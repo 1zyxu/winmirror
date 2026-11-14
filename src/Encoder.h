@@ -36,6 +36,9 @@ public:
     VideoCodec getCodec() const { return m_codec; }
     ColorProfile getColorProfile() const { return m_colorProfile; }
     bool isHdrActive() const { return m_colorProfile == COLOR_HDR10_PQ; }
+    bool isHardwareGpu() const { return m_isHardware; }
+    bool isNvidiaEncoder() const { return m_isNvidia; }
+    bool isZeroCopyActive() const { return m_useD3dManager; }
     const std::string& getEncoderName() const { return m_encoderName; }
     DXGI_FORMAT getSrcFormat() const { return m_srcFormat; }
 
@@ -50,7 +53,7 @@ private:
     static void convertBgraToNv12Studio(const uint8_t* bgra, uint32_t width, uint32_t height, std::vector<uint8_t>& outNv12);
 
     bool waitAsyncInputReady();
-    bool submitSampleToMft(IMFSample* sample, std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe);
+    bool submitSampleToMft(IMFSample* sample, std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe, bool& outInputAccepted);
     bool encodePackedYuv(const std::vector<uint8_t>& yuvData, uint64_t ptsUs,
                          std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe);
     bool collectSyncOutput(std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe);
@@ -68,11 +71,13 @@ private:
 
     VideoCodec m_codec = CODEC_H264;
     ColorProfile m_colorProfile = COLOR_SDR_BT709;
+    bool m_isHardware = false;
+    bool m_isNvidia = false;
     std::string m_encoderName = "Uninitialized";
     std::atomic<bool> m_forceKeyframe{true};
 
     // D3D11 Video Processor (GPU HDR/SDR color conversion -> NV12/P010 ring)
-    static constexpr int kVpRingSize = 3;
+    static constexpr int kVpRingSize = 4;
     ID3D11VideoDevice* m_videoDevice = nullptr;
     ID3D11VideoContext* m_videoContext = nullptr;
     ID3D11VideoContext1* m_videoContext1 = nullptr;

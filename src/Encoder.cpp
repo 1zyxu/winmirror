@@ -3,7 +3,32 @@
 #include <mferror.h>
 #include <iostream>
 #include <algorithm>
+#include <cctype>
 #include <cstring>
+
+static std::string readMftFriendlyName(IMFActivate* act) {
+    if (!act) return {};
+    WCHAR* friendlyName = nullptr;
+    UINT32 nameLen = 0;
+    std::string out;
+    if (SUCCEEDED(act->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &friendlyName, &nameLen)) && friendlyName) {
+        int utf8Len = WideCharToMultiByte(CP_UTF8, 0, friendlyName, -1, nullptr, 0, nullptr, nullptr);
+        if (utf8Len > 1) {
+            out.assign(utf8Len - 1, '\0');
+            WideCharToMultiByte(CP_UTF8, 0, friendlyName, -1, &out[0], utf8Len, nullptr, nullptr);
+        }
+        CoTaskMemFree(friendlyName);
+    }
+    return out;
+}
+
+static bool containsInsensitive(const std::string& haystack, const char* needle) {
+    if (!needle || !*needle) return false;
+    std::string h = haystack, n = needle;
+    for (char& c : h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (char& c : n) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return h.find(n) != std::string::npos;
+}
 
 static const DXGI_FORMAT kTryVideoProcInFormats[] = {
     DXGI_FORMAT_R16G16B16A16_FLOAT,
@@ -276,7 +301,24 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
         return false;
     }
 
+    // Sort hardware MFTs so NVIDIA NVENC is always tried first
+    std::vector<std::pair<int, UINT32>> candidates;
+    candidates.reserve(count);
     for (UINT32 idx = 0; idx < count; ++idx) {
+        std::string name = readMftFriendlyName(ppActivate[idx]);
+        int rank = 2;
+        if (containsInsensitive(name, "nvidia")) rank = 0;
+        else if (containsInsensitive(name, "amd") || containsInsensitive(name, "intel")) rank = 1;
+        candidates.push_back({ rank, idx });
+    }
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    for (const auto& cand : candidates) {
+        UINT32 idx = cand.second;
+        std::string rawFriendly = readMftFriendlyName(ppActivate[idx]);
+        bool isNvidiaName = containsInsensitive(rawFriendly, "nvidia");
+
         cleanupMft();
         if (FAILED(ppActivate[idx]->ActivateObject(__uuidof(IMFTransform), reinterpret_cast<void**>(&m_mft))) || !m_mft) {
             continue;
@@ -285,10 +327,12 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
         // Handle Async MFT unlock and D3D11 zero-copy binding if hardware driver supports it
         IMFAttributes* mftAttr = nullptr;
         UINT32 isAsync = 0;
+        UINT32 d3d11Aware = 0;
         UINT32 d3dAware = 0;
         if (SUCCEEDED(m_mft->GetAttributes(&mftAttr)) && mftAttr) {
             mftAttr->GetUINT32(MF_TRANSFORM_ASYNC, &isAsync);
-            mftAttr->GetUINT32(MF_SA_D3D11_AWARE, &d3dAware);
+            mftAttr->GetUINT32(MF_SA_D3D11_AWARE, &d3d11Aware);
+            mftAttr->GetUINT32(MF_SA_D3D_AWARE, &d3dAware);
             if (isAsync) {
                 if (FAILED(mftAttr->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE))) {
                     mftAttr->Release();
@@ -304,12 +348,6 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
             mftAttr->Release();
         }
 
-        if (hardwareOnly && d3dAware && m_dxgiManager && m_hasVideoProcessor) {
-            if (SUCCEEDED(m_mft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, reinterpret_cast<ULONG_PTR>(m_dxgiManager)))) {
-                m_useD3dManager = true;
-            }
-        }
-
         DWORD inCount = 0, outCount = 0;
         if (SUCCEEDED(m_mft->GetStreamCount(&inCount, &outCount)) && inCount > 0 && outCount > 0) {
             DWORD inIds[8] = {}, outIds[8] = {};
@@ -322,11 +360,28 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
             }
         }
 
-        // Optimal streaming bitrate: ~18 Mbps for 1080p60, ~36 Mbps for 4K60
+        if (hardwareOnly && (d3d11Aware || d3dAware) && m_dxgiManager && m_hasVideoProcessor) {
+            if (SUCCEEDED(m_mft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, reinterpret_cast<ULONG_PTR>(m_dxgiManager)))) {
+                m_useD3dManager = true;
+            }
+        }
+
+        // Optimal streaming bitrate: ~14 Mbps for 1080p60, ~28 Mbps for 4K60
         uint64_t pixels = static_cast<uint64_t>(m_width) * m_height;
-        UINT32 bitrate = (pixels > 3000000ULL) ? 36000000u : 18000000u;
+        UINT32 bitrate = (pixels > 3000000ULL) ? 28000000u : 14000000u;
 
         m_mft->QueryInterface(__uuidof(ICodecAPI), reinterpret_cast<void**>(&m_codecApi));
+
+        // Low-latency real-time NVENC/GPU tuning (apply before stream type negotiation as well)
+        if (m_codecApi) {
+            setCodecBool(m_codecApi, CODECAPI_AVLowLatencyMode, true);
+            setCodecBool(m_codecApi, CODECAPI_AVEncCommonRealTime, true);
+            setCodecUint32(m_codecApi, CODECAPI_AVEncCommonQualityVsSpeed, 0);
+            setCodecUint32(m_codecApi, CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
+            setCodecUint32(m_codecApi, CODECAPI_AVEncCommonMeanBitRate, bitrate);
+            setCodecUint32(m_codecApi, CODECAPI_AVEncMPVDefaultBPictureCount, 0);
+            setCodecUint32(m_codecApi, CODECAPI_AVEncMPVGOPSize, m_fps * 2);
+        }
 
         // Configure Output Type FIRST
         IMFMediaType* outType = nullptr;
@@ -350,7 +405,6 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
         outType->Release();
         if (FAILED(hr)) continue;
 
-        // Low-latency real-time game capture settings (0 B-frames, speed preset 0, 2s GOP)
         if (m_codecApi) {
             setCodecBool(m_codecApi, CODECAPI_AVLowLatencyMode, true);
             setCodecBool(m_codecApi, CODECAPI_AVEncCommonRealTime, true);
@@ -398,19 +452,10 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
         m_mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
         m_mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
 
-        // Read encoder friendly name if available
-        WCHAR* friendlyName = nullptr;
-        UINT32 nameLen = 0;
-        std::string hwName = label;
-        if (SUCCEEDED(ppActivate[idx]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &friendlyName, &nameLen)) && friendlyName) {
-            int utf8Len = WideCharToMultiByte(CP_UTF8, 0, friendlyName, -1, nullptr, 0, nullptr, nullptr);
-            if (utf8Len > 1) {
-                std::string s(utf8Len - 1, '\0');
-                WideCharToMultiByte(CP_UTF8, 0, friendlyName, -1, &s[0], utf8Len, nullptr, nullptr);
-                hwName = std::string(label) + " [" + s + "]" + (m_useD3dManager ? " (D3D11 Zero-Copy)" : "");
-            }
-            CoTaskMemFree(friendlyName);
-        } else if (m_useD3dManager) {
+        m_isHardware = hardwareOnly;
+        m_isNvidia = isNvidiaName;
+        std::string hwName = !rawFriendly.empty() ? (std::string(label) + " [" + rawFriendly + "]") : label;
+        if (m_useD3dManager) {
             hwName += " (D3D11 Zero-Copy)";
         }
         m_encoderName = hwName;
@@ -437,6 +482,8 @@ void Encoder::cleanupMft() {
     if (m_mft) { m_mft->Release(); m_mft = nullptr; }
     m_isAsync = false;
     m_useD3dManager = false;
+    m_isHardware = false;
+    m_isNvidia = false;
     m_needInputCount = 0;
     m_seqHeader.clear();
 }
@@ -543,6 +590,9 @@ bool Encoder::encodeGpuFrame(ID3D11Texture2D* gpuSrcTex, uint64_t ptsUs,
     if (FAILED(hr)) return false;
 
     if (m_useD3dManager) {
+        // Flush VideoProcessorBlt to GPU queue immediately so NVENC reads current NV12/P010 frame without batch stall
+        m_d3dContext->Flush();
+
         if (!waitAsyncInputReady()) return false;
 
         IMFMediaBuffer* mfBuf = nullptr;
@@ -563,15 +613,18 @@ bool Encoder::encodeGpuFrame(ID3D11Texture2D* gpuSrcTex, uint64_t ptsUs,
                 sample->SetSampleTime(static_cast<LONGLONG>(ptsUs) * 10);
                 sample->SetSampleDuration(10000000LL / m_fps);
 
-                if (submitSampleToMft(sample, outAnnexB, outIsKeyframe)) {
-                    return true;
+                bool inputAccepted = false;
+                bool gotOut = submitSampleToMft(sample, outAnnexB, outIsKeyframe, inputAccepted);
+                if (inputAccepted) {
+                    // NEVER downgrade out of GPU Zero-Copy once ProcessInput succeeded on the DXGI surface!
+                    return gotOut;
                 }
             } else {
                 mfBuf->Release();
             }
         }
 
-        // Driver rejected DXGI surface input; cleanly disable D3D manager and fall back once
+        // Only reach here if ProcessInput actually rejected DXGI surface input; cleanly fall back once
         m_useD3dManager = false;
         m_mft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
     }
@@ -611,7 +664,8 @@ bool Encoder::waitAsyncInputReady() {
     return true;
 }
 
-bool Encoder::submitSampleToMft(IMFSample* sample, std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe) {
+bool Encoder::submitSampleToMft(IMFSample* sample, std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe, bool& outInputAccepted) {
+    outInputAccepted = false;
     if (!sample) return false;
 
     if (m_forceKeyframe.exchange(false) && m_codecApi) {
@@ -625,6 +679,7 @@ bool Encoder::submitSampleToMft(IMFSample* sample, std::vector<uint8_t>& outAnne
         return false;
     }
 
+    outInputAccepted = true;
     if (m_isAsync) {
         m_needInputCount--;
         return pumpAsyncEvents(outAnnexB, outIsKeyframe, true);
@@ -658,7 +713,8 @@ bool Encoder::encodePackedYuv(const std::vector<uint8_t>& yuvData, uint64_t ptsU
     sample->SetSampleTime(static_cast<LONGLONG>(ptsUs) * 10);
     sample->SetSampleDuration(10000000LL / m_fps);
 
-    return submitSampleToMft(sample, outAnnexB, outIsKeyframe);
+    bool inputAccepted = false;
+    return submitSampleToMft(sample, outAnnexB, outIsKeyframe, inputAccepted);
 }
 
 bool Encoder::collectSyncOutput(std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe) {

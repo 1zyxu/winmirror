@@ -4,6 +4,7 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <dxgi1_6.h>
+#include <string>
 #include <vector>
 
 struct RawFrame {
@@ -41,6 +42,8 @@ public:
     bool isDxgiActive() const { return m_useDxgi; }
     bool isHdrOutput() const { return m_isHdrOutput || m_format == DXGI_FORMAT_R16G16B16A16_FLOAT; }
     DXGI_FORMAT getPixelFormat() const { return m_format; }
+    const std::string& getAdapterName() const { return m_adapterName; }
+    bool isNvidiaGpu() const { return m_isNvidiaGpu; }
 
 private:
     bool initDxgi();
@@ -79,6 +82,8 @@ private:
     IDXGIOutputDuplication* m_duplication = nullptr;
     ID3D11Texture2D* m_gpuCopyTex = nullptr;
     ID3D11Texture2D* m_stagingTexture = nullptr;
+    std::string m_adapterName = "Default GPU";
+    bool m_isNvidiaGpu = false;
 
     // GDI fallback resources
     HDC m_hdcScreen = nullptr;

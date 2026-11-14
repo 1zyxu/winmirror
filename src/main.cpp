@@ -45,6 +45,25 @@ static void cleanupPreviousUpdateBinary() {
     }
 }
 
+static uint16_t buildHelloFlags(bool btReady, const ScreenCapture& cap, const Encoder& enc) {
+    uint16_t f = btReady ? HELLO_FLAG_BT : 0;
+    if (cap.isNvidiaGpu() || enc.isNvidiaEncoder()) f |= HELLO_FLAG_NVIDIA;
+    if (enc.isZeroCopyActive()) f |= HELLO_FLAG_ZEROCOPY;
+    if (enc.isHardwareGpu()) f |= HELLO_FLAG_HW_GPU;
+    return f;
+}
+
+static const char* gpuModeTag(uint16_t flags) {
+    bool nv = (flags & HELLO_FLAG_NVIDIA) != 0;
+    bool zc = (flags & HELLO_FLAG_ZEROCOPY) != 0;
+    bool hw = (flags & HELLO_FLAG_HW_GPU) != 0;
+    if (nv && zc) return "NVENC-ZC";
+    if (nv) return "NVENC";
+    if (hw && zc) return "GPU-ZC";
+    if (hw) return "GPU";
+    return "CPU";
+}
+
 static std::string collectLocalIpsAndPrint(int port) {
     std::cout << "==================================================================" << std::endl;
     std::cout << "  WINMIRROR AirPlay v" << WINMIRROR_VERSION << " -- GPU HEVC/H264 HDR + Bluetooth" << std::endl;
@@ -164,7 +183,7 @@ int main(int argc, char* argv[]) {
 
     server.setStreamInfo(encoder.getWidth(), encoder.getHeight(), static_cast<uint16_t>(targetFps),
                          encoder.getCodec(), encoder.getColorProfile(),
-                         audioCapture.getSampleRate(), btReady,
+                         audioCapture.getSampleRate(), buildHelloFlags(btReady, capture, encoder),
                          [&encoder]() { encoder.requestKeyframe(); });
 
     if (!server.start()) {
@@ -184,6 +203,7 @@ int main(int argc, char* argv[]) {
     auto nextEncodeTime = startTime;
     uint32_t encodedFrames = 0;
     uint64_t frameSeq = 0;
+    bool lastZeroCopy = encoder.isZeroCopyActive();
 
     const auto minFrameGap = std::chrono::microseconds(1000000 / targetFps);
     const auto idleTick = std::chrono::milliseconds(8);
@@ -220,8 +240,10 @@ int main(int argc, char* argv[]) {
                                  capture.isHdrOutput());
                     server.setStreamInfo(encoder.getWidth(), encoder.getHeight(), static_cast<uint16_t>(targetFps),
                                          encoder.getCodec(), encoder.getColorProfile(),
-                                         audioCapture.getSampleRate(), btBridge.isRadioAvailable(),
+                                         audioCapture.getSampleRate(),
+                                         buildHelloFlags(btBridge.isRadioAvailable(), capture, encoder),
                                          [&encoder]() { encoder.requestKeyframe(); });
+                    lastZeroCopy = encoder.isZeroCopyActive();
                     btBridge.updateMetadata(ipsCsv, encoder.getWidth(), encoder.getHeight(),
                                             encoder.isHdrActive(), encoder.getEncoderName());
                 }
@@ -258,6 +280,14 @@ int main(int argc, char* argv[]) {
                     server.broadcastVideo(std::move(pkt));
                     encodedFrames++;
                     encodedThisSlot = true;
+                    if (encoder.isZeroCopyActive() != lastZeroCopy) {
+                        lastZeroCopy = encoder.isZeroCopyActive();
+                        server.setStreamInfo(encoder.getWidth(), encoder.getHeight(), static_cast<uint16_t>(targetFps),
+                                             encoder.getCodec(), encoder.getColorProfile(),
+                                             audioCapture.getSampleRate(),
+                                             buildHelloFlags(btBridge.isRadioAvailable(), capture, encoder),
+                                             [&encoder]() { encoder.requestKeyframe(); });
+                    }
                 }
             }
 
@@ -276,8 +306,10 @@ int main(int argc, char* argv[]) {
             float elapsedSec = std::chrono::duration<float>(now - lastReport).count();
             float currentFps = encodedFrames / elapsedSec;
 
+            uint16_t hflags = buildHelloFlags(btBridge.isRadioAvailable(), capture, encoder);
             std::cout << "\r[AirPlay] " << std::fixed << std::setprecision(1) << std::setw(4) << currentFps
                       << " FPS | " << (encoder.getCodec() == CODEC_HEVC ? "HEVC" : "H264")
+                      << "[" << gpuModeTag(hflags) << "]"
                       << (encoder.isHdrActive() ? " HDR10" : " SDR")
                       << " | " << encoder.getWidth() << "x" << encoder.getHeight()
                       << " | BT:" << btBridge.getStatusText()

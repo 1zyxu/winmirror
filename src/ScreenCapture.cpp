@@ -173,27 +173,52 @@ bool ScreenCapture::initDxgi() {
     };
     D3D_FEATURE_LEVEL chosenLevel;
 
-    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
-    HRESULT hr = D3D11CreateDevice(
-        nullptr,
-        D3D_DRIVER_TYPE_HARDWARE,
-        nullptr,
-        flags,
-        featureLevels,
-        ARRAYSIZE(featureLevels),
-        D3D11_SDK_VERSION,
-        &m_d3dDevice,
-        &chosenLevel,
-        &m_d3dContext
-    );
+    // Prefer NVIDIA adapter (0x10DE) that owns an active desktop output; fallback to primary GPU
+    IDXGIAdapter1* preferredAdapter = nullptr;
+    IDXGIFactory1* factory = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) && factory) {
+        IDXGIAdapter1* fallbackAdapter = nullptr;
+        for (UINT idx = 0; ; ++idx) {
+            IDXGIAdapter1* cand = nullptr;
+            if (factory->EnumAdapters1(idx, &cand) == DXGI_ERROR_NOT_FOUND || !cand) break;
 
-    if (FAILED(hr)) {
-        // Retry without VIDEO_SUPPORT flag just in case driver rejects it
-        hr = D3D11CreateDevice(
+            DXGI_ADAPTER_DESC1 ad = {};
+            cand->GetDesc1(&ad);
+            if (ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
+                cand->Release();
+                continue;
+            }
+
+            IDXGIOutput* out = nullptr;
+            bool hasOutput = SUCCEEDED(cand->EnumOutputs(0, &out)) && out;
+            if (out) out->Release();
+
+            if (hasOutput) {
+                if (ad.VendorId == 0x10DE && !preferredAdapter) {
+                    preferredAdapter = cand;
+                    break;
+                }
+                if (!fallbackAdapter) {
+                    fallbackAdapter = cand;
+                    continue;
+                }
+            }
+            cand->Release();
+        }
+        if (!preferredAdapter) {
+            preferredAdapter = fallbackAdapter;
+        } else if (fallbackAdapter) {
+            fallbackAdapter->Release();
+        }
+        factory->Release();
+    }
+
+    auto tryCreateOnAdapter = [&](IDXGIAdapter* adp, UINT flags) -> HRESULT {
+        return D3D11CreateDevice(
+            adp,
+            adp ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
             nullptr,
-            D3D_DRIVER_TYPE_HARDWARE,
-            nullptr,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            flags,
             featureLevels,
             ARRAYSIZE(featureLevels),
             D3D11_SDK_VERSION,
@@ -201,9 +226,21 @@ bool ScreenCapture::initDxgi() {
             &chosenLevel,
             &m_d3dContext
         );
+    };
+
+    HRESULT hr = tryCreateOnAdapter(preferredAdapter, D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT);
+    if (FAILED(hr)) {
+        hr = tryCreateOnAdapter(preferredAdapter, D3D11_CREATE_DEVICE_BGRA_SUPPORT);
+    }
+    if (FAILED(hr) && preferredAdapter) {
+        hr = tryCreateOnAdapter(nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT);
+    }
+    if (preferredAdapter) {
+        preferredAdapter->Release();
+        preferredAdapter = nullptr;
     }
 
-    if (FAILED(hr)) return false;
+    if (FAILED(hr) || !m_d3dDevice || !m_d3dContext) return false;
 
     ID3D10Multithread* mt = nullptr;
     if (SUCCEEDED(m_d3dDevice->QueryInterface(__uuidof(ID3D10Multithread), reinterpret_cast<void**>(&mt)))) {
@@ -214,12 +251,25 @@ bool ScreenCapture::initDxgi() {
     IDXGIDevice* dxgiDevice = nullptr;
     hr = m_d3dDevice->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgiDevice));
     if (FAILED(hr)) { cleanupDxgi(); return false; }
-    dxgiDevice->SetGPUThreadPriority(5);
+    dxgiDevice->SetGPUThreadPriority(7);
 
     IDXGIAdapter* dxgiAdapter = nullptr;
     hr = dxgiDevice->GetParent(__uuidof(IDXGIAdapter), reinterpret_cast<void**>(&dxgiAdapter));
     dxgiDevice->Release();
     if (FAILED(hr)) { cleanupDxgi(); return false; }
+
+    DXGI_ADAPTER_DESC desc = {};
+    if (SUCCEEDED(dxgiAdapter->GetDesc(&desc))) {
+        m_isNvidiaGpu = (desc.VendorId == 0x10DE);
+        int utf8Len = WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, nullptr, 0, nullptr, nullptr);
+        if (utf8Len > 1) {
+            std::string name(utf8Len - 1, '\0');
+            WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, &name[0], utf8Len, nullptr, nullptr);
+            m_adapterName = std::move(name);
+        }
+        std::cout << "[ScreenCapture] GPU Adapter: " << m_adapterName
+                  << (m_isNvidiaGpu ? " (NVIDIA Dedicated)" : "") << std::endl;
+    }
 
     IDXGIOutput* dxgiOutput = nullptr;
     hr = dxgiAdapter->EnumOutputs(0, &dxgiOutput);

@@ -17,7 +17,7 @@ public:
 
     void setStreamInfo(uint32_t width, uint32_t height, uint16_t fps,
                        VideoCodec codec, ColorProfile colorProfile,
-                       uint32_t audioSampleRate, bool bluetoothReady,
+                       uint32_t audioSampleRate, uint16_t helloFlags,
                        std::function<void()> onKeyframeReq);
 
     bool start();

@@ -40,6 +40,13 @@ enum ColorProfile : uint8_t {
     COLOR_HDR10_PQ   = 2
 };
 
+enum HelloFlags : uint16_t {
+    HELLO_FLAG_BT       = 1 << 0,
+    HELLO_FLAG_NVIDIA   = 1 << 1,
+    HELLO_FLAG_ZEROCOPY = 1 << 2,
+    HELLO_FLAG_HW_GPU   = 1 << 3
+};
+
 enum PacketType : uint16_t {
     PACKET_TYPE_HELLO         = 0x01,
     PACKET_TYPE_VIDEO         = 0x02,
@@ -930,6 +937,7 @@ private:
 @property (nonatomic, assign) ColorProfile currentColor;
 @property (nonatomic, assign) double lastRttMs;
 @property (nonatomic, assign) BOOL btLinked;
+@property (nonatomic, assign) uint16_t pcHelloFlags;
 @property (nonatomic, copy) NSString *pcHostName;
 
 - (void)addDiscoveredHost:(NSString *)ip port:(int)port source:(NSString *)src;
@@ -1374,9 +1382,18 @@ private:
     NSString *hdrStr = (_currentColor == COLOR_HDR10_PQ) ? @"HDR10" : @"SDR";
     NSString *btStr = _btLinked ? @"BT + LAN" : @"LAN/USB";
 
-    NSString *title = [NSString stringWithFormat:@"WinMirror AirPlay — %@ | %ux%u %@ | %@ %.0f FPS | %.1f ms | %@",
+    NSString *gpuStr = @"CPU";
+    BOOL hasNvidia = (_pcHelloFlags & HELLO_FLAG_NVIDIA) != 0;
+    BOOL hasZc = (_pcHelloFlags & HELLO_FLAG_ZEROCOPY) != 0;
+    BOOL hasHw = (_pcHelloFlags & HELLO_FLAG_HW_GPU) != 0;
+    if (hasNvidia && hasZc) gpuStr = @"NVENC-ZC";
+    else if (hasNvidia) gpuStr = @"NVENC";
+    else if (hasHw && hasZc) gpuStr = @"GPU-ZC";
+    else if (hasHw) gpuStr = @"GPU";
+
+    NSString *title = [NSString stringWithFormat:@"WinMirror AirPlay — %@ | %ux%u %@ | %@ [%@] %.0f FPS | %.1f ms | %@",
                        _pcHostName, _currentWidth, _currentHeight, hdrStr, codecStr,
-                       _currentFps, _lastRttMs, btStr];
+                       gpuStr, _currentFps, _lastRttMs, btStr];
     [_window setTitle:title];
 }
 
@@ -1552,6 +1569,7 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
                 uint32_t h = hello.height;
                 VideoCodec codec = static_cast<VideoCodec>(hello.codec);
                 ColorProfile color = static_cast<ColorProfile>(hello.colorProfile);
+                uint16_t hflags = hello.flags;
 
                 dispatch_async(dispatch_get_main_queue(), ^{
                     controller.pcHostName = name.length ? name : [NSString stringWithUTF8String:host.c_str()];
@@ -1559,6 +1577,7 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
                     controller.currentHeight = h;
                     controller.currentCodec = codec;
                     controller.currentColor = color;
+                    controller.pcHelloFlags = hflags;
                     [controller.videoView setVideoDimensions:w height:h hdr:(color == COLOR_HDR10_PQ)];
                     [controller refreshTitle];
                 });

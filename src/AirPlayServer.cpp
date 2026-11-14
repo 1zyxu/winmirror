@@ -12,7 +12,7 @@ AirPlayServer::~AirPlayServer() {
 
 void AirPlayServer::setStreamInfo(uint32_t width, uint32_t height, uint16_t fps,
                                   VideoCodec codec, ColorProfile colorProfile,
-                                  uint32_t audioSampleRate, bool bluetoothReady,
+                                  uint32_t audioSampleRate, uint16_t helloFlags,
                                   std::function<void()> onKeyframeReq) {
     {
         std::lock_guard<std::mutex> lock(m_infoMutex);
@@ -23,7 +23,7 @@ void AirPlayServer::setStreamInfo(uint32_t width, uint32_t height, uint16_t fps,
         m_hello.colorProfile = static_cast<uint8_t>(colorProfile);
         m_hello.audioSampleRate = audioSampleRate;
         m_hello.audioChannels = 2;
-        m_hello.flags = bluetoothReady ? 1 : 0;
+        m_hello.flags = helloFlags;
 
         char hostname[64] = "WindowsPC";
         gethostname(hostname, sizeof(hostname) - 1);

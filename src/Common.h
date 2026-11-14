@@ -24,7 +24,7 @@
 #include <chrono>
 #include <memory>
 
-#define WINMIRROR_VERSION "2.0.5"
+#define WINMIRROR_VERSION "2.0.6"
 #define WINMIRROR_REPO "1zyxu/winmirror"
 #define AIRPLAY_PORT 7001
 #define BEACON_PORT 8889
@@ -57,6 +57,13 @@ enum PacketType : uint16_t {
     PACKET_TYPE_KEYFRAME_REQ  = 0x07,
     PACKET_TYPE_AUDIO_DEVICES = 0x08,
     PACKET_TYPE_SET_AUDIO_SRC = 0x09
+};
+
+enum HelloFlags : uint16_t {
+    HELLO_FLAG_BT       = 1 << 0,
+    HELLO_FLAG_NVIDIA   = 1 << 1,
+    HELLO_FLAG_ZEROCOPY = 1 << 2,
+    HELLO_FLAG_HW_GPU   = 1 << 3
 };
 
 #pragma pack(push, 1)
