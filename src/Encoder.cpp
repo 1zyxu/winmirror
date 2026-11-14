@@ -14,7 +14,6 @@ bool Encoder::init(float quality) {
     if (SUCCEEDED(hr)) {
         m_coInitialized = true;
     } else if (hr == RPC_E_CHANGED_MODE) {
-        // COM was already initialized in another mode, continue
         m_coInitialized = false;
     }
 
@@ -48,6 +47,23 @@ void Encoder::cleanup() {
 bool Encoder::encodeBgraToJpeg(const uint8_t* bgra, uint32_t width, uint32_t height, std::vector<uint8_t>& outJpeg) {
     if (!m_factory || !bgra || width == 0 || height == 0) return false;
 
+    // Convert 32-bit BGRA to 24-bit BGR (removes alpha channel so JPEG encoder receives exact 3 bytes/pixel)
+    size_t totalPixels = static_cast<size_t>(width) * height;
+    size_t bgrSize = totalPixels * 3;
+    if (m_bgrBuffer.size() != bgrSize) {
+        m_bgrBuffer.resize(bgrSize);
+    }
+
+    const uint8_t* src = bgra;
+    uint8_t* dst = m_bgrBuffer.data();
+    for (size_t i = 0; i < totalPixels; ++i) {
+        dst[0] = src[0]; // B
+        dst[1] = src[1]; // G
+        dst[2] = src[2]; // R
+        dst += 3;
+        src += 4;
+    }
+
     IStream* pStream = nullptr;
     HRESULT hr = CreateStreamOnHGlobal(NULL, TRUE, &pStream);
     if (FAILED(hr)) return false;
@@ -75,7 +91,6 @@ bool Encoder::encodeBgraToJpeg(const uint8_t* bgra, uint32_t width, uint32_t hei
         return false;
     }
 
-    // Set JPEG quality
     PROPBAG2 option = {};
     option.pstrName = const_cast<LPOLESTR>(L"ImageQuality");
     VARIANT varValue;
@@ -95,13 +110,14 @@ bool Encoder::encodeBgraToJpeg(const uint8_t* bgra, uint32_t width, uint32_t hei
 
     pFrame->SetSize(width, height);
 
-    WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+    // Exact matching format for JPEG encoder: 24bpp BGR (3 bytes per pixel)
+    WICPixelFormatGUID format = GUID_WICPixelFormat24bppBGR;
     pFrame->SetPixelFormat(&format);
 
-    uint32_t stride = width * 4;
+    uint32_t stride = width * 3;
     uint32_t bufferSize = stride * height;
 
-    hr = pFrame->WritePixels(height, stride, bufferSize, const_cast<BYTE*>(bgra));
+    hr = pFrame->WritePixels(height, stride, bufferSize, m_bgrBuffer.data());
     if (FAILED(hr)) {
         pFrame->Release();
         pEncoder->Release();

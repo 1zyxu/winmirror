@@ -19,7 +19,7 @@
 #include <atomic>
 #include <chrono>
 
-#define WINMIRROR_VERSION "1.0.4"
+#define WINMIRROR_VERSION "1.0.5"
 #define WINMIRROR_REPO "1zyxu/winmirror"
 #define DEFAULT_PORT 8888
 #define BEACON_PORT 8889
@@ -90,7 +90,7 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         m_chunks.emplace_back(pcm, pcm + size);
         if (m_chunks.size() > 50) {
-            m_chunks.pop_front(); // drop oldest if client is too slow to avoid queue latency
+            m_chunks.pop_front();
         }
     }
 

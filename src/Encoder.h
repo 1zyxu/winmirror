@@ -21,4 +21,5 @@ private:
     float m_quality = 0.75f;
     IWICImagingFactory* m_factory = nullptr;
     bool m_coInitialized = false;
+    std::vector<uint8_t> m_bgrBuffer;
 };
