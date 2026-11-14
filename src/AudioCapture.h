@@ -29,7 +29,7 @@ public:
 private:
     void captureLoop();
     bool initEndpoint();
-    bool tryActivateDevice(IMMDevice* dev);
+    bool tryActivateDevice(IMMDevice* dev, bool isInput);
     void refreshDeviceList();
     void releaseEndpoint();
     void cleanup();

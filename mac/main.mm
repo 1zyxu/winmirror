@@ -1233,24 +1233,39 @@ private:
     }
 
     if (_pcAudioDevices.count > 0) {
-        [menu addItem:[NSMenuItem separatorItem]];
-        NSMenuItem *hdr = [[[NSMenuItem alloc] initWithTitle:@"PC Audio Source (Capture)" action:nil keyEquivalent:@""] autorelease];
-        hdr.enabled = NO;
-        [menu addItem:hdr];
+        auto addPcSection = [&](NSString *sectionTitle, BOOL wantInput) {
+            BOOL addedHeader = NO;
+            for (NSDictionary *pcDev in _pcAudioDevices) {
+                NSInteger idx = [pcDev[@"index"] integerValue];
+                NSString *rawName = pcDev[@"name"];
+                BOOL isInput = (idx == -2 || idx >= 1000 || [rawName hasPrefix:@"IN:"]);
+                if (isInput != wantInput) continue;
 
-        for (NSDictionary *pcDev in _pcAudioDevices) {
-            NSInteger idx = [pcDev[@"index"] integerValue];
-            BOOL sel = [pcDev[@"selected"] boolValue];
-            NSString *devName = pcDev[@"name"];
-            NSString *pcTitle = [NSString stringWithFormat:@"🖥️ %@", devName];
-            NSMenuItem *pcItem = [[[NSMenuItem alloc] initWithTitle:pcTitle
-                                                             action:@selector(onPcAudioSourceAction:)
-                                                      keyEquivalent:@""] autorelease];
-            pcItem.target = self;
-            pcItem.tag = idx;
-            pcItem.state = sel ? NSControlStateValueOn : NSControlStateValueOff;
-            [menu addItem:pcItem];
-        }
+                if (!addedHeader) {
+                    [menu addItem:[NSMenuItem separatorItem]];
+                    NSMenuItem *hdr = [[[NSMenuItem alloc] initWithTitle:sectionTitle action:nil keyEquivalent:@""] autorelease];
+                    hdr.enabled = NO;
+                    [menu addItem:hdr];
+                    addedHeader = YES;
+                }
+
+                NSString *cleanName = rawName;
+                if ([cleanName hasPrefix:@"OUT:"]) cleanName = [cleanName substringFromIndex:4];
+                else if ([cleanName hasPrefix:@"IN:"]) cleanName = [cleanName substringFromIndex:3];
+
+                NSString *pcTitle = [NSString stringWithFormat:@"%@ %@", wantInput ? @"🎤" : @"🖥️", cleanName];
+                NSMenuItem *pcItem = [[[NSMenuItem alloc] initWithTitle:pcTitle
+                                                                 action:@selector(onPcAudioSourceAction:)
+                                                          keyEquivalent:@""] autorelease];
+                pcItem.target = self;
+                pcItem.tag = idx;
+                pcItem.state = [pcDev[@"selected"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
+                [menu addItem:pcItem];
+            }
+        };
+
+        addPcSection(@"PC Output Source (Speakers / Loopback)", NO);
+        addPcSection(@"PC Input Source (Mic / Line / Virtual)", YES);
     }
 
     if (!mutedDevs.empty()) {
@@ -1300,7 +1315,16 @@ private:
 }
 
 - (void)onPcAudioSourceAction:(NSMenuItem *)sender {
-    _pendingPcAudioSrc.store(static_cast<int>(sender.tag));
+    NSInteger chosen = sender.tag;
+    _pendingPcAudioSrc.store(static_cast<int>(chosen));
+    for (NSUInteger i = 0; i < _pcAudioDevices.count; ++i) {
+        NSDictionary *d = _pcAudioDevices[i];
+        _pcAudioDevices[i] = @{
+            @"index": d[@"index"],
+            @"selected": @([d[@"index"] integerValue] == chosen),
+            @"name": d[@"name"]
+        };
+    }
     [self refreshAudioSwitchControls];
 }
 
@@ -1356,20 +1380,13 @@ private:
     [_window setTitle:title];
 }
 
-- (void)noteFrameRendered:(uint32_t)w height:(uint32_t)h codec:(VideoCodec)codec color:(ColorProfile)color {
+- (void)updateRenderStats:(uint32_t)w height:(uint32_t)h codec:(VideoCodec)codec color:(ColorProfile)color fps:(double)fps {
     _currentWidth = w;
     _currentHeight = h;
     _currentCodec = codec;
     _currentColor = color;
-
-    self.frameCount++;
-    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    if (now - self.lastFpsTime >= 0.5) {
-        self.currentFps = self.frameCount / (now - self.lastFpsTime);
-        self.frameCount = 0;
-        self.lastFpsTime = now;
-        [self refreshTitle];
-    }
+    _currentFps = fps;
+    [self refreshTitle];
 }
 
 - (void)keyDown:(NSEvent *)event {
@@ -1488,6 +1505,8 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
         }
 
         auto lastPing = std::chrono::steady_clock::now();
+        auto lastFpsTick = lastPing;
+        uint32_t decodedFpsFrames = 0;
 
         while (*running) {
             int reqAudioIdx = [controller consumePendingPcAudioSource];
@@ -1550,11 +1569,19 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
                 if (color != COLOR_SDR_BT709 && color != COLOR_HDR10_PQ) color = controller.currentColor;
 
                 if (decoder.decodeAndPresent(payloadBuf.data(), hdr.payloadSize, codec, color, controller.videoView.displayLayer)) {
-                    uint32_t w = controller.currentWidth;
-                    uint32_t h = controller.currentHeight;
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        [controller noteFrameRendered:w height:h codec:codec color:color];
-                    });
+                    decodedFpsFrames++;
+                    auto fpsNow = std::chrono::steady_clock::now();
+                    double dt = std::chrono::duration<double>(fpsNow - lastFpsTick).count();
+                    if (dt >= 0.5) {
+                        double fps = decodedFpsFrames / dt;
+                        decodedFpsFrames = 0;
+                        lastFpsTick = fpsNow;
+                        uint32_t w = controller.currentWidth;
+                        uint32_t h = controller.currentHeight;
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            [controller updateRenderStats:w height:h codec:codec color:color fps:fps];
+                        });
+                    }
                 }
             } else if (hdr.type == PACKET_TYPE_AUDIO && hdr.payloadSize > 0) {
                 [controller.audioPlayer playPcm:payloadBuf.data() length:hdr.payloadSize sampleRate:hdr.extra1];

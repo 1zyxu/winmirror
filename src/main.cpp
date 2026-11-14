@@ -235,7 +235,10 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            if (server.getActiveClients() > 0 && (gotNewScreen || encoder.hasKeyframeRequest())) {
+            bool hasClients = (server.getActiveClients() > 0);
+            bool encodedThisSlot = false;
+
+            if (hasClients && (gotNewScreen || encoder.hasKeyframeRequest())) {
                 uint64_t ptsUs = std::chrono::duration_cast<std::chrono::microseconds>(loopStart - startTime).count();
                 bool isKey = false;
                 bool encoded = false;
@@ -262,11 +265,16 @@ int main(int argc, char* argv[]) {
 
                     server.broadcastVideo(std::move(pkt));
                     encodedFrames++;
+                    encodedThisSlot = true;
                 }
             }
-            nextEncodeTime += minFrameGap;
-            if (nextEncodeTime + minFrameGap < loopStart) {
-                nextEncodeTime = loopStart + minFrameGap;
+
+            // Only advance target frame slot once a frame actually lands (prevents missing 1ms later -> 33ms skip)
+            if (!hasClients || encodedThisSlot) {
+                nextEncodeTime += minFrameGap;
+                if (nextEncodeTime + minFrameGap < loopStart) {
+                    nextEncodeTime = loopStart + minFrameGap;
+                }
             }
         }
 

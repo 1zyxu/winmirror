@@ -125,19 +125,26 @@ bool Updater::fetchLatestReleaseInfo(std::string& outTag, std::string& outDownlo
     if (tagEnd == std::string::npos) return false;
     outTag = response.substr(tagStart + 1, tagEnd - tagStart - 1);
 
-    // Parse browser_download_url for winmirror.exe
-    size_t exePos = response.find("winmirror.exe");
-    if (exePos != std::string::npos) {
-        size_t urlPos = response.rfind("\"browser_download_url\":", exePos);
-        if (urlPos != std::string::npos) {
-            size_t urlStart = response.find('"', urlPos + 23);
-            if (urlStart != std::string::npos) {
-                size_t urlEnd = response.find('"', urlStart + 1);
-                if (urlEnd != std::string::npos) {
-                    outDownloadUrl = response.substr(urlStart + 1, urlEnd - urlStart - 1);
-                }
-            }
+    // Parse browser_download_url across all release assets for winmirror.exe
+    size_t searchPos = 0;
+    while (true) {
+        size_t urlPos = response.find("\"browser_download_url\":", searchPos);
+        if (urlPos == std::string::npos) break;
+        size_t urlStart = response.find('"', urlPos + 23);
+        if (urlStart == std::string::npos) break;
+        size_t urlEnd = response.find('"', urlStart + 1);
+        if (urlEnd == std::string::npos) break;
+
+        std::string cand = response.substr(urlStart + 1, urlEnd - urlStart - 1);
+        if (cand.find("winmirror.exe") != std::string::npos) {
+            outDownloadUrl = std::move(cand);
+            break;
         }
+        searchPos = urlEnd + 1;
+    }
+    if (outDownloadUrl.empty() && !outTag.empty()) {
+        outDownloadUrl = "https://github.com/" + std::string(WINMIRROR_REPO) +
+                         "/releases/download/" + outTag + "/winmirror.exe";
     }
 
     return !outTag.empty();
@@ -194,7 +201,11 @@ bool Updater::downloadFile(const std::string& url, const std::string& outputPath
         bResults = WinHttpReceiveResponse(hRequest, NULL);
     }
 
-    if (!bResults) {
+    DWORD statusCode = 0, statusSize = sizeof(statusCode);
+    if (!bResults ||
+        !WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                             WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX) ||
+        statusCode != 200) {
         WinHttpCloseHandle(hRequest);
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);
@@ -239,14 +250,14 @@ void Updater::applyUpdateAndRestart(const std::string& newExePath) {
     std::ostringstream cmd;
     cmd << "cmd.exe /c \"ping 127.0.0.1 -n 2 > nul & "
         << "move /y \"" << newExePath << "\" \"" << currentExe << "\" & "
-        << "start \"\" \"" << currentExe << "\"\"";
+        << "start \"WinMirror AirPlay\" \"" << currentExe << "\"\"";
 
     STARTUPINFOA si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
     std::string cmdStr = cmd.str();
 
     std::cout << "[Updater] Applying update and restarting..." << std::endl;
-    if (CreateProcessA(NULL, &cmdStr[0], NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+    if (CreateProcessA(NULL, &cmdStr[0], NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi)) {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         exit(0);
@@ -275,13 +286,17 @@ bool Updater::checkForUpdates(bool autoInstall) {
         return true;
     }
 
+    char currentExe[MAX_PATH] = {};
+    GetModuleFileNameA(NULL, currentExe, MAX_PATH);
+    std::string tempExe = std::string(currentExe) + ".update.exe";
+
     std::cout << "[Updater] Downloading update from " << downloadUrl << "..." << std::endl;
-    std::string tempExe = "winmirror_update.exe";
     if (downloadFile(downloadUrl, tempExe)) {
         std::cout << "[Updater] Update downloaded successfully (" << tempExe << ")." << std::endl;
         applyUpdateAndRestart(tempExe);
         return true;
     } else {
+        DeleteFileA(tempExe.c_str());
         std::cerr << "[Updater] Failed to download update." << std::endl;
         return false;
     }

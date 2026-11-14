@@ -70,44 +70,49 @@ void AudioCapture::refreshDeviceList() {
     }
 
     std::ostringstream oss;
-    oss << "-1|" << (reqIdx < 0 ? 1 : 0) << "|Default PC Audio (Auto)\n";
+    auto appendFlow = [&](EDataFlow flow, int baseIdx, const char* prefix, int autoIdx, const char* autoLabel) {
+        oss << autoIdx << "|" << (reqIdx == autoIdx ? 1 : 0) << "|" << autoLabel << "\n";
+        IMMDeviceCollection* coll = nullptr;
+        if (SUCCEEDED(m_enumerator->EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE, &coll)) && coll) {
+            UINT count = 0;
+            coll->GetCount(&count);
+            for (UINT i = 0; i < count && i < 900; ++i) {
+                IMMDevice* dev = nullptr;
+                if (SUCCEEDED(coll->Item(i, &dev)) && dev) {
+                    int wireIdx = baseIdx + static_cast<int>(i);
+                    std::string name = (flow == eCapture ? "Input Device " : "Output Device ") + std::to_string(i + 1);
+                    bool selected = (reqIdx == wireIdx);
 
-    IMMDeviceCollection* coll = nullptr;
-    if (SUCCEEDED(m_enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &coll)) && coll) {
-        UINT count = 0;
-        coll->GetCount(&count);
-        for (UINT i = 0; i < count; ++i) {
-            IMMDevice* dev = nullptr;
-            if (SUCCEEDED(coll->Item(i, &dev)) && dev) {
-                std::string name = "Audio Device " + std::to_string(i + 1);
-                bool selected = (reqIdx == static_cast<int>(i));
-
-                LPWSTR devId = nullptr;
-                if (SUCCEEDED(dev->GetId(&devId)) && devId) {
-                    if (reqIdx >= 0 && !targetId.empty()) {
-                        selected = (targetId == devId);
+                    LPWSTR devId = nullptr;
+                    if (SUCCEEDED(dev->GetId(&devId)) && devId) {
+                        if (reqIdx >= 0 && !targetId.empty()) {
+                            selected = (targetId == devId);
+                        }
+                        CoTaskMemFree(devId);
                     }
-                    CoTaskMemFree(devId);
-                }
 
-                IPropertyStore* props = nullptr;
-                if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &props)) && props) {
-                    PROPVARIANT pv;
-                    PropVariantInit(&pv);
-                    if (SUCCEEDED(props->GetValue(WINMIRROR_PKEY_FriendlyName, &pv)) &&
-                        pv.vt == VT_LPWSTR && pv.pwszVal) {
-                        std::string conv = wideToUtf8(pv.pwszVal);
-                        if (!conv.empty()) name = std::move(conv);
+                    IPropertyStore* props = nullptr;
+                    if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &props)) && props) {
+                        PROPVARIANT pv;
+                        PropVariantInit(&pv);
+                        if (SUCCEEDED(props->GetValue(WINMIRROR_PKEY_FriendlyName, &pv)) &&
+                            pv.vt == VT_LPWSTR && pv.pwszVal) {
+                            std::string conv = wideToUtf8(pv.pwszVal);
+                            if (!conv.empty()) name = std::move(conv);
+                        }
+                        PropVariantClear(&pv);
+                        props->Release();
                     }
-                    PropVariantClear(&pv);
-                    props->Release();
+                    oss << wireIdx << "|" << (selected ? 1 : 0) << "|" << prefix << name << "\n";
+                    dev->Release();
                 }
-                oss << i << "|" << (selected ? 1 : 0) << "|" << name << "\n";
-                dev->Release();
             }
+            coll->Release();
         }
-        coll->Release();
-    }
+    };
+
+    appendFlow(eRender, 0, "OUT:", -1, "OUT:Default PC Output (Auto)");
+    appendFlow(eCapture, 1000, "IN:", -2, "IN:Default PC Input / Mic (Auto)");
 
     std::string listStr = oss.str();
     bool changed = false;
@@ -128,7 +133,7 @@ void AudioCapture::setSourceDeviceIndex(int index) {
         std::lock_guard<std::mutex> lock(m_devListMutex);
         m_targetDeviceId.clear();
     }
-    m_requestedIndex.store(index < 0 ? -1 : index);
+    m_requestedIndex.store(index < -2 ? -1 : index);
     m_forceReinit.store(true);
 }
 
@@ -137,7 +142,7 @@ std::string AudioCapture::getDeviceListSerialized() {
     return m_cachedDeviceList;
 }
 
-bool AudioCapture::tryActivateDevice(IMMDevice* dev) {
+bool AudioCapture::tryActivateDevice(IMMDevice* dev, bool isInput) {
     if (!dev) return false;
 
     IAudioClient* client = nullptr;
@@ -153,9 +158,11 @@ bool AudioCapture::tryActivateDevice(IMMDevice* dev) {
         return false;
     }
 
+    // eRender requires loopback flag; eCapture must pass 0 (direct mic/line/virtual input)
+    DWORD streamFlags = isInput ? 0 : AUDCLNT_STREAMFLAGS_LOOPBACK;
     hr = client->Initialize(
         AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_LOOPBACK,
+        streamFlags,
         2000000, // 200ms buffer for low latency
         0,
         pwfx,
@@ -202,85 +209,97 @@ bool AudioCapture::initEndpoint() {
         targetId = m_targetDeviceId;
     }
 
-    IMMDeviceCollection* coll = nullptr;
-    UINT activeCount = 0;
-    if (SUCCEEDED(m_enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &coll)) && coll) {
-        coll->GetCount(&activeCount);
-    }
+    auto tryFlow = [&](EDataFlow flow, int baseIdx, int pinnedRelIdx) -> bool {
+        bool isInput = (flow == eCapture);
+        IMMDeviceCollection* coll = nullptr;
+        UINT activeCount = 0;
+        if (SUCCEEDED(m_enumerator->EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE, &coll)) && coll) {
+            coll->GetCount(&activeCount);
+        }
 
-    // 1. Honor explicit PC source selection (prefer stable device ID if known, else index)
-    if (reqIdx >= 0 && coll) {
-        IMMDevice* chosen = nullptr;
-        if (!targetId.empty()) {
-            for (UINT i = 0; i < activeCount; ++i) {
-                IMMDevice* cand = nullptr;
-                if (SUCCEEDED(coll->Item(i, &cand)) && cand) {
-                    LPWSTR cid = nullptr;
-                    bool match = (SUCCEEDED(cand->GetId(&cid)) && cid && targetId == cid);
-                    if (cid) CoTaskMemFree(cid);
-                    if (match) {
-                        chosen = cand;
-                        m_requestedIndex.store(static_cast<int>(i));
-                        break;
+        // 1. Pinned device by stable ID or relative index
+        if (pinnedRelIdx >= 0 && coll) {
+            IMMDevice* chosen = nullptr;
+            if (!targetId.empty()) {
+                for (UINT i = 0; i < activeCount; ++i) {
+                    IMMDevice* cand = nullptr;
+                    if (SUCCEEDED(coll->Item(i, &cand)) && cand) {
+                        LPWSTR cid = nullptr;
+                        bool match = (SUCCEEDED(cand->GetId(&cid)) && cid && targetId == cid);
+                        if (cid) CoTaskMemFree(cid);
+                        if (match) {
+                            chosen = cand;
+                            m_requestedIndex.store(baseIdx + static_cast<int>(i));
+                            break;
+                        }
+                        cand->Release();
                     }
-                    cand->Release();
+                }
+            } else if (static_cast<UINT>(pinnedRelIdx) < activeCount) {
+                coll->Item(static_cast<UINT>(pinnedRelIdx), &chosen);
+            }
+
+            if (chosen) {
+                bool ok = tryActivateDevice(chosen, isInput);
+                chosen->Release();
+                if (ok) {
+                    std::lock_guard<std::mutex> lock(m_devListMutex);
+                    m_targetDeviceId = m_deviceId;
+                    coll->Release();
+                    return true;
                 }
             }
-        } else if (static_cast<UINT>(reqIdx) < activeCount) {
-            coll->Item(static_cast<UINT>(reqIdx), &chosen);
+
+            // Pinned device unplugged or busy: reset to that flow's auto mode
+            m_requestedIndex.store(isInput ? -2 : -1);
+            std::lock_guard<std::mutex> lock(m_devListMutex);
+            m_targetDeviceId.clear();
         }
 
-        if (chosen) {
-            bool ok = tryActivateDevice(chosen);
-            chosen->Release();
-            if (ok) {
-                std::lock_guard<std::mutex> lock(m_devListMutex);
-                m_targetDeviceId = m_deviceId;
-                coll->Release();
-                refreshDeviceList();
-                return true;
-            }
-        }
-
-        // Unplugged or unavailable pinned source: gracefully fall back to Auto Default
-        m_requestedIndex.store(-1);
-        std::lock_guard<std::mutex> lock(m_devListMutex);
-        m_targetDeviceId.clear();
-    }
-
-    // 2. Try Windows default playback endpoints (eConsole -> eMultimedia)
-    for (ERole role : { eConsole, eMultimedia }) {
-        IMMDevice* defDev = nullptr;
-        if (SUCCEEDED(m_enumerator->GetDefaultAudioEndpoint(eRender, role, &defDev)) && defDev) {
-            bool ok = tryActivateDevice(defDev);
-            defDev->Release();
-            if (ok) {
-                if (coll) coll->Release();
-                refreshDeviceList();
-                return true;
-            }
-        }
-    }
-
-    // 3. Final fallback: any active render endpoint (e.g. Speakers / Monitor HDMI / VoiceMeeter)
-    if (coll) {
-        for (UINT i = 0; i < activeCount; ++i) {
-            IMMDevice* cand = nullptr;
-            if (SUCCEEDED(coll->Item(i, &cand)) && cand) {
-                bool ok = tryActivateDevice(cand);
-                cand->Release();
+        // 2. Default endpoint for this flow
+        for (ERole role : { eConsole, eMultimedia, eCommunications }) {
+            IMMDevice* defDev = nullptr;
+            if (SUCCEEDED(m_enumerator->GetDefaultAudioEndpoint(flow, role, &defDev)) && defDev) {
+                bool ok = tryActivateDevice(defDev, isInput);
+                defDev->Release();
                 if (ok) {
-                    coll->Release();
-                    refreshDeviceList();
+                    if (coll) coll->Release();
                     return true;
                 }
             }
         }
-        coll->Release();
+
+        // 3. Fallback: any active endpoint for this flow
+        if (coll) {
+            for (UINT i = 0; i < activeCount; ++i) {
+                IMMDevice* cand = nullptr;
+                if (SUCCEEDED(coll->Item(i, &cand)) && cand) {
+                    bool ok = tryActivateDevice(cand, isInput);
+                    cand->Release();
+                    if (ok) {
+                        coll->Release();
+                        return true;
+                    }
+                }
+            }
+            coll->Release();
+        }
+        return false;
+    };
+
+    bool ok = false;
+    if (reqIdx == -2 || reqIdx >= 1000) {
+        ok = tryFlow(eCapture, 1000, reqIdx >= 1000 ? (reqIdx - 1000) : -1);
+        if (!ok) {
+            m_requestedIndex.store(-1);
+            ok = tryFlow(eRender, 0, -1);
+        }
+    } else {
+        ok = tryFlow(eRender, 0, reqIdx);
     }
 
     refreshDeviceList();
-    return false;
+    return ok;
 }
 
 bool AudioCapture::init(AudioDataCallback callback, AudioDevicesCallback devCallback) {
@@ -353,11 +372,13 @@ void AudioCapture::captureLoop() {
             lastEndpointPoll = now;
             refreshDeviceList();
 
-            if (m_requestedIndex.load() < 0 && m_enumerator && m_captureClient) {
+            int reqIdxNow = m_requestedIndex.load();
+            if (reqIdxNow < 0 && m_enumerator && m_captureClient) {
+                EDataFlow pollFlow = (reqIdxNow == -2) ? eCapture : eRender;
                 IMMDevice* defDev = nullptr;
-                HRESULT defHr = m_enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &defDev);
+                HRESULT defHr = m_enumerator->GetDefaultAudioEndpoint(pollFlow, eConsole, &defDev);
                 if (FAILED(defHr) || !defDev) {
-                    defHr = m_enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &defDev);
+                    defHr = m_enumerator->GetDefaultAudioEndpoint(pollFlow, eMultimedia, &defDev);
                 }
                 if (SUCCEEDED(defHr) && defDev) {
                     LPWSTR defId = nullptr;
