@@ -49,9 +49,9 @@ bool Updater::fetchLatestReleaseInfo(std::string& outTag, std::string& outDownlo
     );
     if (!hSession) return false;
 
-    // Follow redirects automatically
-    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
-    WinHttpSetOption(hSession, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
+    // Enable TLS 1.2 and TLS 1.3 for GitHub
+    DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+    WinHttpSetOption(hSession, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
 
     HINTERNET hConnect = WinHttpConnect(hSession, L"api.github.com", INTERNET_DEFAULT_HTTPS_PORT, 0);
     if (!hConnect) {
@@ -75,6 +75,9 @@ bool Updater::fetchLatestReleaseInfo(std::string& outTag, std::string& outDownlo
         WinHttpCloseHandle(hSession);
         return false;
     }
+
+    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
 
     std::wstring headers = L"User-Agent: WinMirror-Updater\r\nAccept: application/vnd.github.v3+json\r\n";
     BOOL bResults = WinHttpSendRequest(
@@ -165,8 +168,8 @@ bool Updater::downloadFile(const std::string& url, const std::string& outputPath
     );
     if (!hSession) return false;
 
-    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
-    WinHttpSetOption(hSession, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
+    DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+    WinHttpSetOption(hSession, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
 
     HINTERNET hConnect = WinHttpConnect(hSession, hostName, urlComp.nPort, 0);
     if (!hConnect) {
@@ -181,6 +184,9 @@ bool Updater::downloadFile(const std::string& url, const std::string& outputPath
         WinHttpCloseHandle(hSession);
         return false;
     }
+
+    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
 
     std::wstring headers = L"User-Agent: WinMirror-Updater\r\n";
     BOOL bResults = WinHttpSendRequest(hRequest, headers.c_str(), static_cast<DWORD>(headers.length()), WINHTTP_NO_REQUEST_DATA, 0, 0, 0);

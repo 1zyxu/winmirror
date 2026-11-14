@@ -25,6 +25,7 @@ private:
     void handleSnapshot(SOCKET clientSock);
     void handleStatus(SOCKET clientSock);
     void handleTriggerUpdate(SOCKET clientSock);
+    void handleUpload(SOCKET clientSock, const std::string& initialData);
 
     FrameBuffer& m_frameBuffer;
     AudioBuffer& m_audioBuffer;

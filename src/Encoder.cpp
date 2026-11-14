@@ -56,10 +56,20 @@ bool Encoder::encodeBgraToJpeg(const uint8_t* bgra, uint32_t width, uint32_t hei
 
     const uint8_t* src = bgra;
     uint8_t* dst = m_bgrBuffer.data();
-    for (size_t i = 0; i < totalPixels; ++i) {
-        dst[0] = src[0]; // B
-        dst[1] = src[1]; // G
-        dst[2] = src[2]; // R
+    size_t i = 0;
+    size_t fastPixels = totalPixels >= 4 ? totalPixels - 4 : 0;
+    for (; i <= fastPixels; i += 4) {
+        dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2];
+        dst[3] = src[4]; dst[4] = src[5]; dst[5] = src[6];
+        dst[6] = src[8]; dst[7] = src[9]; dst[8] = src[10];
+        dst[9] = src[12]; dst[10] = src[13]; dst[11] = src[14];
+        dst += 12;
+        src += 16;
+    }
+    for (; i < totalPixels; ++i) {
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = src[2];
         dst += 3;
         src += 4;
     }

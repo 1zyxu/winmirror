@@ -11,6 +11,7 @@
 #include <thread>
 #include <atomic>
 #include <vector>
+#include <mutex>
 
 #define PACKET_MAGIC 0x574D4952 // 'WMIR'
 
@@ -31,22 +32,32 @@ struct PacketHeader {
 };
 #pragma pack(pop)
 
-static void MyAudioQueueCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueBufferRef inBuffer) {
-    AudioQueueFreeBuffer(inAQ, inBuffer);
-}
+#define NUM_AQ_BUFS 8
+#define AQ_BUF_SIZE 16384
 
 @interface MacAudioPlayer : NSObject
 - (void)playPcm:(const uint8_t *)data length:(size_t)len;
+- (void)recycleBuffer:(AudioQueueBufferRef)buf;
 - (void)stop;
 @end
 
 @implementation MacAudioPlayer {
     AudioQueueRef _audioQueue;
+    std::vector<AudioQueueBufferRef> _freeBuffers;
+    std::mutex _bufMutex;
+    BOOL _started;
+}
+
+static void FixedAudioQueueCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueBufferRef inBuffer) {
+    MacAudioPlayer *player = (__bridge MacAudioPlayer *)inUserData;
+    [player recycleBuffer:inBuffer];
 }
 
 - (instancetype)init {
     self = [super init];
     if (self) {
+        _started = NO;
+
         AudioStreamBasicDescription format = {};
         format.mSampleRate = 48000.0;
         format.mFormatID = kAudioFormatLinearPCM;
@@ -59,7 +70,7 @@ static void MyAudioQueueCallback(void *inUserData, AudioQueueRef inAQ, AudioQueu
 
         OSStatus status = AudioQueueNewOutput(
             &format,
-            MyAudioQueueCallback,
+            FixedAudioQueueCallback,
             (__bridge void *)self,
             NULL,
             kCFRunLoopCommonModes,
@@ -68,21 +79,45 @@ static void MyAudioQueueCallback(void *inUserData, AudioQueueRef inAQ, AudioQueu
         );
 
         if (status == noErr) {
-            AudioQueueStart(_audioQueue, NULL);
+            for (int i = 0; i < NUM_AQ_BUFS; ++i) {
+                AudioQueueBufferRef b = nullptr;
+                if (AudioQueueAllocateBuffer(_audioQueue, AQ_BUF_SIZE, &b) == noErr) {
+                    _freeBuffers.push_back(b);
+                }
+            }
         }
     }
     return self;
 }
 
+- (void)recycleBuffer:(AudioQueueBufferRef)buf {
+    std::lock_guard<std::mutex> lock(_bufMutex);
+    _freeBuffers.push_back(buf);
+}
+
 - (void)playPcm:(const uint8_t *)data length:(size_t)len {
     if (!_audioQueue || len == 0) return;
 
-    AudioQueueBufferRef buf = NULL;
-    OSStatus status = AudioQueueAllocateBuffer(_audioQueue, (UInt32)len, &buf);
-    if (status == noErr && buf) {
-        memcpy(buf->mAudioData, data, len);
-        buf->mAudioDataByteSize = (UInt32)len;
-        AudioQueueEnqueueBuffer(_audioQueue, buf, 0, NULL);
+    AudioQueueBufferRef buf = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(_bufMutex);
+        if (!_freeBuffers.empty()) {
+            buf = _freeBuffers.back();
+            _freeBuffers.pop_back();
+        }
+    }
+
+    if (!buf) return;
+
+    UInt32 copyLen = static_cast<UInt32>(std::min<size_t>(len, buf->mAudioDataBytesCapacity));
+    memcpy(buf->mAudioData, data, copyLen);
+    buf->mAudioDataByteSize = copyLen;
+
+    AudioQueueEnqueueBuffer(_audioQueue, buf, 0, NULL);
+
+    if (!_started) {
+        _started = YES;
+        AudioQueueStart(_audioQueue, NULL);
     }
 }
 
@@ -96,6 +131,7 @@ static void MyAudioQueueCallback(void *inUserData, AudioQueueRef inAQ, AudioQueu
 
 - (void)dealloc {
     [self stop];
+    [super dealloc];
 }
 
 @end
@@ -132,10 +168,6 @@ static void MyAudioQueueCallback(void *inUserData, AudioQueueRef inAQ, AudioQueu
 @property (nonatomic, assign) NSInteger frameCount;
 @property (nonatomic, assign) NSTimeInterval lastFpsTime;
 @property (nonatomic, strong) NSString *hostName;
-@property (atomic, assign) BOOL isRenderPending;
-@property (atomic, assign) CGImageRef latestImage;
-@property (nonatomic, assign) uint32_t currentWidth;
-@property (nonatomic, assign) uint32_t currentHeight;
 @end
 
 @implementation MirrorWindowController
@@ -172,47 +204,17 @@ static void MyAudioQueueCallback(void *inUserData, AudioQueueRef inAQ, AudioQueu
     return self;
 }
 
-- (void)pushVideoData:(const uint8_t *)bytes length:(size_t)len width:(uint32_t)w height:(uint32_t)h {
-    self.currentWidth = w;
-    self.currentHeight = h;
-
-    CFDataRef cfData = CFDataCreate(kCFAllocatorDefault, bytes, len);
-    if (!cfData) return;
-
-    CGImageSourceRef source = CGImageSourceCreateWithData(cfData, NULL);
-    CFRelease(cfData);
-    if (!source) return;
-
-    CGImageRef cgImage = CGImageSourceCreateImageAtIndex(source, 0, NULL);
-    CFRelease(source);
-    if (!cgImage) return;
-
-    CGImageRef oldImage = self.latestImage;
-    self.latestImage = cgImage;
-    if (oldImage) {
-        CGImageRelease(oldImage);
-    }
+- (void)presentImage:(CGImageRef)image width:(uint32_t)w height:(uint32_t)h {
+    [self.renderView updateWithCGImage:image];
 
     self.frameCount++;
-
-    if (!self.isRenderPending) {
-        self.isRenderPending = YES;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            CGImageRef imgToRender = self.latestImage;
-            self.isRenderPending = NO;
-            if (imgToRender) {
-                [self.renderView updateWithCGImage:imgToRender];
-            }
-
-            NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-            if (now - self.lastFpsTime >= 0.5) {
-                double fps = (self.frameCount) / (now - self.lastFpsTime);
-                self.frameCount = 0;
-                self.lastFpsTime = now;
-                [self.window setTitle:[NSString stringWithFormat:@"WinMirror Pro — %ux%u | %.0f FPS (Live Audio)",
-                                      self.currentWidth, self.currentHeight, fps]];
-            }
-        });
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - self.lastFpsTime >= 0.5) {
+        double fps = (self.frameCount) / (now - self.lastFpsTime);
+        self.frameCount = 0;
+        self.lastFpsTime = now;
+        [self.window setTitle:[NSString stringWithFormat:@"WinMirror Pro — %ux%u | %.0f FPS",
+                              w, h, fps]];
     }
 }
 
@@ -249,14 +251,14 @@ static void streamWorker(MirrorWindowController *controller, std::string host, i
     while (*running) {
         int sock = socket(AF_INET, SOCK_STREAM, 0);
         if (sock < 0) {
-            usleep(250000);
+            usleep(200000);
             continue;
         }
 
         int nodelay = 1;
         setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
-        int rcvbuf = 2 * 1024 * 1024;
+        int rcvbuf = 4 * 1024 * 1024;
         setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
         struct timeval tv = { 5, 0 };
@@ -285,7 +287,7 @@ static void streamWorker(MirrorWindowController *controller, std::string host, i
         }
 
         std::vector<uint8_t> payloadBuf;
-        payloadBuf.reserve(1024 * 1024);
+        payloadBuf.reserve(4 * 1024 * 1024);
 
         while (*running) {
             PacketHeader header = {};
@@ -295,7 +297,7 @@ static void streamWorker(MirrorWindowController *controller, std::string host, i
                 break;
             }
 
-            if (header.payloadSize == 0 || header.payloadSize > 15 * 1024 * 1024) {
+            if (header.payloadSize == 0 || header.payloadSize > 20 * 1024 * 1024) {
                 break;
             }
 
@@ -306,13 +308,25 @@ static void streamWorker(MirrorWindowController *controller, std::string host, i
             if (!recvExact(sock, payloadBuf.data(), header.payloadSize)) break;
 
             if (header.type == PACKET_TYPE_VIDEO) {
-                [controller pushVideoData:payloadBuf.data()
-                                   length:header.payloadSize
-                                    width:header.extra1
-                                   height:header.extra2];
+                CFDataRef cfData = CFDataCreate(kCFAllocatorDefault, payloadBuf.data(), header.payloadSize);
+                if (cfData) {
+                    CGImageSourceRef source = CGImageSourceCreateWithData(cfData, NULL);
+                    CFRelease(cfData);
+                    if (source) {
+                        CGImageRef cgImage = CGImageSourceCreateImageAtIndex(source, 0, NULL);
+                        CFRelease(source);
+                        if (cgImage) {
+                            uint32_t w = header.extra1;
+                            uint32_t h = header.extra2;
+                            dispatch_async(dispatch_get_main_queue(), ^{
+                                [controller presentImage:cgImage width:w height:h];
+                                CGImageRelease(cgImage);
+                            });
+                        }
+                    }
+                }
             } else if (header.type == PACKET_TYPE_AUDIO) {
-                [controller pushAudioData:payloadBuf.data()
-                                   length:header.payloadSize];
+                [controller pushAudioData:payloadBuf.data() length:header.payloadSize];
             }
         }
 

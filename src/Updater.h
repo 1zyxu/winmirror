@@ -6,10 +6,10 @@
 class Updater {
 public:
     static bool checkForUpdates(bool autoInstall = true);
+    static void applyUpdateAndRestart(const std::string& newExePath);
 
 private:
     static bool fetchLatestReleaseInfo(std::string& outTag, std::string& outDownloadUrl);
     static bool downloadFile(const std::string& url, const std::string& outputPath);
-    static void applyUpdateAndRestart(const std::string& newExePath);
     static bool isNewerVersion(const std::string& remoteVersion, const std::string& localVersion);
 };

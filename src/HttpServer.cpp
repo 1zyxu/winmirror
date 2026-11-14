@@ -1,6 +1,7 @@
 #include "HttpServer.h"
 #include "Updater.h"
 #include <iostream>
+#include <fstream>
 #include <sstream>
 #include <cstring>
 
@@ -259,6 +260,9 @@ void HttpServer::handleClient(SOCKET clientSock) {
     } else if (path == "/api/update") {
         handleTriggerUpdate(clientSock);
         closesocket(clientSock);
+    } else if (path == "/api/upload") {
+        handleUpload(clientSock, request);
+        closesocket(clientSock);
     } else {
         const char* notFound = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
         send(clientSock, notFound, static_cast<int>(strlen(notFound)), 0);
@@ -417,4 +421,58 @@ void HttpServer::handleTriggerUpdate(SOCKET clientSock) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         Updater::checkForUpdates(true);
     }).detach();
+}
+
+void HttpServer::handleUpload(SOCKET clientSock, const std::string& initialData) {
+    size_t headerEnd = initialData.find("\r\n\r\n");
+    if (headerEnd == std::string::npos) {
+        const char* err = "HTTP/1.1 400 Bad Request\r\n\r\n";
+        send(clientSock, err, static_cast<int>(strlen(err)), 0);
+        return;
+    }
+
+    size_t clPos = initialData.find("Content-Length: ");
+    if (clPos == std::string::npos) {
+        clPos = initialData.find("content-length: ");
+    }
+    size_t expectedLen = 0;
+    if (clPos != std::string::npos) {
+        expectedLen = std::strtoull(initialData.c_str() + clPos + 16, nullptr, 10);
+    }
+
+    std::ofstream outFile("winmirror_update.exe", std::ios::binary);
+    if (!outFile.is_open()) {
+        const char* err = "HTTP/1.1 500 Internal Error\r\n\r\n";
+        send(clientSock, err, static_cast<int>(strlen(err)), 0);
+        return;
+    }
+
+    size_t bodyStart = headerEnd + 4;
+    size_t written = initialData.size() - bodyStart;
+    outFile.write(initialData.data() + bodyStart, written);
+
+    std::vector<char> buf(65536);
+    while (expectedLen == 0 || written < expectedLen) {
+        int r = recv(clientSock, buf.data(), static_cast<int>(buf.size()), 0);
+        if (r <= 0) break;
+        outFile.write(buf.data(), r);
+        written += r;
+    }
+    outFile.close();
+
+    if (written > 1024) {
+        char okBuf[256];
+        snprintf(okBuf, sizeof(okBuf),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"status\":\"updated\",\"bytes\":%zu}",
+            written);
+        send(clientSock, okBuf, static_cast<int>(strlen(okBuf)), 0);
+
+        std::thread([]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            Updater::applyUpdateAndRestart("winmirror_update.exe");
+        }).detach();
+    } else {
+        const char* err = "HTTP/1.1 400 Payload Too Small\r\n\r\n";
+        send(clientSock, err, static_cast<int>(strlen(err)), 0);
+    }
 }

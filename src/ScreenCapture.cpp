@@ -58,7 +58,7 @@ void ScreenCapture::initHalfTable() {
     s_tableInitialized = true;
 }
 
-void ScreenCapture::drawCursor(uint8_t* bgra, uint32_t width, uint32_t height) {
+void ScreenCapture::drawCursor(uint8_t* bgra, uint32_t width, uint32_t height, int32_t screenLeft, int32_t screenTop) {
     CURSORINFO ci = { sizeof(CURSORINFO) };
     if (!GetCursorInfo(&ci)) return;
     if (!(ci.flags & CURSOR_SHOWING) || !ci.hCursor) return;
@@ -71,8 +71,8 @@ void ScreenCapture::drawCursor(uint8_t* bgra, uint32_t width, uint32_t height) {
     if (cx <= 0) cx = 32;
     if (cy <= 0) cy = 32;
 
-    int cursorX = ci.ptScreenPos.x - ii.xHotspot;
-    int cursorY = ci.ptScreenPos.y - ii.yHotspot;
+    int cursorX = (ci.ptScreenPos.x - screenLeft) - ii.xHotspot;
+    int cursorY = (ci.ptScreenPos.y - screenTop) - ii.yHotspot;
 
     HDC hdcScreen = GetDC(NULL);
     HDC hdcMem = CreateCompatibleDC(hdcScreen);
@@ -90,40 +90,36 @@ void ScreenCapture::drawCursor(uint8_t* bgra, uint32_t width, uint32_t height) {
     HBITMAP hbmOld = static_cast<HBITMAP>(SelectObject(hdcMem, hbmMem));
 
     uint32_t* pPixels = reinterpret_cast<uint32_t*>(pBits);
-    for (int i = 0; i < cx * cy; ++i) {
-        pPixels[i] = 0x00FF00FF; // magenta transparent key
+
+    // 1. Copy real background from bgra underneath the cursor
+    for (int y = 0; y < cy; ++y) {
+        int sy = cursorY + y;
+        for (int x = 0; x < cx; ++x) {
+            int sx = cursorX + x;
+            if (sy >= 0 && sy < static_cast<int>(height) && sx >= 0 && sx < static_cast<int>(width)) {
+                size_t idx = (static_cast<size_t>(sy) * width + sx) * 4;
+                pPixels[y * cx + x] = bgra[idx] | (bgra[idx + 1] << 8) | (bgra[idx + 2] << 16) | (0xFF << 24);
+            } else {
+                pPixels[y * cx + x] = 0;
+            }
+        }
     }
 
+    // 2. Windows draws and blends the icon natively with full alpha/mask support
     DrawIconEx(hdcMem, 0, 0, ci.hCursor, cx, cy, 0, NULL, DI_NORMAL);
 
+    // 3. Write blended pixels back to bgra buffer
     for (int y = 0; y < cy; ++y) {
-        int screenY = cursorY + y;
-        if (screenY < 0 || screenY >= static_cast<int>(height)) continue;
-
+        int sy = cursorY + y;
+        if (sy < 0 || sy >= static_cast<int>(height)) continue;
         for (int x = 0; x < cx; ++x) {
-            int screenX = cursorX + x;
-            if (screenX < 0 || screenX >= static_cast<int>(width)) continue;
-
-            uint32_t cur = pPixels[y * cx + x];
-            if (cur == 0x00FF00FF) continue;
-
-            size_t screenIdx = (static_cast<size_t>(screenY) * width + screenX) * 4;
-            uint8_t curB = cur & 0xFF;
-            uint8_t curG = (cur >> 8) & 0xFF;
-            uint8_t curR = (cur >> 16) & 0xFF;
-            uint8_t curA = (cur >> 24) & 0xFF;
-
-            if (curA == 0 || curA == 255) {
-                bgra[screenIdx]     = curB;
-                bgra[screenIdx + 1] = curG;
-                bgra[screenIdx + 2] = curR;
-            } else {
-                float a = curA / 255.0f;
-                float invA = 1.0f - a;
-                bgra[screenIdx]     = static_cast<uint8_t>(curB * a + bgra[screenIdx] * invA);
-                bgra[screenIdx + 1] = static_cast<uint8_t>(curG * a + bgra[screenIdx + 1] * invA);
-                bgra[screenIdx + 2] = static_cast<uint8_t>(curR * a + bgra[screenIdx + 2] * invA);
-            }
+            int sx = cursorX + x;
+            if (sx < 0 || sx >= static_cast<int>(width)) continue;
+            uint32_t c = pPixels[y * cx + x];
+            size_t idx = (static_cast<size_t>(sy) * width + sx) * 4;
+            bgra[idx + 0] = c & 0xFF;         // B
+            bgra[idx + 1] = (c >> 8) & 0xFF;  // G
+            bgra[idx + 2] = (c >> 16) & 0xFF; // R
         }
     }
 
@@ -222,6 +218,8 @@ bool ScreenCapture::initDxgi() {
 
     DXGI_OUTPUT_DESC outputDesc;
     dxgiOutput1->GetDesc(&outputDesc);
+    m_screenLeft = outputDesc.DesktopCoordinates.left;
+    m_screenTop = outputDesc.DesktopCoordinates.top;
     m_width = outputDesc.DesktopCoordinates.right - outputDesc.DesktopCoordinates.left;
     m_height = outputDesc.DesktopCoordinates.bottom - outputDesc.DesktopCoordinates.top;
 
@@ -242,8 +240,6 @@ void ScreenCapture::cleanupDxgi() {
 bool ScreenCapture::capture(RawFrame& outFrame) {
     if (m_useDxgi) {
         if (captureDxgi(outFrame)) {
-            // Draw mouse cursor seamlessly onto the captured frame
-            drawCursor(outFrame.bgra.data(), outFrame.width, outFrame.height);
             return true;
         }
         if (!m_duplication) {
@@ -253,7 +249,7 @@ bool ScreenCapture::capture(RawFrame& outFrame) {
     }
 
     if (captureGdi(outFrame)) {
-        drawCursor(outFrame.bgra.data(), outFrame.width, outFrame.height);
+        drawCursor(outFrame.bgra.data(), outFrame.width, outFrame.height, 0, 0);
         return true;
     }
     return false;
@@ -267,6 +263,22 @@ bool ScreenCapture::captureDxgi(RawFrame& outFrame) {
 
     HRESULT hr = m_duplication->AcquireNextFrame(16, &frameInfo, &desktopResource);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+        CURSORINFO ci = { sizeof(CURSORINFO) };
+        if (GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING) && ci.hCursor) {
+            if (ci.ptScreenPos.x != m_lastCursorPos.x || ci.ptScreenPos.y != m_lastCursorPos.y || ci.hCursor != m_lastHCursor) {
+                if (!m_lastCleanBgra.empty()) {
+                    m_lastCursorPos = ci.ptScreenPos;
+                    m_lastHCursor = ci.hCursor;
+
+                    outFrame.width = m_width;
+                    outFrame.height = m_height;
+                    outFrame.pitch = m_width * 4;
+                    outFrame.bgra = m_lastCleanBgra;
+                    drawCursor(outFrame.bgra.data(), m_width, m_height, m_screenLeft, m_screenTop);
+                    return true;
+                }
+            }
+        }
         return false;
     }
     if (FAILED(hr)) {
@@ -380,6 +392,17 @@ bool ScreenCapture::captureDxgi(RawFrame& outFrame) {
     }
 
     m_d3dContext->Unmap(m_stagingTexture, 0);
+
+    // Save clean desktop frame for smooth mouse interpolation
+    m_lastCleanBgra = outFrame.bgra;
+
+    CURSORINFO ci = { sizeof(CURSORINFO) };
+    if (GetCursorInfo(&ci)) {
+        m_lastCursorPos = ci.ptScreenPos;
+        m_lastHCursor = ci.hCursor;
+    }
+
+    drawCursor(outFrame.bgra.data(), outFrame.width, outFrame.height, m_screenLeft, m_screenTop);
     return true;
 }
 

@@ -37,12 +37,19 @@ private:
     bool captureGdi(RawFrame& outFrame);
 
     static void initHalfTable();
-    static void drawCursor(uint8_t* bgra, uint32_t width, uint32_t height);
+    static void drawCursor(uint8_t* bgra, uint32_t width, uint32_t height, int32_t screenLeft, int32_t screenTop);
 
     bool m_useDxgi = true;
     uint32_t m_width = 0;
     uint32_t m_height = 0;
+    int32_t m_screenLeft = 0;
+    int32_t m_screenTop = 0;
     DXGI_FORMAT m_format = DXGI_FORMAT_B8G8R8A8_UNORM;
+
+    // Cache for 60 FPS smooth mouse tracking even on static screens
+    std::vector<uint8_t> m_lastCleanBgra;
+    POINT m_lastCursorPos = { -1, -1 };
+    HCURSOR m_lastHCursor = nullptr;
 
     // DXGI resources
     ID3D11Device* m_d3dDevice = nullptr;
