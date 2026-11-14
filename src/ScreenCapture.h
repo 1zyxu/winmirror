@@ -20,12 +20,12 @@ public:
     bool init();
     void cleanup();
 
-    // Returns true if a new frame was captured, false if timeout (static screen) or error
     bool capture(RawFrame& outFrame);
 
     uint32_t getWidth() const { return m_width; }
     uint32_t getHeight() const { return m_height; }
     bool isDxgiActive() const { return m_useDxgi; }
+    DXGI_FORMAT getPixelFormat() const { return m_format; }
 
 private:
     bool initDxgi();
@@ -36,9 +36,12 @@ private:
     void cleanupGdi();
     bool captureGdi(RawFrame& outFrame);
 
+    static void initHalfTable();
+
     bool m_useDxgi = true;
     uint32_t m_width = 0;
     uint32_t m_height = 0;
+    DXGI_FORMAT m_format = DXGI_FORMAT_B8G8R8A8_UNORM;
 
     // DXGI resources
     ID3D11Device* m_d3dDevice = nullptr;

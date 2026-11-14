@@ -1,11 +1,62 @@
 #include "ScreenCapture.h"
 #include <iostream>
+#include <cmath>
 
 #ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
 #define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((DPI_AWARENESS_CONTEXT)-4)
 #endif
 
 typedef BOOL(WINAPI* PFN_SetProcessDpiAwarenessContext)(DPI_AWARENESS_CONTEXT);
+
+static uint8_t s_halfToByteTable[65536];
+static bool s_tableInitialized = false;
+
+struct HalfRGBA {
+    uint16_t r;
+    uint16_t g;
+    uint16_t b;
+    uint16_t a;
+};
+
+void ScreenCapture::initHalfTable() {
+    if (s_tableInitialized) return;
+
+    for (uint32_t i = 0; i < 65536; ++i) {
+        uint16_t h = static_cast<uint16_t>(i);
+        uint32_t sign = (h >> 15) & 1;
+        uint32_t exp = (h >> 10) & 0x1f;
+        uint32_t mant = h & 0x3ff;
+
+        if (sign) {
+            s_halfToByteTable[i] = 0;
+            continue;
+        }
+
+        if (exp == 31) {
+            s_halfToByteTable[i] = 255;
+            continue;
+        }
+
+        float f = 0.0f;
+        if (exp == 0) {
+            f = (mant / 1024.0f) * std::ldexp(1.0f, -14);
+        } else {
+            f = (1.0f + mant / 1024.0f) * std::ldexp(1.0f, static_cast<int>(exp) - 15);
+        }
+
+        if (f <= 0.0f) {
+            s_halfToByteTable[i] = 0;
+        } else if (f >= 1.0f) {
+            s_halfToByteTable[i] = 255;
+        } else {
+            // Standard sRGB gamma 2.2 curve for vibrant, true colors
+            float srgb = std::pow(f, 1.0f / 2.2f);
+            s_halfToByteTable[i] = static_cast<uint8_t>(srgb * 255.0f + 0.5f);
+        }
+    }
+
+    s_tableInitialized = true;
+}
 
 ScreenCapture::ScreenCapture() = default;
 
@@ -14,7 +65,8 @@ ScreenCapture::~ScreenCapture() {
 }
 
 bool ScreenCapture::init() {
-    // Enable Per-Monitor V2 DPI awareness to prevent Windows GDI/DPI virtualization mismatches
+    initHalfTable();
+
     HMODULE hUser32 = GetModuleHandleA("user32.dll");
     if (hUser32) {
         auto setDpiAwareness = (PFN_SetProcessDpiAwarenessContext)GetProcAddress(hUser32, "SetProcessDpiAwarenessContext");
@@ -24,14 +76,15 @@ bool ScreenCapture::init() {
     }
 
     if (initDxgi()) {
-        std::cout << "[ScreenCapture] DXGI GPU Capture Active (" << m_width << "x" << m_height << ")" << std::endl;
+        std::cout << "[ScreenCapture] Initialized DXGI Desktop Duplication (GPU Capture: "
+                  << m_width << "x" << m_height << ")" << std::endl;
         m_useDxgi = true;
         return true;
     }
 
     std::cout << "[ScreenCapture] Falling back to GDI capture..." << std::endl;
     if (initGdi()) {
-        std::cout << "[ScreenCapture] GDI Capture Active (" << m_width << "x" << m_height << ")" << std::endl;
+        std::cout << "[ScreenCapture] Initialized GDI Capture (" << m_width << "x" << m_height << ")" << std::endl;
         m_useDxgi = false;
         return true;
     }
@@ -144,11 +197,11 @@ bool ScreenCapture::captureDxgi(RawFrame& outFrame) {
         return false;
     }
 
-    // Always get the EXACT physical pixel dimensions of the GPU surface
     D3D11_TEXTURE2D_DESC actualDesc;
     desktopImage->GetDesc(&actualDesc);
 
-    if (!m_stagingTexture || m_width != actualDesc.Width || m_height != actualDesc.Height) {
+    // Recreate staging texture if resolution or pixel format changed
+    if (!m_stagingTexture || m_width != actualDesc.Width || m_height != actualDesc.Height || m_format != actualDesc.Format) {
         if (m_stagingTexture) {
             m_stagingTexture->Release();
             m_stagingTexture = nullptr;
@@ -156,13 +209,14 @@ bool ScreenCapture::captureDxgi(RawFrame& outFrame) {
 
         m_width = actualDesc.Width;
         m_height = actualDesc.Height;
+        m_format = actualDesc.Format;
 
         D3D11_TEXTURE2D_DESC desc = {};
         desc.Width = m_width;
         desc.Height = m_height;
         desc.MipLevels = 1;
         desc.ArraySize = 1;
-        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.Format = m_format; // EXACT matching format (supports HDR Float16 & SDR BGRA)
         desc.SampleDesc.Count = 1;
         desc.Usage = D3D11_USAGE_STAGING;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -187,20 +241,57 @@ bool ScreenCapture::captureDxgi(RawFrame& outFrame) {
     outFrame.height = m_height;
     outFrame.pitch = m_width * 4;
 
-    size_t totalBytes = (size_t)m_width * m_height * 4;
+    size_t totalBytes = static_cast<size_t>(m_width) * m_height * 4;
     if (outFrame.bgra.size() != totalBytes) {
         outFrame.bgra.resize(totalBytes);
     }
 
     const uint8_t* srcRow = static_cast<const uint8_t*>(mapped.pData);
     uint8_t* dstRow = outFrame.bgra.data();
-    size_t rowBytes = (size_t)m_width * 4;
 
-    // Strict row pitch copy: handles GPU padding/alignment perfectly without stride drift
-    for (uint32_t y = 0; y < m_height; ++y) {
-        memcpy(dstRow, srcRow, rowBytes);
-        srcRow += mapped.RowPitch;
-        dstRow += rowBytes;
+    if (m_format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        // Windows 11 HDR / Auto-HDR (scRGB 64-bit float) -> 32-bit BGRA
+        for (uint32_t y = 0; y < m_height; ++y) {
+            const HalfRGBA* srcPixel = reinterpret_cast<const HalfRGBA*>(srcRow);
+            uint8_t* dstPixel = dstRow;
+
+            for (uint32_t x = 0; x < m_width; ++x) {
+                dstPixel[0] = s_halfToByteTable[srcPixel[x].b];
+                dstPixel[1] = s_halfToByteTable[srcPixel[x].g];
+                dstPixel[2] = s_halfToByteTable[srcPixel[x].r];
+                dstPixel[3] = 255;
+                dstPixel += 4;
+            }
+
+            srcRow += mapped.RowPitch;
+            dstRow += (m_width * 4);
+        }
+    } else if (m_format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+        // 10-bit HDR -> 32-bit BGRA
+        for (uint32_t y = 0; y < m_height; ++y) {
+            const uint32_t* srcPixel = reinterpret_cast<const uint32_t*>(srcRow);
+            uint8_t* dstPixel = dstRow;
+
+            for (uint32_t x = 0; x < m_width; ++x) {
+                uint32_t p = srcPixel[x];
+                dstPixel[0] = static_cast<uint8_t>((p >> 20) & 0x3FF) >> 2;
+                dstPixel[1] = static_cast<uint8_t>((p >> 10) & 0x3FF) >> 2;
+                dstPixel[2] = static_cast<uint8_t>(p & 0x3FF) >> 2;
+                dstPixel[3] = 255;
+                dstPixel += 4;
+            }
+
+            srcRow += mapped.RowPitch;
+            dstRow += (m_width * 4);
+        }
+    } else {
+        // Standard SDR 8-bit B8G8R8A8_UNORM
+        size_t rowBytes = static_cast<size_t>(m_width) * 4;
+        for (uint32_t y = 0; y < m_height; ++y) {
+            memcpy(dstRow, srcRow, rowBytes);
+            srcRow += mapped.RowPitch;
+            dstRow += rowBytes;
+        }
     }
 
     m_d3dContext->Unmap(m_stagingTexture, 0);
@@ -252,7 +343,7 @@ bool ScreenCapture::captureGdi(RawFrame& outFrame) {
     outFrame.height = m_height;
     outFrame.pitch = m_width * 4;
 
-    size_t totalBytes = (size_t)m_width * m_height * 4;
+    size_t totalBytes = static_cast<size_t>(m_width) * m_height * 4;
     if (outFrame.bgra.size() != totalBytes) {
         outFrame.bgra.resize(totalBytes);
     }
