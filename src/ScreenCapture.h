@@ -45,7 +45,8 @@ public:
 
     uint32_t getWidth() const { return m_width; }
     uint32_t getHeight() const { return m_height; }
-    bool isDxgiActive() const { return m_useDxgi; }
+    bool isDxgiActive() const { return m_mode == CaptureMode::Dxgi || m_mode == CaptureMode::Wgc; }
+    bool isWgcActive() const { return m_mode == CaptureMode::Wgc; }
     bool isHdrOutput() const { return m_isHdrOutput || m_format == DXGI_FORMAT_R16G16B16A16_FLOAT; }
     DXGI_FORMAT getPixelFormat() const { return m_format; }
     const char* getPixelFormatName() const;
@@ -53,10 +54,21 @@ public:
     bool isNvidiaGpu() const { return m_isNvidiaGpu; }
 
 private:
-    bool initDxgi();
-    bool initDxgiOnAdapter(IDXGIAdapter1* adapter, bool requireLivePresent = false);
-    void cleanupDxgi();
+    enum class CaptureMode { None, Dxgi, Wgc, Gdi };
+
+    bool initGpuCapture();
+    void cleanupGpu();
+    bool createD3d11DeviceForAdapter(IDXGIAdapter1* adapter);
+    bool ensureGpuCopyTextures(uint32_t w, uint32_t h, DXGI_FORMAT fmt);
+
+    bool initDxgi(bool requireLiveOnly);
+    bool initDxgiOnAdapter(IDXGIAdapter1* adapter, bool requireLivePresent, const RECT* primaryMonitorRect);
     bool acquireDxgi(uint32_t timeoutMs, bool requireLivePresent = false);
+
+    bool initWgc();
+    bool initWgcOnAdapter(IDXGIAdapter1* adapter, HMONITOR hMon, const RECT& monRect);
+    void cleanupWgcInterfaces();
+    bool acquireWgc();
 
     bool initGdi();
     void cleanupGdi();
@@ -65,10 +77,13 @@ private:
     static void initHalfTable();
     static void extractCursorBgra(HCURSOR hCursor, int cx, int cy, std::vector<uint8_t>& outPremulBgra);
 
-    bool m_useDxgi = true;
+    CaptureMode m_mode = CaptureMode::None;
     bool m_isHdrOutput = false;
     bool m_hasValidGpuFrame = false;
-    uint32_t m_dxgiReinitFails = 0;
+    uint32_t m_gpuReinitFails = 0;
+    uint64_t m_lastGpuReinitMs = 0;
+    uint64_t m_lastGdiRetryMs = 0;
+    uint64_t m_lastGdiCaptureMs = 0;
     uint32_t m_width = 0;
     uint32_t m_height = 0;
     int32_t m_screenLeft = 0;
@@ -85,7 +100,7 @@ private:
     int16_t m_cursorHotX = 0;
     int16_t m_cursorHotY = 0;
 
-    // DXGI GPU resources (double-buffered texture slot for lock-free Capture -> Encode overlap)
+    // GPU capture resources (double-buffered texture slot for lock-free Capture -> Encode overlap)
     std::mutex m_snapMutex;
     std::atomic<int> m_latestSlot{0};
     ID3D11Device* m_d3dDevice = nullptr;
@@ -96,6 +111,15 @@ private:
     ID3D11Texture2D* m_stagingTexture = nullptr;
     std::string m_adapterName = "Default GPU";
     bool m_isNvidiaGpu = false;
+
+    // Pure-COM Windows.Graphics.Capture session objects (opaque to keep header SDK-neutral)
+    void* m_wgcD3dDevice = nullptr;
+    void* m_wgcItem = nullptr;
+    void* m_wgcPool = nullptr;
+    void* m_wgcSession = nullptr;
+    int32_t m_wgcPoolW = 0;
+    int32_t m_wgcPoolH = 0;
+    DXGI_FORMAT m_wgcPoolFmt = DXGI_FORMAT_B8G8R8A8_UNORM;
 
     // GDI fallback resources
     HDC m_hdcScreen = nullptr;

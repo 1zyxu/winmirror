@@ -15,6 +15,11 @@ static const GUID kMFT_ENUM_ADAPTER_LUID = {
     0x1d39518c, 0xe220, 0x4da8, { 0xa0, 0x7f, 0xba, 0x17, 0x25, 0x52, 0xd6, 0xb1 }
 };
 
+// MF_LOW_LATENCY (defined locally to avoid MinGW/MSVC uuid import differences)
+static const GUID kMfLowLatency = {
+    0x9c27891a, 0xed7a, 0x40e1, { 0x88, 0xe8, 0xb2, 0x27, 0x27, 0xa0, 0x24, 0xee }
+};
+
 using PFN_MFTEnum2 = HRESULT(WINAPI*)(GUID, UINT32, const MFT_REGISTER_TYPE_INFO*,
                                      const MFT_REGISTER_TYPE_INFO*, IMFAttributes*,
                                      IMFActivate***, UINT32*);
@@ -537,26 +542,29 @@ bool Encoder::initVideoProcessor(DXGI_FORMAT srcFormat, bool useP010) {
     outDesc.Format = outFmt;
     outDesc.SampleDesc.Count = 1;
     outDesc.Usage = D3D11_USAGE_DEFAULT;
-    outDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | kBindVideoEncoder;
+    static const UINT kBindTries[] = {
+        D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | kBindVideoEncoder,
+        D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE,
+        D3D11_BIND_RENDER_TARGET
+    };
 
     m_vpRingIdx = 0;
     for (int i = 0; i < kVpRingSize; ++i) {
-        hr = m_d3dDevice->CreateTexture2D(&outDesc, nullptr, &m_vpOutTex[i]);
-        if (FAILED(hr) || !m_vpOutTex[i]) {
-            outDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-            hr = m_d3dDevice->CreateTexture2D(&outDesc, nullptr, &m_vpOutTex[i]);
-        }
-        if (FAILED(hr) || !m_vpOutTex[i]) {
-            outDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
-            hr = m_d3dDevice->CreateTexture2D(&outDesc, nullptr, &m_vpOutTex[i]);
-        }
-        if (FAILED(hr) || !m_vpOutTex[i]) { cleanupVideoProcessor(); return false; }
-
         D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovDesc = {};
         ovDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
         ovDesc.Texture2D.MipSlice = 0;
-        hr = m_videoDevice->CreateVideoProcessorOutputView(m_vpOutTex[i], m_vpEnum, &ovDesc, &m_vpOutView[i]);
-        if (FAILED(hr) || !m_vpOutView[i]) { cleanupVideoProcessor(); return false; }
+        for (UINT bf : kBindTries) {
+            outDesc.BindFlags = bf;
+            if (FAILED(m_d3dDevice->CreateTexture2D(&outDesc, nullptr, &m_vpOutTex[i])) || !m_vpOutTex[i]) {
+                continue;
+            }
+            if (SUCCEEDED(m_videoDevice->CreateVideoProcessorOutputView(m_vpOutTex[i], m_vpEnum, &ovDesc, &m_vpOutView[i])) && m_vpOutView[i]) {
+                break;
+            }
+            m_vpOutTex[i]->Release();
+            m_vpOutTex[i] = nullptr;
+        }
+        if (!m_vpOutTex[i] || !m_vpOutView[i]) { cleanupVideoProcessor(); return false; }
     }
 
     outDesc.Usage = D3D11_USAGE_STAGING;
@@ -679,7 +687,7 @@ bool Encoder::configureMftTypes(const GUID& outputSubtype, bool wantP010, UINT32
         MFSetAttributeRatio(inType, MF_MT_FRAME_RATE, m_fps, 1);
         MFSetAttributeRatio(inType, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
         inType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-        if (mode == 0) {
+        if (mode == 0 && !m_useD3dManager) {
             inType->SetUINT32(MF_MT_DEFAULT_STRIDE, wantP010 ? (m_width * 2) : m_width);
         }
         if (mode <= 1) {
@@ -798,6 +806,9 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
             mftAttr->GetUINT32(MF_TRANSFORM_ASYNC, &isAsync);
             mftAttr->GetUINT32(MF_SA_D3D11_AWARE, &d3d11Aware);
             mftAttr->GetUINT32(MF_SA_D3D_AWARE, &d3dAware);
+            if (hardwareOnly) {
+                mftAttr->SetUINT32(kMfLowLatency, TRUE);
+            }
             if (isAsync) {
                 if (FAILED(mftAttr->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE))) {
                     mftAttr->Release();
@@ -859,6 +870,7 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
             curOut->Release();
         }
 
+        m_mft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
         m_mft->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
         m_mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
 
@@ -1007,13 +1019,10 @@ bool Encoder::submitDxgiSurface(ID3D11Texture2D* tex, uint64_t ptsUs,
         return false;
     }
 
-    IMF2DBuffer* buf2d = nullptr;
-    if (SUCCEEDED(mfBuf->QueryInterface(__uuidof(IMF2DBuffer), reinterpret_cast<void**>(&buf2d))) && buf2d) {
-        DWORD contigLen = 0;
-        if (SUCCEEDED(buf2d->GetContiguousLength(&contigLen))) {
-            mfBuf->SetCurrentLength(contigLen);
-        }
-        buf2d->Release();
+    // GPU textures use driver-aligned row pitch; set full max length rather than compact CPU byte size
+    DWORD maxLen = 0;
+    if (SUCCEEDED(mfBuf->GetMaxLength(&maxLen)) && maxLen > 0) {
+        mfBuf->SetCurrentLength(maxLen);
     }
 
     IMFSample* sample = nullptr;

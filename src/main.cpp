@@ -166,13 +166,18 @@ int main(int argc, char* argv[]) {
         bool snapHdr = false;
         bool haveGpu = capture.grabGpuFrame(&snapDev, &snapCtx, &snapTex, snapW, snapH, snapFmt, snapHdr);
 
-        if (haveGpu && (snapDev != encoder.getCaptureDevice() ||
-                        (snapW & ~1u) != encoder.getWidth() ||
-                        (snapH & ~1u) != encoder.getHeight() ||
-                        snapFmt != encoder.getSrcFormat() ||
-                        snapHdr != encoder.isHdrSource())) {
-            encoder.init(snapDev, snapCtx, snapW, snapH, snapFmt,
-                         static_cast<uint32_t>(targetFps), snapHdr);
+        if ((haveGpu && (snapDev != encoder.getCaptureDevice() ||
+                         (snapW & ~1u) != encoder.getWidth() ||
+                         (snapH & ~1u) != encoder.getHeight() ||
+                         snapFmt != encoder.getSrcFormat() ||
+                         snapHdr != encoder.isHdrSource())) ||
+            (!haveGpu && encoder.getCaptureDevice() != nullptr)) {
+            uint32_t initW = haveGpu ? snapW : capture.getWidth();
+            uint32_t initH = haveGpu ? snapH : capture.getHeight();
+            if (initW > 0 && initH > 0) {
+                encoder.init(snapDev, snapCtx, initW, initH, snapFmt,
+                             static_cast<uint32_t>(targetFps), snapHdr);
+            }
         }
 
         outIsKey = false;
@@ -180,7 +185,7 @@ int main(int argc, char* argv[]) {
         if (haveGpu && encoder.hasVideoProcessor()) {
             encoded = encoder.encodeGpuFrame(snapTex, ptsUs, annexB, outIsKey);
         }
-        if (!encoded && !encoder.hasVideoProcessor() && capture.copyCurrentFrameToBgra(cpuFallbackFrame)) {
+        if (!encoded && (!haveGpu || !encoder.hasVideoProcessor()) && capture.copyCurrentFrameToBgra(cpuFallbackFrame)) {
             if ((cpuFallbackFrame.width & ~1u) != encoder.getWidth() ||
                 (cpuFallbackFrame.height & ~1u) != encoder.getHeight()) {
                 encoder.init(snapDev, snapCtx, cpuFallbackFrame.width, cpuFallbackFrame.height,

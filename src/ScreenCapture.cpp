@@ -1,13 +1,221 @@
 #include "ScreenCapture.h"
+#include "CapturePolicy.h"
+#include <hstring.h>
 #include <iostream>
 #include <cmath>
 #include <algorithm>
+#include <cstring>
+#include <cwchar>
 
 #ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
 #define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((DPI_AWARENESS_CONTEXT)-4)
 #endif
 
 typedef BOOL(WINAPI* PFN_SetProcessDpiAwarenessContext)(DPI_AWARENESS_CONTEXT);
+
+namespace {
+
+// Pure-COM WinRT WGC ABI definitions (verified against Windows SDK / Wine IDL) so builds need no cppwinrt
+struct WgcSizeInt32 {
+    int32_t Width;
+    int32_t Height;
+};
+static_assert(sizeof(WgcSizeInt32) == 8, "WgcSizeInt32 must match WinRT ABI");
+
+struct WgcClosable;
+struct WgcClosableVtbl {
+    HRESULT (STDMETHODCALLTYPE* QueryInterface)(WgcClosable*, REFIID, void**);
+    ULONG   (STDMETHODCALLTYPE* AddRef)(WgcClosable*);
+    ULONG   (STDMETHODCALLTYPE* Release)(WgcClosable*);
+    HRESULT (STDMETHODCALLTYPE* GetIids)(WgcClosable*, ULONG*, IID**);
+    HRESULT (STDMETHODCALLTYPE* GetRuntimeClassName)(WgcClosable*, HSTRING*);
+    HRESULT (STDMETHODCALLTYPE* GetTrustLevel)(WgcClosable*, int*);
+    HRESULT (STDMETHODCALLTYPE* Close)(WgcClosable*);
+};
+struct WgcClosable { WgcClosableVtbl* lpVtbl; };
+
+struct WgcCaptureItemInterop;
+struct WgcCaptureItemInteropVtbl {
+    HRESULT (STDMETHODCALLTYPE* QueryInterface)(WgcCaptureItemInterop*, REFIID, void**);
+    ULONG   (STDMETHODCALLTYPE* AddRef)(WgcCaptureItemInterop*);
+    ULONG   (STDMETHODCALLTYPE* Release)(WgcCaptureItemInterop*);
+    HRESULT (STDMETHODCALLTYPE* CreateForWindow)(WgcCaptureItemInterop*, HWND, REFIID, void**);
+    HRESULT (STDMETHODCALLTYPE* CreateForMonitor)(WgcCaptureItemInterop*, HMONITOR, REFIID, void**);
+};
+struct WgcCaptureItemInterop { WgcCaptureItemInteropVtbl* lpVtbl; };
+
+struct WgcCaptureItem;
+struct WgcCaptureItemVtbl {
+    HRESULT (STDMETHODCALLTYPE* QueryInterface)(WgcCaptureItem*, REFIID, void**);
+    ULONG   (STDMETHODCALLTYPE* AddRef)(WgcCaptureItem*);
+    ULONG   (STDMETHODCALLTYPE* Release)(WgcCaptureItem*);
+    HRESULT (STDMETHODCALLTYPE* GetIids)(WgcCaptureItem*, ULONG*, IID**);
+    HRESULT (STDMETHODCALLTYPE* GetRuntimeClassName)(WgcCaptureItem*, HSTRING*);
+    HRESULT (STDMETHODCALLTYPE* GetTrustLevel)(WgcCaptureItem*, int*);
+    HRESULT (STDMETHODCALLTYPE* get_DisplayName)(WgcCaptureItem*, HSTRING*);
+    HRESULT (STDMETHODCALLTYPE* get_Size)(WgcCaptureItem*, WgcSizeInt32*);
+    HRESULT (STDMETHODCALLTYPE* add_Closed)(WgcCaptureItem*, void*, int64_t*);
+    HRESULT (STDMETHODCALLTYPE* remove_Closed)(WgcCaptureItem*, int64_t);
+};
+struct WgcCaptureItem { WgcCaptureItemVtbl* lpVtbl; };
+
+struct WgcCaptureFrame;
+struct WgcCaptureFrameVtbl {
+    HRESULT (STDMETHODCALLTYPE* QueryInterface)(WgcCaptureFrame*, REFIID, void**);
+    ULONG   (STDMETHODCALLTYPE* AddRef)(WgcCaptureFrame*);
+    ULONG   (STDMETHODCALLTYPE* Release)(WgcCaptureFrame*);
+    HRESULT (STDMETHODCALLTYPE* GetIids)(WgcCaptureFrame*, ULONG*, IID**);
+    HRESULT (STDMETHODCALLTYPE* GetRuntimeClassName)(WgcCaptureFrame*, HSTRING*);
+    HRESULT (STDMETHODCALLTYPE* GetTrustLevel)(WgcCaptureFrame*, int*);
+    HRESULT (STDMETHODCALLTYPE* get_Surface)(WgcCaptureFrame*, IUnknown**);
+    HRESULT (STDMETHODCALLTYPE* get_SystemRelativeTime)(WgcCaptureFrame*, int64_t*);
+    HRESULT (STDMETHODCALLTYPE* get_ContentSize)(WgcCaptureFrame*, WgcSizeInt32*);
+};
+struct WgcCaptureFrame { WgcCaptureFrameVtbl* lpVtbl; };
+
+struct WgcCaptureSession;
+struct WgcCaptureSessionVtbl {
+    HRESULT (STDMETHODCALLTYPE* QueryInterface)(WgcCaptureSession*, REFIID, void**);
+    ULONG   (STDMETHODCALLTYPE* AddRef)(WgcCaptureSession*);
+    ULONG   (STDMETHODCALLTYPE* Release)(WgcCaptureSession*);
+    HRESULT (STDMETHODCALLTYPE* GetIids)(WgcCaptureSession*, ULONG*, IID**);
+    HRESULT (STDMETHODCALLTYPE* GetRuntimeClassName)(WgcCaptureSession*, HSTRING*);
+    HRESULT (STDMETHODCALLTYPE* GetTrustLevel)(WgcCaptureSession*, int*);
+    HRESULT (STDMETHODCALLTYPE* StartCapture)(WgcCaptureSession*);
+};
+struct WgcCaptureSession { WgcCaptureSessionVtbl* lpVtbl; };
+
+struct WgcCaptureSession2;
+struct WgcCaptureSession2Vtbl {
+    HRESULT (STDMETHODCALLTYPE* QueryInterface)(WgcCaptureSession2*, REFIID, void**);
+    ULONG   (STDMETHODCALLTYPE* AddRef)(WgcCaptureSession2*);
+    ULONG   (STDMETHODCALLTYPE* Release)(WgcCaptureSession2*);
+    HRESULT (STDMETHODCALLTYPE* GetIids)(WgcCaptureSession2*, ULONG*, IID**);
+    HRESULT (STDMETHODCALLTYPE* GetRuntimeClassName)(WgcCaptureSession2*, HSTRING*);
+    HRESULT (STDMETHODCALLTYPE* GetTrustLevel)(WgcCaptureSession2*, int*);
+    HRESULT (STDMETHODCALLTYPE* get_IsCursorCaptureEnabled)(WgcCaptureSession2*, uint8_t*);
+    HRESULT (STDMETHODCALLTYPE* put_IsCursorCaptureEnabled)(WgcCaptureSession2*, uint8_t);
+};
+struct WgcCaptureSession2 { WgcCaptureSession2Vtbl* lpVtbl; };
+
+struct WgcCaptureSession3;
+struct WgcCaptureSession3Vtbl {
+    HRESULT (STDMETHODCALLTYPE* QueryInterface)(WgcCaptureSession3*, REFIID, void**);
+    ULONG   (STDMETHODCALLTYPE* AddRef)(WgcCaptureSession3*);
+    ULONG   (STDMETHODCALLTYPE* Release)(WgcCaptureSession3*);
+    HRESULT (STDMETHODCALLTYPE* GetIids)(WgcCaptureSession3*, ULONG*, IID**);
+    HRESULT (STDMETHODCALLTYPE* GetRuntimeClassName)(WgcCaptureSession3*, HSTRING*);
+    HRESULT (STDMETHODCALLTYPE* GetTrustLevel)(WgcCaptureSession3*, int*);
+    HRESULT (STDMETHODCALLTYPE* get_IsBorderRequired)(WgcCaptureSession3*, uint8_t*);
+    HRESULT (STDMETHODCALLTYPE* put_IsBorderRequired)(WgcCaptureSession3*, uint8_t);
+};
+struct WgcCaptureSession3 { WgcCaptureSession3Vtbl* lpVtbl; };
+
+struct WgcFramePool;
+struct WgcFramePoolVtbl {
+    HRESULT (STDMETHODCALLTYPE* QueryInterface)(WgcFramePool*, REFIID, void**);
+    ULONG   (STDMETHODCALLTYPE* AddRef)(WgcFramePool*);
+    ULONG   (STDMETHODCALLTYPE* Release)(WgcFramePool*);
+    HRESULT (STDMETHODCALLTYPE* GetIids)(WgcFramePool*, ULONG*, IID**);
+    HRESULT (STDMETHODCALLTYPE* GetRuntimeClassName)(WgcFramePool*, HSTRING*);
+    HRESULT (STDMETHODCALLTYPE* GetTrustLevel)(WgcFramePool*, int*);
+    HRESULT (STDMETHODCALLTYPE* Recreate)(WgcFramePool*, IUnknown*, int32_t, int32_t, WgcSizeInt32);
+    HRESULT (STDMETHODCALLTYPE* TryGetNextFrame)(WgcFramePool*, WgcCaptureFrame**);
+    HRESULT (STDMETHODCALLTYPE* add_FrameArrived)(WgcFramePool*, void*, int64_t*);
+    HRESULT (STDMETHODCALLTYPE* remove_FrameArrived)(WgcFramePool*, int64_t);
+    HRESULT (STDMETHODCALLTYPE* CreateCaptureSession)(WgcFramePool*, WgcCaptureItem*, WgcCaptureSession**);
+    HRESULT (STDMETHODCALLTYPE* get_DispatcherQueue)(WgcFramePool*, void**);
+};
+struct WgcFramePool { WgcFramePoolVtbl* lpVtbl; };
+
+struct WgcFramePoolStatics;
+struct WgcFramePoolStaticsVtbl {
+    HRESULT (STDMETHODCALLTYPE* QueryInterface)(WgcFramePoolStatics*, REFIID, void**);
+    ULONG   (STDMETHODCALLTYPE* AddRef)(WgcFramePoolStatics*);
+    ULONG   (STDMETHODCALLTYPE* Release)(WgcFramePoolStatics*);
+    HRESULT (STDMETHODCALLTYPE* GetIids)(WgcFramePoolStatics*, ULONG*, IID**);
+    HRESULT (STDMETHODCALLTYPE* GetRuntimeClassName)(WgcFramePoolStatics*, HSTRING*);
+    HRESULT (STDMETHODCALLTYPE* GetTrustLevel)(WgcFramePoolStatics*, int*);
+    HRESULT (STDMETHODCALLTYPE* Create)(WgcFramePoolStatics*, IUnknown*, int32_t, int32_t, WgcSizeInt32, WgcFramePool**);
+};
+struct WgcFramePoolStatics { WgcFramePoolStaticsVtbl* lpVtbl; };
+
+struct WgcDxgiInterfaceAccess;
+struct WgcDxgiInterfaceAccessVtbl {
+    HRESULT (STDMETHODCALLTYPE* QueryInterface)(WgcDxgiInterfaceAccess*, REFIID, void**);
+    ULONG   (STDMETHODCALLTYPE* AddRef)(WgcDxgiInterfaceAccess*);
+    ULONG   (STDMETHODCALLTYPE* Release)(WgcDxgiInterfaceAccess*);
+    HRESULT (STDMETHODCALLTYPE* GetInterface)(WgcDxgiInterfaceAccess*, REFIID, void**);
+};
+struct WgcDxgiInterfaceAccess { WgcDxgiInterfaceAccessVtbl* lpVtbl; };
+
+const GUID kIID_IClosable = { 0x30d5a829, 0x7fa4, 0x4026, { 0x83, 0xbb, 0xd7, 0x5b, 0xae, 0x4e, 0xa9, 0x9e } };
+const GUID kIID_IGraphicsCaptureItemInterop = { 0x3628e81b, 0x3cac, 0x4c60, { 0xb7, 0xf4, 0x23, 0xce, 0x0e, 0x0c, 0x33, 0x56 } };
+const GUID kIID_IGraphicsCaptureItem = { 0x79c3f95b, 0x31f7, 0x4ec2, { 0xa4, 0x64, 0x63, 0x2e, 0xf5, 0xd3, 0x07, 0x60 } };
+const GUID kIID_IDirect3D11CaptureFramePoolStatics2 = { 0x589b103f, 0x6bbc, 0x5df5, { 0xa9, 0x91, 0x02, 0xe2, 0x8b, 0x3b, 0x66, 0xd5 } };
+const GUID kIID_IGraphicsCaptureSession2 = { 0x2c39ae40, 0x7d2e, 0x5044, { 0x80, 0x4e, 0x8b, 0x67, 0x99, 0xd4, 0xcf, 0x9e } };
+const GUID kIID_IGraphicsCaptureSession3 = { 0xf2cdd966, 0x22ae, 0x5ea1, { 0x95, 0x96, 0x3a, 0x28, 0x93, 0x44, 0xc3, 0xbe } };
+const GUID kIID_IDirect3DDxgiInterfaceAccess = { 0xa9b3d012, 0x3df2, 0x4ee3, { 0xb8, 0xd1, 0x86, 0x95, 0xf4, 0x57, 0xd3, 0xc1 } };
+
+typedef HRESULT (WINAPI* PFN_RoInitialize)(int initType);
+typedef HRESULT (WINAPI* PFN_RoGetActivationFactory)(HSTRING, REFIID, void**);
+typedef HRESULT (WINAPI* PFN_WindowsCreateStringReference)(PCWSTR, UINT32, HSTRING_HEADER*, HSTRING*);
+typedef HRESULT (WINAPI* PFN_CreateDirect3D11DeviceFromDXGIDevice)(IDXGIDevice*, IUnknown**);
+
+struct WgcFunctions {
+    PFN_RoInitialize roInitialize = nullptr;
+    PFN_RoGetActivationFactory roGetActivationFactory = nullptr;
+    PFN_WindowsCreateStringReference createStringRef = nullptr;
+    PFN_CreateDirect3D11DeviceFromDXGIDevice createWgcDevice = nullptr;
+    bool loaded = false;
+
+    bool ensureLoaded() {
+        if (loaded) return createWgcDevice != nullptr;
+        loaded = true;
+        HMODULE hCombase = LoadLibraryW(L"combase.dll");
+        HMODULE hD3d11 = LoadLibraryW(L"d3d11.dll");
+        if (!hCombase || !hD3d11) return false;
+        roInitialize = reinterpret_cast<PFN_RoInitialize>(GetProcAddress(hCombase, "RoInitialize"));
+        roGetActivationFactory = reinterpret_cast<PFN_RoGetActivationFactory>(GetProcAddress(hCombase, "RoGetActivationFactory"));
+        createStringRef = reinterpret_cast<PFN_WindowsCreateStringReference>(GetProcAddress(hCombase, "WindowsCreateStringReference"));
+        createWgcDevice = reinterpret_cast<PFN_CreateDirect3D11DeviceFromDXGIDevice>(
+            GetProcAddress(hD3d11, "CreateDirect3D11DeviceFromDXGIDevice"));
+        if (!roInitialize || !roGetActivationFactory || !createStringRef || !createWgcDevice) {
+            createWgcDevice = nullptr;
+            return false;
+        }
+        return true;
+    }
+};
+
+WgcFunctions& wgcApi() {
+    static WgcFunctions s_api;
+    return s_api;
+}
+
+template <typename T>
+void closeAndReleaseWinRt(void*& ptr) {
+    if (!ptr) return;
+    WgcClosable* closable = nullptr;
+    WgcClosable* self = reinterpret_cast<WgcClosable*>(ptr);
+    if (SUCCEEDED(self->lpVtbl->QueryInterface(self, kIID_IClosable, reinterpret_cast<void**>(&closable))) && closable) {
+        closable->lpVtbl->Close(closable);
+        closable->lpVtbl->Release(closable);
+    }
+    T* obj = reinterpret_cast<T*>(ptr);
+    obj->lpVtbl->Release(obj);
+    ptr = nullptr;
+}
+
+std::string adapterNameUtf8(const WCHAR* wideName) {
+    int utf8Len = WideCharToMultiByte(CP_UTF8, 0, wideName, -1, nullptr, 0, nullptr, nullptr);
+    if (utf8Len <= 1) return "Default GPU";
+    std::string out(utf8Len - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wideName, -1, &out[0], utf8Len, nullptr, nullptr);
+    return out;
+}
+
+} // namespace
 
 static uint8_t s_halfToByteTable[65536];
 static bool s_tableInitialized = false;
@@ -140,17 +348,18 @@ bool ScreenCapture::init() {
         }
     }
 
-    if (initDxgi()) {
-        std::cout << "[ScreenCapture] DXGI GPU Capture (" << m_width << "x" << m_height
-                  << ", " << (isHdrOutput() ? "HDR16/10-bit" : "SDR 8-bit BGRA") << ")" << std::endl;
-        m_useDxgi = true;
+    if (initGpuCapture()) {
+        const char* tag = (m_mode == CaptureMode::Wgc) ? "WGC GPU Capture" : "DXGI GPU Capture";
+        std::cout << "[ScreenCapture] " << tag << " (" << m_width << "x" << m_height
+                  << ", " << getPixelFormatName() << ")" << std::endl;
         return true;
     }
 
-    std::cout << "[ScreenCapture] Falling back to GDI capture..." << std::endl;
+    std::cout << "[ScreenCapture] GPU capture unavailable - falling back to GDI capture..." << std::endl;
     if (initGdi()) {
         std::cout << "[ScreenCapture] GDI Capture (" << m_width << "x" << m_height << ")" << std::endl;
-        m_useDxgi = false;
+        m_mode = CaptureMode::Gdi;
+        m_lastGdiRetryMs = GetTickCount64();
         return true;
     }
 
@@ -158,7 +367,10 @@ bool ScreenCapture::init() {
 }
 
 const char* ScreenCapture::getPixelFormatName() const {
-    if (!m_useDxgi) return "GDI BGRA 8-bit";
+    if (m_mode == CaptureMode::Gdi) return "GDI BGRA 8-bit";
+    if (m_mode == CaptureMode::Wgc) {
+        return isHdrOutput() ? "WGC 16-bit scRGB HDR" : "WGC 8-bit BGRA";
+    }
     switch (m_format) {
         case DXGI_FORMAT_R16G16B16A16_FLOAT: return "16-bit scRGB HDR";
         case DXGI_FORMAT_R10G10B10A2_UNORM:  return "10-bit RGB10A2";
@@ -169,73 +381,33 @@ const char* ScreenCapture::getPixelFormatName() const {
 }
 
 void ScreenCapture::cleanup() {
-    cleanupDxgi();
+    cleanupGpu();
     cleanupGdi();
 }
 
-bool ScreenCapture::initDxgi() {
-    cleanupDxgi();
-
-    // Enumerate adapters owning a desktop output, trying NVIDIA (0x10DE) first before iGPU fallback
-    std::vector<IDXGIAdapter1*> nvidiaAdapters;
-    std::vector<IDXGIAdapter1*> otherAdapters;
-    IDXGIFactory1* factory = nullptr;
-    if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) && factory) {
-        for (UINT idx = 0; ; ++idx) {
-            IDXGIAdapter1* cand = nullptr;
-            if (factory->EnumAdapters1(idx, &cand) == DXGI_ERROR_NOT_FOUND || !cand) break;
-
-            DXGI_ADAPTER_DESC1 ad = {};
-            cand->GetDesc1(&ad);
-            if (ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
-                cand->Release();
-                continue;
-            }
-
-            bool hasOutput = false;
-            for (UINT oi = 0; ; ++oi) {
-                IDXGIOutput* out = nullptr;
-                if (cand->EnumOutputs(oi, &out) == DXGI_ERROR_NOT_FOUND || !out) break;
-                DXGI_OUTPUT_DESC od = {};
-                if (SUCCEEDED(out->GetDesc(&od)) && od.AttachedToDesktop) {
-                    hasOutput = true;
-                }
-                out->Release();
-                if (hasOutput) break;
-            }
-
-            if (hasOutput) {
-                if (ad.VendorId == 0x10DE) nvidiaAdapters.push_back(cand);
-                else otherAdapters.push_back(cand);
-                continue;
-            }
-            cand->Release();
-        }
-        factory->Release();
+bool ScreenCapture::initGpuCapture() {
+    // 1) Try live DXGI Desktop Duplication first (best HDR16 & dirty-rect latency)
+    if (initDxgi(true)) {
+        m_mode = CaptureMode::Dxgi;
+        m_gpuReinitFails = 0;
+        return true;
     }
-
-    bool ok = false;
-    // Prefer an adapter that actually presents live desktop updates before accepting a static frame
-    for (int pass = 0; pass < 2 && !ok; ++pass) {
-        bool requireLive = (pass == 0);
-        for (IDXGIAdapter1* cand : nvidiaAdapters) {
-            if (!ok) ok = initDxgiOnAdapter(cand, requireLive);
-        }
-        for (IDXGIAdapter1* cand : otherAdapters) {
-            if (!ok) ok = initDxgiOnAdapter(cand, requireLive);
-        }
+    // 2) Try Windows.Graphics.Capture (reliable on static desktops, Optimus hybrid GPUs, and games)
+    if (initWgc()) {
+        m_mode = CaptureMode::Wgc;
+        m_gpuReinitFails = 0;
+        return true;
     }
-    for (IDXGIAdapter1* cand : nvidiaAdapters) cand->Release();
-    for (IDXGIAdapter1* cand : otherAdapters) cand->Release();
-    if (!ok) {
-        ok = initDxgiOnAdapter(nullptr, false);
+    // 3) Fallback DXGI pass accepting initial static frame (Win <1903 or when WGC unavailable)
+    if (initDxgi(false)) {
+        m_mode = CaptureMode::Dxgi;
+        m_gpuReinitFails = 0;
+        return true;
     }
-    return ok;
+    return false;
 }
 
-bool ScreenCapture::initDxgiOnAdapter(IDXGIAdapter1* adapter, bool requireLivePresent) {
-    cleanupDxgi();
-
+bool ScreenCapture::createD3d11DeviceForAdapter(IDXGIAdapter1* adapter) {
     D3D_FEATURE_LEVEL featureLevels[] = {
         D3D_FEATURE_LEVEL_11_1,
         D3D_FEATURE_LEVEL_11_0,
@@ -264,7 +436,6 @@ bool ScreenCapture::initDxgiOnAdapter(IDXGIAdapter1* adapter, bool requireLivePr
         hr = tryCreate(D3D11_CREATE_DEVICE_BGRA_SUPPORT);
     }
     if (FAILED(hr) || !m_d3dDevice || !m_d3dContext) {
-        cleanupDxgi();
         return false;
     }
 
@@ -275,27 +446,166 @@ bool ScreenCapture::initDxgiOnAdapter(IDXGIAdapter1* adapter, bool requireLivePr
     }
 
     IDXGIDevice* dxgiDevice = nullptr;
-    hr = m_d3dDevice->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgiDevice));
-    if (FAILED(hr)) { cleanupDxgi(); return false; }
-    dxgiDevice->SetGPUThreadPriority(7);
+    if (SUCCEEDED(m_d3dDevice->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgiDevice))) && dxgiDevice) {
+        dxgiDevice->SetGPUThreadPriority(7);
+        IDXGIAdapter* dxgiAdapter = nullptr;
+        if (SUCCEEDED(dxgiDevice->GetParent(__uuidof(IDXGIAdapter), reinterpret_cast<void**>(&dxgiAdapter))) && dxgiAdapter) {
+            DXGI_ADAPTER_DESC desc = {};
+            if (SUCCEEDED(dxgiAdapter->GetDesc(&desc))) {
+                m_isNvidiaGpu = (desc.VendorId == 0x10DE);
+                m_adapterName = adapterNameUtf8(desc.Description);
+            }
+            dxgiAdapter->Release();
+        }
+        dxgiDevice->Release();
+    }
+    return true;
+}
 
-    IDXGIAdapter* dxgiAdapter = nullptr;
-    hr = dxgiDevice->GetParent(__uuidof(IDXGIAdapter), reinterpret_cast<void**>(&dxgiAdapter));
-    dxgiDevice->Release();
-    if (FAILED(hr)) { cleanupDxgi(); return false; }
+bool ScreenCapture::ensureGpuCopyTextures(uint32_t w, uint32_t h, DXGI_FORMAT fmt) {
+    if (!m_d3dDevice || w == 0 || h == 0) return false;
 
-    DXGI_ADAPTER_DESC desc = {};
-    if (SUCCEEDED(dxgiAdapter->GetDesc(&desc))) {
-        m_isNvidiaGpu = (desc.VendorId == 0x10DE);
-        int utf8Len = WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, nullptr, 0, nullptr, nullptr);
-        if (utf8Len > 1) {
-            std::string name(utf8Len - 1, '\0');
-            WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, &name[0], utf8Len, nullptr, nullptr);
-            m_adapterName = std::move(name);
+    std::lock_guard<std::mutex> lock(m_snapMutex);
+    if (m_gpuCopyTex[0] && m_gpuCopyTex[1] && m_width == w && m_height == h && m_format == fmt) {
+        return true;
+    }
+
+    for (int i = 0; i < 2; ++i) {
+        if (m_gpuCopyTex[i]) { m_gpuCopyTex[i]->Release(); m_gpuCopyTex[i] = nullptr; }
+    }
+    if (m_stagingTexture) { m_stagingTexture->Release(); m_stagingTexture = nullptr; }
+    m_latestSlot.store(0);
+
+    m_width = w;
+    m_height = h;
+    m_format = fmt;
+    if (m_dxgiOutput6) {
+        DXGI_OUTPUT_DESC1 desc1 = {};
+        if (SUCCEEDED(m_dxgiOutput6->GetDesc1(&desc1))) {
+            m_isHdrOutput = (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
         }
     }
 
-    std::vector<IDXGIOutput*> attachedOutputs;
+    D3D11_TEXTURE2D_DESC gpuDesc = {};
+    gpuDesc.Width = m_width;
+    gpuDesc.Height = m_height;
+    gpuDesc.MipLevels = 1;
+    gpuDesc.ArraySize = 1;
+    gpuDesc.Format = m_format;
+    gpuDesc.SampleDesc.Count = 1;
+    gpuDesc.Usage = D3D11_USAGE_DEFAULT;
+    gpuDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    for (int i = 0; i < 2; ++i) {
+        HRESULT hr = m_d3dDevice->CreateTexture2D(&gpuDesc, nullptr, &m_gpuCopyTex[i]);
+        if (FAILED(hr) || !m_gpuCopyTex[i]) {
+            for (int j = 0; j < 2; ++j) {
+                if (m_gpuCopyTex[j]) { m_gpuCopyTex[j]->Release(); m_gpuCopyTex[j] = nullptr; }
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ScreenCapture::initDxgi(bool requireLiveOnly) {
+    cleanupGpu();
+
+    HMONITOR primaryMon = MonitorFromPoint({ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFOEXW mi = {};
+    mi.cbSize = sizeof(mi);
+    bool hasPrimaryInfo = (GetMonitorInfoW(primaryMon, &mi) != FALSE);
+
+    std::vector<IDXGIAdapter1*> nvPrimary, otherPrimary, nvSecondary, otherSecondary;
+    IDXGIFactory1* factory = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) && factory) {
+        for (UINT idx = 0; ; ++idx) {
+            IDXGIAdapter1* cand = nullptr;
+            if (factory->EnumAdapters1(idx, &cand) == DXGI_ERROR_NOT_FOUND || !cand) break;
+
+            DXGI_ADAPTER_DESC1 ad = {};
+            cand->GetDesc1(&ad);
+            if (ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
+                cand->Release();
+                continue;
+            }
+
+            bool hasOutput = false;
+            bool ownsPrimary = false;
+            for (UINT oi = 0; ; ++oi) {
+                IDXGIOutput* out = nullptr;
+                if (cand->EnumOutputs(oi, &out) == DXGI_ERROR_NOT_FOUND || !out) break;
+                DXGI_OUTPUT_DESC od = {};
+                if (SUCCEEDED(out->GetDesc(&od)) && od.AttachedToDesktop &&
+                    od.DesktopCoordinates.right > od.DesktopCoordinates.left &&
+                    od.DesktopCoordinates.bottom > od.DesktopCoordinates.top) {
+                    hasOutput = true;
+                    if (hasPrimaryInfo && _wcsicmp(od.DeviceName, mi.szDevice) == 0) {
+                        ownsPrimary = true;
+                    }
+                }
+                out->Release();
+                if (ownsPrimary) break;
+            }
+
+            if (hasOutput) {
+                if (ad.VendorId == 0x10DE) {
+                    (ownsPrimary ? nvPrimary : nvSecondary).push_back(cand);
+                } else {
+                    (ownsPrimary ? otherPrimary : otherSecondary).push_back(cand);
+                }
+                continue;
+            }
+            cand->Release();
+        }
+        factory->Release();
+    }
+
+    const RECT* primaryRect = hasPrimaryInfo ? &mi.rcMonitor : nullptr;
+    bool ok = false;
+    auto tryGroup = [&](const std::vector<IDXGIAdapter1*>& group) {
+        for (IDXGIAdapter1* cand : group) {
+            if (!ok) ok = initDxgiOnAdapter(cand, requireLiveOnly, primaryRect);
+        }
+    };
+    // Prefer adapter actually owning the primary desktop (0,0) before secondary outputs
+    tryGroup(nvPrimary);
+    tryGroup(otherPrimary);
+    tryGroup(nvSecondary);
+    tryGroup(otherSecondary);
+
+    for (auto* list : { &nvPrimary, &otherPrimary, &nvSecondary, &otherSecondary }) {
+        for (IDXGIAdapter1* cand : *list) cand->Release();
+    }
+    if (!ok && !requireLiveOnly) {
+        ok = initDxgiOnAdapter(nullptr, false, primaryRect);
+    }
+    return ok;
+}
+
+bool ScreenCapture::initDxgiOnAdapter(IDXGIAdapter1* adapter, bool requireLivePresent, const RECT* primaryMonitorRect) {
+    cleanupGpu();
+
+    if (!createD3d11DeviceForAdapter(adapter)) {
+        cleanupGpu();
+        return false;
+    }
+
+    IDXGIDevice* dxgiDevice = nullptr;
+    if (FAILED(m_d3dDevice->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgiDevice))) || !dxgiDevice) {
+        cleanupGpu();
+        return false;
+    }
+    IDXGIAdapter* dxgiAdapter = nullptr;
+    HRESULT hr = dxgiDevice->GetParent(__uuidof(IDXGIAdapter), reinterpret_cast<void**>(&dxgiAdapter));
+    dxgiDevice->Release();
+    if (FAILED(hr) || !dxgiAdapter) {
+        cleanupGpu();
+        return false;
+    }
+
+    struct OutCand { IDXGIOutput* out; bool isPrimary; };
+    std::vector<OutCand> attachedOutputs;
     for (UINT oi = 0; ; ++oi) {
         IDXGIOutput* out = nullptr;
         if (dxgiAdapter->EnumOutputs(oi, &out) == DXGI_ERROR_NOT_FOUND || !out) break;
@@ -303,17 +613,25 @@ bool ScreenCapture::initDxgiOnAdapter(IDXGIAdapter1* adapter, bool requireLivePr
         if (SUCCEEDED(out->GetDesc(&od)) && od.AttachedToDesktop &&
             od.DesktopCoordinates.right > od.DesktopCoordinates.left &&
             od.DesktopCoordinates.bottom > od.DesktopCoordinates.top) {
-            attachedOutputs.push_back(out);
+            bool isPrimary = primaryMonitorRect &&
+                EqualRect(&od.DesktopCoordinates, primaryMonitorRect);
+            attachedOutputs.push_back({ out, isPrimary });
         } else {
             out->Release();
         }
     }
     dxgiAdapter->Release();
-    if (attachedOutputs.empty()) { cleanupDxgi(); return false; }
+    if (attachedOutputs.empty()) {
+        cleanupGpu();
+        return false;
+    }
+
+    std::stable_sort(attachedOutputs.begin(), attachedOutputs.end(),
+                     [](const OutCand& a, const OutCand& b) { return a.isPrimary && !b.isPrimary; });
 
     bool duplicated = false;
     for (size_t oi = 0; oi < attachedOutputs.size(); ++oi) {
-        IDXGIOutput* dxgiOutput = attachedOutputs[oi];
+        IDXGIOutput* dxgiOutput = attachedOutputs[oi].out;
         if (duplicated) {
             dxgiOutput->Release();
             continue;
@@ -326,10 +644,9 @@ bool ScreenCapture::initDxgiOnAdapter(IDXGIAdapter1* adapter, bool requireLivePr
                 m_isHdrOutput = (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
             }
             if (m_dxgiOutput6) m_dxgiOutput6->Release();
-            m_dxgiOutput6 = dxgiOutput6; // kept for live Auto-HDR / Win+Alt+B re-checks
+            m_dxgiOutput6 = dxgiOutput6;
         }
 
-        // Prefer DuplicateOutput1 so Windows hands us native HDR scRGB R16G16B16A16_FLOAT when Windows HDR is ON
         IDXGIOutput5* dxgiOutput5 = nullptr;
         if (SUCCEEDED(dxgiOutput->QueryInterface(__uuidof(IDXGIOutput5), reinterpret_cast<void**>(&dxgiOutput5)))) {
             DXGI_OUTPUT_DESC outputDesc = {};
@@ -364,7 +681,7 @@ bool ScreenCapture::initDxgiOnAdapter(IDXGIAdapter1* adapter, bool requireLivePr
         dxgiOutput->Release();
 
         if (SUCCEEDED(hr) && m_duplication) {
-            for (int a = 0; a < 5 && !acquireDxgi(20, requireLivePresent); ++a) {}
+            for (int a = 0; a < 4 && !acquireDxgi(15, requireLivePresent); ++a) {}
             if (m_duplication && m_hasValidGpuFrame) {
                 duplicated = true;
             } else {
@@ -375,7 +692,7 @@ bool ScreenCapture::initDxgiOnAdapter(IDXGIAdapter1* adapter, bool requireLivePr
     }
 
     if (!duplicated) {
-        cleanupDxgi();
+        cleanupGpu();
         return false;
     }
 
@@ -384,7 +701,23 @@ bool ScreenCapture::initDxgiOnAdapter(IDXGIAdapter1* adapter, bool requireLivePr
     return true;
 }
 
-void ScreenCapture::cleanupDxgi() {
+void ScreenCapture::cleanupWgcInterfaces() {
+    closeAndReleaseWinRt<WgcCaptureSession>(m_wgcSession);
+    closeAndReleaseWinRt<WgcFramePool>(m_wgcPool);
+    if (m_wgcItem) {
+        reinterpret_cast<WgcCaptureItem*>(m_wgcItem)->lpVtbl->Release(reinterpret_cast<WgcCaptureItem*>(m_wgcItem));
+        m_wgcItem = nullptr;
+    }
+    if (m_wgcD3dDevice) {
+        reinterpret_cast<IUnknown*>(m_wgcD3dDevice)->Release();
+        m_wgcD3dDevice = nullptr;
+    }
+    m_wgcPoolW = 0;
+    m_wgcPoolH = 0;
+}
+
+void ScreenCapture::cleanupGpu() {
+    cleanupWgcInterfaces();
     std::lock_guard<std::mutex> lock(m_snapMutex);
     for (int i = 0; i < 2; ++i) {
         if (m_gpuCopyTex[i]) { m_gpuCopyTex[i]->Release(); m_gpuCopyTex[i] = nullptr; }
@@ -396,6 +729,302 @@ void ScreenCapture::cleanupDxgi() {
     if (m_dxgiOutput6) { m_dxgiOutput6->Release(); m_dxgiOutput6 = nullptr; }
     if (m_d3dContext) { m_d3dContext->Release(); m_d3dContext = nullptr; }
     if (m_d3dDevice) { m_d3dDevice->Release(); m_d3dDevice = nullptr; }
+    if (m_mode == CaptureMode::Dxgi || m_mode == CaptureMode::Wgc) {
+        m_mode = CaptureMode::None;
+    }
+}
+
+bool ScreenCapture::initWgc() {
+    if (!wgcApi().ensureLoaded()) return false;
+
+    HMONITOR hMon = MonitorFromPoint({ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFOEXW mi = {};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(hMon, &mi)) {
+        mi.rcMonitor = { 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
+        mi.szDevice[0] = L'\0';
+    }
+
+    IDXGIAdapter1* primaryAdapter = nullptr;
+    IDXGIFactory1* factory = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) && factory) {
+        for (UINT idx = 0; !primaryAdapter; ++idx) {
+            IDXGIAdapter1* cand = nullptr;
+            if (factory->EnumAdapters1(idx, &cand) == DXGI_ERROR_NOT_FOUND || !cand) break;
+            DXGI_ADAPTER_DESC1 ad = {};
+            cand->GetDesc1(&ad);
+            if (!(ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+                for (UINT oi = 0; ; ++oi) {
+                    IDXGIOutput* out = nullptr;
+                    if (cand->EnumOutputs(oi, &out) == DXGI_ERROR_NOT_FOUND || !out) break;
+                    DXGI_OUTPUT_DESC od = {};
+                    bool match = SUCCEEDED(out->GetDesc(&od)) && od.AttachedToDesktop &&
+                        (mi.szDevice[0] == L'\0' || _wcsicmp(od.DeviceName, mi.szDevice) == 0);
+                    out->Release();
+                    if (match) {
+                        primaryAdapter = cand;
+                        break;
+                    }
+                }
+            }
+            if (!primaryAdapter) cand->Release();
+        }
+        factory->Release();
+    }
+
+    bool ok = initWgcOnAdapter(primaryAdapter, hMon, mi.rcMonitor);
+    if (!ok && primaryAdapter) {
+        ok = initWgcOnAdapter(nullptr, hMon, mi.rcMonitor);
+    }
+    if (primaryAdapter) primaryAdapter->Release();
+    return ok;
+}
+
+bool ScreenCapture::initWgcOnAdapter(IDXGIAdapter1* adapter, HMONITOR hMon, const RECT& monRect) {
+    cleanupGpu();
+    if (!wgcApi().ensureLoaded()) return false;
+
+    HRESULT roHr = wgcApi().roInitialize(1 /* RO_INIT_MULTITHREADED */);
+    if (FAILED(roHr) && roHr != RPC_E_CHANGED_MODE) {
+        return false;
+    }
+
+    if (!createD3d11DeviceForAdapter(adapter)) {
+        cleanupGpu();
+        return false;
+    }
+
+    m_screenLeft = monRect.left;
+    m_screenTop = monRect.top;
+    m_width = static_cast<uint32_t>(std::max<LONG>(0, monRect.right - monRect.left));
+    m_height = static_cast<uint32_t>(std::max<LONG>(0, monRect.bottom - monRect.top));
+    m_isHdrOutput = false;
+
+    IDXGIDevice* dxgiDevice = nullptr;
+    if (FAILED(m_d3dDevice->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgiDevice))) || !dxgiDevice) {
+        cleanupGpu();
+        return false;
+    }
+
+    // Check IDXGIOutput6 HDR state on this adapter's primary output before configuring pool format
+    IDXGIAdapter* dxgiAdp = nullptr;
+    if (SUCCEEDED(dxgiDevice->GetParent(__uuidof(IDXGIAdapter), reinterpret_cast<void**>(&dxgiAdp))) && dxgiAdp) {
+        for (UINT oi = 0; ; ++oi) {
+            IDXGIOutput* out = nullptr;
+            if (dxgiAdp->EnumOutputs(oi, &out) == DXGI_ERROR_NOT_FOUND || !out) break;
+            IDXGIOutput6* out6 = nullptr;
+            if (SUCCEEDED(out->QueryInterface(__uuidof(IDXGIOutput6), reinterpret_cast<void**>(&out6))) && out6) {
+                DXGI_OUTPUT_DESC1 d1 = {};
+                if (SUCCEEDED(out6->GetDesc1(&d1)) && d1.AttachedToDesktop) {
+                    if (EqualRect(&d1.DesktopCoordinates, &monRect) || oi == 0) {
+                        m_isHdrOutput = (d1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+                        m_dxgiOutput6 = out6;
+                        out->Release();
+                        break;
+                    }
+                }
+                out6->Release();
+            }
+            out->Release();
+        }
+        dxgiAdp->Release();
+    }
+
+    IUnknown* wgcDev = nullptr;
+    HRESULT hr = wgcApi().createWgcDevice(dxgiDevice, &wgcDev);
+    dxgiDevice->Release();
+    if (FAILED(hr) || !wgcDev) {
+        cleanupGpu();
+        return false;
+    }
+    m_wgcD3dDevice = wgcDev;
+
+    const wchar_t* itemClass = L"Windows.Graphics.Capture.GraphicsCaptureItem";
+    HSTRING_HEADER itemHdr = {};
+    HSTRING itemHs = nullptr;
+    WgcCaptureItemInterop* interop = nullptr;
+    if (FAILED(wgcApi().createStringRef(itemClass, static_cast<UINT32>(std::wcslen(itemClass)), &itemHdr, &itemHs)) ||
+        FAILED(wgcApi().roGetActivationFactory(itemHs, kIID_IGraphicsCaptureItemInterop, reinterpret_cast<void**>(&interop))) ||
+        !interop) {
+        cleanupGpu();
+        return false;
+    }
+
+    WgcCaptureItem* item = nullptr;
+    hr = interop->lpVtbl->CreateForMonitor(interop, hMon, kIID_IGraphicsCaptureItem, reinterpret_cast<void**>(&item));
+    interop->lpVtbl->Release(interop);
+    if (FAILED(hr) || !item) {
+        cleanupGpu();
+        return false;
+    }
+    m_wgcItem = item;
+
+    WgcSizeInt32 itemSize = { static_cast<int32_t>(m_width), static_cast<int32_t>(m_height) };
+    WgcSizeInt32 reportedSize = {};
+    if (SUCCEEDED(item->lpVtbl->get_Size(item, &reportedSize)) && reportedSize.Width > 0 && reportedSize.Height > 0) {
+        itemSize = reportedSize;
+    }
+    if (itemSize.Width <= 0 || itemSize.Height <= 0) {
+        cleanupGpu();
+        return false;
+    }
+
+    const wchar_t* poolClass = L"Windows.Graphics.Capture.Direct3D11CaptureFramePool";
+    HSTRING_HEADER poolHdr = {};
+    HSTRING poolHs = nullptr;
+    WgcFramePoolStatics* statics2 = nullptr;
+    if (FAILED(wgcApi().createStringRef(poolClass, static_cast<UINT32>(std::wcslen(poolClass)), &poolHdr, &poolHs)) ||
+        FAILED(wgcApi().roGetActivationFactory(poolHs, kIID_IDirect3D11CaptureFramePoolStatics2, reinterpret_cast<void**>(&statics2))) ||
+        !statics2) {
+        cleanupGpu();
+        return false;
+    }
+
+    std::vector<DXGI_FORMAT> fmtCandidates;
+    if (m_isHdrOutput) fmtCandidates.push_back(DXGI_FORMAT_R16G16B16A16_FLOAT);
+    fmtCandidates.push_back(DXGI_FORMAT_B8G8R8A8_UNORM);
+
+    bool started = false;
+    for (DXGI_FORMAT candFmt : fmtCandidates) {
+        closeAndReleaseWinRt<WgcCaptureSession>(m_wgcSession);
+        closeAndReleaseWinRt<WgcFramePool>(m_wgcPool);
+
+        WgcFramePool* pool = nullptr;
+        hr = statics2->lpVtbl->Create(statics2, wgcDev, static_cast<int32_t>(candFmt), 2, itemSize, &pool);
+        if (FAILED(hr) || !pool) continue;
+        m_wgcPool = pool;
+        m_wgcPoolW = itemSize.Width;
+        m_wgcPoolH = itemSize.Height;
+        m_wgcPoolFmt = candFmt;
+
+        WgcCaptureSession* session = nullptr;
+        if (FAILED(pool->lpVtbl->CreateCaptureSession(pool, item, &session)) || !session) continue;
+        m_wgcSession = session;
+
+        // Hide OS cursor from WGC pixels (we stream crisp hardware cursor out-of-band) and hide Win11 yellow border
+        WgcCaptureSession2* s2 = nullptr;
+        if (SUCCEEDED(session->lpVtbl->QueryInterface(session, kIID_IGraphicsCaptureSession2, reinterpret_cast<void**>(&s2))) && s2) {
+            s2->lpVtbl->put_IsCursorCaptureEnabled(s2, 0);
+            s2->lpVtbl->Release(s2);
+        }
+        WgcCaptureSession3* s3 = nullptr;
+        if (SUCCEEDED(session->lpVtbl->QueryInterface(session, kIID_IGraphicsCaptureSession3, reinterpret_cast<void**>(&s3))) && s3) {
+            s3->lpVtbl->put_IsBorderRequired(s3, 0);
+            s3->lpVtbl->Release(s3);
+        }
+
+        if (FAILED(session->lpVtbl->StartCapture(session))) continue;
+
+        for (int waitIdx = 0; waitIdx < 20 && !acquireWgc(); ++waitIdx) {
+            Sleep(10);
+        }
+        if (m_hasValidGpuFrame) {
+            if (candFmt != DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                m_isHdrOutput = false;
+            }
+            started = true;
+            break;
+        }
+    }
+    statics2->lpVtbl->Release(statics2);
+
+    if (!started) {
+        cleanupGpu();
+        return false;
+    }
+
+    std::cout << "[ScreenCapture] WGC Adapter: " << m_adapterName
+              << (m_isNvidiaGpu ? " (NVIDIA Dedicated)" : " (Display Owner)") << std::endl;
+    return true;
+}
+
+bool ScreenCapture::acquireWgc() {
+    if (!m_wgcPool || !m_d3dDevice || !m_d3dContext) return false;
+
+    WgcFramePool* pool = reinterpret_cast<WgcFramePool*>(m_wgcPool);
+    WgcCaptureFrame* latest = nullptr;
+    for (;;) {
+        WgcCaptureFrame* next = nullptr;
+        HRESULT hr = pool->lpVtbl->TryGetNextFrame(pool, &next);
+        if (FAILED(hr)) {
+            if (latest) latest->lpVtbl->Release(latest);
+            cleanupGpu();
+            return false;
+        }
+        if (!next) break;
+        if (latest) latest->lpVtbl->Release(latest);
+        latest = next;
+    }
+    if (!latest) return false;
+
+    WgcSizeInt32 contentSize = { m_wgcPoolW, m_wgcPoolH };
+    latest->lpVtbl->get_ContentSize(latest, &contentSize);
+
+    IUnknown* surfaceUnk = nullptr;
+    HRESULT hr = latest->lpVtbl->get_Surface(latest, &surfaceUnk);
+    if (FAILED(hr) || !surfaceUnk) {
+        latest->lpVtbl->Release(latest);
+        return false;
+    }
+
+    WgcDxgiInterfaceAccess* access = nullptr;
+    hr = surfaceUnk->QueryInterface(kIID_IDirect3DDxgiInterfaceAccess, reinterpret_cast<void**>(&access));
+    surfaceUnk->Release();
+    if (FAILED(hr) || !access) {
+        latest->lpVtbl->Release(latest);
+        return false;
+    }
+
+    ID3D11Texture2D* srcTex = nullptr;
+    hr = access->lpVtbl->GetInterface(access, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&srcTex));
+    access->lpVtbl->Release(access);
+    if (FAILED(hr) || !srcTex) {
+        latest->lpVtbl->Release(latest);
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC actualDesc = {};
+    srcTex->GetDesc(&actualDesc);
+    uint32_t copyW = actualDesc.Width;
+    uint32_t copyH = actualDesc.Height;
+    if (contentSize.Width > 0 && static_cast<uint32_t>(contentSize.Width) < copyW) {
+        copyW = static_cast<uint32_t>(contentSize.Width);
+    }
+    if (contentSize.Height > 0 && static_cast<uint32_t>(contentSize.Height) < copyH) {
+        copyH = static_cast<uint32_t>(contentSize.Height);
+    }
+
+    bool copied = false;
+    if (ensureGpuCopyTextures(copyW, copyH, actualDesc.Format)) {
+        int writeSlot = 1 - m_latestSlot.load();
+        ID3D11Texture2D* dstTex = m_gpuCopyTex[writeSlot];
+        D3D11_BOX srcBox = { 0, 0, 0, copyW, copyH, 1 };
+        m_d3dContext->CopySubresourceRegion(dstTex, 0, 0, 0, 0, srcTex, 0, &srcBox);
+        m_d3dContext->Flush();
+
+        {
+            std::lock_guard<std::mutex> lock(m_snapMutex);
+            m_latestSlot.store(writeSlot);
+            m_hasValidGpuFrame = true;
+            if (m_mode == CaptureMode::Wgc && m_wgcPoolFmt != DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                m_isHdrOutput = false;
+            }
+        }
+        copied = true;
+    }
+
+    srcTex->Release();
+    latest->lpVtbl->Release(latest);
+
+    if (contentSize.Width > 0 && contentSize.Height > 0 &&
+        (contentSize.Width != m_wgcPoolW || contentSize.Height != m_wgcPoolH)) {
+        if (SUCCEEDED(pool->lpVtbl->Recreate(pool, reinterpret_cast<IUnknown*>(m_wgcD3dDevice),
+                                             static_cast<int32_t>(m_wgcPoolFmt), 2, contentSize))) {
+            m_wgcPoolW = contentSize.Width;
+            m_wgcPoolH = contentSize.Height;
+        }
+    }
+    return copied;
 }
 
 bool ScreenCapture::grabGpuFrame(ID3D11Device** outDev, ID3D11DeviceContext** outCtx, ID3D11Texture2D** outTex,
@@ -408,7 +1037,7 @@ bool ScreenCapture::grabGpuFrame(ID3D11Device** outDev, ID3D11DeviceContext** ou
     std::lock_guard<std::mutex> lock(m_snapMutex);
     int slot = m_latestSlot.load();
     ID3D11Texture2D* tex = m_gpuCopyTex[slot];
-    if (!m_useDxgi || !m_hasValidGpuFrame || !m_d3dDevice || !m_d3dContext || !tex) {
+    if (!isDxgiActive() || !m_hasValidGpuFrame || !m_d3dDevice || !m_d3dContext || !tex) {
         return false;
     }
 
@@ -426,23 +1055,78 @@ bool ScreenCapture::grabGpuFrame(ID3D11Device** outDev, ID3D11DeviceContext** ou
 }
 
 bool ScreenCapture::acquireFrame(uint32_t timeoutMs) {
-    if (m_useDxgi) {
-        if (acquireDxgi(timeoutMs)) {
-            m_dxgiReinitFails = 0;
+    uint64_t nowMs = GetTickCount64();
+
+    if (m_mode == CaptureMode::Dxgi && m_duplication) {
+        if (acquireDxgi(timeoutMs, false)) {
+            m_gpuReinitFails = 0;
             return true;
         }
-        if (!m_duplication) {
-            if (!initDxgi()) {
-                if (++m_dxgiReinitFails >= 5 && initGdi()) {
-                    std::cout << "[ScreenCapture] DXGI unavailable - switched to GDI fallback." << std::endl;
-                    m_useDxgi = false;
-                    return acquireGdi();
-                }
+        if (m_duplication) return false; // normal WAIT_TIMEOUT or cursor-only skip
+    } else if (m_mode == CaptureMode::Wgc && m_wgcPool) {
+        if (acquireWgc()) {
+            m_gpuReinitFails = 0;
+            return true;
+        }
+        if (m_wgcPool) {
+            if (timeoutMs > 0) Sleep(std::min<uint32_t>(timeoutMs, 4));
+            return false;
+        }
+    }
+
+    if (m_mode == CaptureMode::Gdi || m_mode == CaptureMode::None) {
+        if (cooldownElapsedMs(nowMs, m_lastGdiRetryMs, 2000)) {
+            m_lastGdiRetryMs = nowMs;
+            const uint32_t savedW = m_width;
+            const uint32_t savedH = m_height;
+            const int32_t savedLeft = m_screenLeft;
+            const int32_t savedTop = m_screenTop;
+            const DXGI_FORMAT savedFmt = m_format;
+            const bool savedHdr = m_isHdrOutput;
+            if (initGpuCapture()) {
+                cleanupGdi();
+                std::cout << "[ScreenCapture] Recovered back to GPU capture ("
+                          << (m_mode == CaptureMode::Wgc ? "WGC" : "DXGI") << ")." << std::endl;
+                return true;
+            }
+            if (m_mode == CaptureMode::Gdi) {
+                m_width = savedW;
+                m_height = savedH;
+                m_screenLeft = savedLeft;
+                m_screenTop = savedTop;
+                m_format = savedFmt;
+                m_isHdrOutput = savedHdr;
             }
         }
-        return false;
+        if (m_mode == CaptureMode::Gdi) {
+            if (!cooldownElapsedMs(nowMs, m_lastGdiCaptureMs, 16)) {
+                if (timeoutMs > 0) Sleep(std::min<uint32_t>(timeoutMs, 4));
+                return false;
+            }
+            m_lastGdiCaptureMs = nowMs;
+            return acquireGdi();
+        }
     }
-    return acquireGdi();
+
+    // DXGI or WGC session lost (e.g. game fullscreen toggle / UAC / HDR toggle): throttled GPU re-init before GDI step-down
+    if (cooldownElapsedMs(nowMs, m_lastGpuReinitMs, 200)) {
+        m_lastGpuReinitMs = nowMs;
+        if (initGpuCapture()) {
+            cleanupGdi();
+            std::cout << "[ScreenCapture] GPU capture re-acquired ("
+                      << (m_mode == CaptureMode::Wgc ? "WGC" : "DXGI") << ")." << std::endl;
+            return true;
+        }
+        if (shouldStepDownToGdi(++m_gpuReinitFails) && initGdi()) {
+            std::cout << "[ScreenCapture] GPU capture temporarily lost - switched to GDI fallback (will auto-recover)." << std::endl;
+            m_mode = CaptureMode::Gdi;
+            m_lastGdiRetryMs = nowMs;
+            return acquireGdi();
+        }
+    } else if (timeoutMs > 0) {
+        Sleep(std::min<uint32_t>(timeoutMs, 4));
+    }
+    return false;
 }
 
 bool ScreenCapture::acquireDxgi(uint32_t timeoutMs, bool requireLivePresent) {
@@ -456,12 +1140,12 @@ bool ScreenCapture::acquireDxgi(uint32_t timeoutMs, bool requireLivePresent) {
         return false;
     }
     if (FAILED(hr)) {
-        cleanupDxgi();
+        cleanupGpu();
         return false;
     }
 
-    // Check if frame contains actual screen image updates vs un-presented/cursor-only update
-    if (frameInfo.LastPresentTime.QuadPart == 0 && (m_hasValidGpuFrame || requireLivePresent)) {
+    if (!shouldAcceptDxgiFrame(static_cast<uint64_t>(frameInfo.LastPresentTime.QuadPart),
+                               frameInfo.AccumulatedFrames, m_hasValidGpuFrame, requireLivePresent)) {
         desktopResource->Release();
         m_duplication->ReleaseFrame();
         return false;
@@ -478,45 +1162,10 @@ bool ScreenCapture::acquireDxgi(uint32_t timeoutMs, bool requireLivePresent) {
     D3D11_TEXTURE2D_DESC actualDesc = {};
     desktopImage->GetDesc(&actualDesc);
 
-    if (!m_gpuCopyTex[0] || !m_gpuCopyTex[1] || m_width != actualDesc.Width || m_height != actualDesc.Height || m_format != actualDesc.Format) {
-        std::lock_guard<std::mutex> lock(m_snapMutex);
-        for (int i = 0; i < 2; ++i) {
-            if (m_gpuCopyTex[i]) { m_gpuCopyTex[i]->Release(); m_gpuCopyTex[i] = nullptr; }
-        }
-        if (m_stagingTexture) { m_stagingTexture->Release(); m_stagingTexture = nullptr; }
-        m_latestSlot.store(0);
-
-        m_width = actualDesc.Width;
-        m_height = actualDesc.Height;
-        m_format = actualDesc.Format;
-        if (m_dxgiOutput6) {
-            DXGI_OUTPUT_DESC1 desc1 = {};
-            if (SUCCEEDED(m_dxgiOutput6->GetDesc1(&desc1))) {
-                m_isHdrOutput = (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
-            }
-        }
-
-        D3D11_TEXTURE2D_DESC gpuDesc = {};
-        gpuDesc.Width = m_width;
-        gpuDesc.Height = m_height;
-        gpuDesc.MipLevels = 1;
-        gpuDesc.ArraySize = 1;
-        gpuDesc.Format = m_format;
-        gpuDesc.SampleDesc.Count = 1;
-        gpuDesc.Usage = D3D11_USAGE_DEFAULT;
-        gpuDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-
-        for (int i = 0; i < 2; ++i) {
-            hr = m_d3dDevice->CreateTexture2D(&gpuDesc, nullptr, &m_gpuCopyTex[i]);
-            if (FAILED(hr)) {
-                for (int j = 0; j < 2; ++j) {
-                    if (m_gpuCopyTex[j]) { m_gpuCopyTex[j]->Release(); m_gpuCopyTex[j] = nullptr; }
-                }
-                desktopImage->Release();
-                m_duplication->ReleaseFrame();
-                return false;
-            }
-        }
+    if (!ensureGpuCopyTextures(actualDesc.Width, actualDesc.Height, actualDesc.Format)) {
+        desktopImage->Release();
+        m_duplication->ReleaseFrame();
+        return false;
     }
 
     int writeSlot = 1 - m_latestSlot.load();
@@ -535,7 +1184,7 @@ bool ScreenCapture::acquireDxgi(uint32_t timeoutMs, bool requireLivePresent) {
 }
 
 bool ScreenCapture::copyCurrentFrameToBgra(RawFrame& outFrame) {
-    if (!m_useDxgi) {
+    if (m_mode == CaptureMode::Gdi) {
         if (!m_gdiBits || m_width == 0 || m_height == 0) return false;
         outFrame.width = m_width;
         outFrame.height = m_height;
