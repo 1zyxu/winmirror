@@ -293,9 +293,12 @@ void Updater::applyUpdateAndRestart(const std::string& newExePath) {
     }
 
     STARTUPINFOA si = { sizeof(si) };
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION pi = {};
     std::cout << "[Updater] Applying update and restarting..." << std::endl;
-    if (CreateProcessA(currentExe, nullptr, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+    if (CreateProcessA(currentExe, nullptr, nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr, nullptr, &si, &pi)) {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         exit(0);

@@ -32,10 +32,37 @@ extern "C" {
 
 static std::atomic<bool> g_running{true};
 static std::atomic<bool> g_unlimitedFpsFlag{false};
+static std::atomic<bool> g_gameBoostFlag{true};
+static std::atomic<bool> g_ecoQosDisabled{false};
 static std::atomic<bool> g_hasVddState{false};
 static std::atomic<bool> g_installingVdd{false};
+static std::atomic<uint64_t> g_captureSkips{0};
 static std::atomic<uint64_t> g_stateChangedSeq{0};
 static WinMirrorGui* g_trayCleanupGui = nullptr;
+
+static void applyGameProcessBoost(bool enable) {
+    SetPriorityClass(GetCurrentProcess(), enable ? HIGH_PRIORITY_CLASS : ABOVE_NORMAL_PRIORITY_CLASS);
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    if (!k32) return;
+    struct WmPowerThrottlingState {
+        ULONG Version;
+        ULONG ControlMask;
+        ULONG StateMask;
+    };
+    using PFN_SetProcessInformation = BOOL(WINAPI*)(HANDLE, int, LPVOID, DWORD);
+    auto pSetProcInfo = reinterpret_cast<PFN_SetProcessInformation>(
+        GetProcAddress(k32, "SetProcessInformation"));
+    if (pSetProcInfo) {
+        WmPowerThrottlingState pts = {};
+        pts.Version = 1;
+        // EXECUTION_SPEED (0x1) | IGNORE_TIMER_RESOLUTION (0x4): prevents Windows 11 EcoQoS throttling behind fullscreen games
+        pts.ControlMask = 0x1 | 0x4;
+        pts.StateMask = enable ? 0u : 0x1u;
+        if (pSetProcInfo(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, &pts, sizeof(pts))) {
+            g_ecoQosDisabled.store(enable);
+        }
+    }
+}
 
 class GuiLogStreamBuf : public std::streambuf {
 public:
@@ -305,7 +332,8 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
     }
 
     SetConsoleCtrlHandler(consoleCtrlHandler, TRUE);
-    SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+    bool gameBoost = g_gameBoostFlag.load();
+    applyGameProcessBoost(gameBoost);
 
     int port = AIRPLAY_PORT;
     int cliFps = 0; // 0 = auto native monitor refresh rate, -1 = unlimited event-driven FPS
@@ -375,12 +403,15 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
     if (gui) {
         WinMirrorStatus initSt;
         initSt.isAdmin = isAdmin;
+        initSt.gameBoost = gameBoost;
+        initSt.ecoQosOff = g_ecoQosDisabled.load();
+        initSt.firewallOk = (preflightRep.firewallOk != 0);
         initSt.hasVdd = g_hasVddState.load();
         initSt.dllLoaded = rtLoaded;
         initSt.dllVersion = rtLoaded ? preflightRep.runtimeVersion : "";
         initSt.endpointsSummary = netSummary;
         initSt.primaryConnectAddr = primaryAddr;
-        initSt.statusBanner = "Initializing GPU screen capture & 200 Mbps NVENC encoder...";
+        initSt.statusBanner = "Initializing GPU screen capture & 200 Mbps NVENC game engine...";
         gui->updateStatus(initSt);
     }
 
@@ -436,6 +467,7 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
     uint32_t targetFps = resolveTargetFps(cliFps, monitorHz, unlimitedFps);
 
     Encoder encoder;
+    encoder.setGameLowLatency(gameBoost);
     if (!encoder.init(capture.getD3DDevice(), capture.getD3DContext(),
                       capture.getWidth(), capture.getHeight(),
                       capture.getPixelFormat(), targetFps,
@@ -596,13 +628,18 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
                 continue;
             }
             bool unlimNow = g_unlimitedFpsFlag.load();
+            bool boostNow = g_gameBoostFlag.load();
             uint32_t fpsNow = std::max<uint32_t>(15u, curTargetFpsAtomic.load());
-            auto minCapGap = std::chrono::microseconds(unlimNow ? 0 : (750000ULL / fpsNow));
-            uint32_t dxgiWaitMs = (fpsNow > 60 || unlimNow) ? 1u : 4u;
-            // Avoid lapping encodeThread or double-copying 200+ Hz game frames on the shared D3D11 context
+            auto minCapGap = std::chrono::microseconds((unlimNow || boostNow) ? 0 : (750000ULL / fpsNow));
+            uint32_t dxgiWaitMs = boostNow ? ((fpsNow > 90 || unlimNow) ? 2u : 6u)
+                                           : ((fpsNow > 60 || unlimNow) ? 2u : 4u);
             auto capNow = std::chrono::steady_clock::now();
-            if ((localSeq > frameShare.consumedSeq.load() + 1) ||
-                (!unlimNow && (capNow - lastAcqTime) < minCapGap)) {
+            if (localSeq > frameShare.consumedSeq.load() + 1) {
+                g_captureSkips.fetch_add(1);
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            if (!unlimNow && minCapGap.count() > 0 && (capNow - lastAcqTime) < minCapGap) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
@@ -628,6 +665,9 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
     auto nextEncodeTime = startTime;
     uint32_t encodedFrames = 0;
     uint64_t encodedBytes = 0;
+    uint32_t keyframesSent = 0;
+    float encodeAvgMs = 0.0f;
+    float avgFrameKb = 0.0f;
     uint64_t frameSeq = 0;
     uint64_t lastEncodedSeq = 0;
     uint64_t seenStateSeq = g_stateChangedSeq.load();
@@ -670,6 +710,9 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
         st.hasVdd = g_hasVddState.load();
         st.installingVdd = g_installingVdd.load();
         st.unlimitedFps = unlimitedFps;
+        st.gameBoost = g_gameBoostFlag.load();
+        st.ecoQosOff = g_ecoQosDisabled.load();
+        st.firewallOk = (preflightRep.firewallOk != 0);
         st.hdrActive = encoder.isHdrActive();
         st.isHevc = (encoder.getCodec() == CODEC_HEVC);
         st.dllLoaded = rtLoaded;
@@ -684,8 +727,12 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
         st.targetFps = targetFps;
         st.targetMbps = encoder.getTargetBitrateMbps();
         st.audioRate = audioCapture.getSampleRate();
+        st.keyframesSent = keyframesSent;
+        st.captureSkips = static_cast<uint32_t>(g_captureSkips.load());
         st.actualFps = curFps;
         st.actualMbps = curMbps;
+        st.encodeAvgMs = encodeAvgMs;
+        st.avgFrameKb = avgFrameKb;
         st.gpuMode = gpuModeTag(hflags);
         st.encoderName = encoder.getEncoderName();
         st.captureName = capture.getAdapterName();
@@ -696,14 +743,21 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
         st.primaryConnectAddr = primaryAddr;
         st.dllVersion = rtLoaded ? preflightRep.runtimeVersion : "";
         st.statusBanner = st.clients > 0
-            ? ("Streaming live to Mac at up to " + std::to_string(st.targetMbps) + " Mbps.")
-            : "Ready - Launch WinMirror on Mac to connect (USB / 5GHz Wi-Fi / BT).";
+            ? (std::string("Streaming ") + (st.gameBoost ? "Game Boost " : "") + "live to Mac (up to " + std::to_string(st.targetMbps) + " Mbps).")
+            : "Ready - Open WinMirror.app on Mac to connect (USB / 5GHz Wi-Fi / BT).";
         gui->updateStatus(st);
     };
     pushGuiSnapshot(0.0f, 0.0f);
 
-    auto emitEncoded = [&](std::vector<uint8_t>& pktData, bool isKey, uint64_t ptsUs) {
-        encodedBytes += pktData.size();
+    auto emitEncoded = [&](std::vector<uint8_t>& pktData, bool isKey, uint64_t ptsUs, float encMs) {
+        size_t pktBytes = pktData.size();
+        encodedBytes += pktBytes;
+        if (isKey) keyframesSent++;
+        float kbNow = static_cast<float>(pktBytes) / 1024.0f;
+        avgFrameKb = (avgFrameKb <= 0.01f) ? kbNow : (avgFrameKb * 0.88f + kbNow * 0.12f);
+        if (encMs >= 0.0f && encMs < 500.0f) {
+            encodeAvgMs = (encodeAvgMs <= 0.01f) ? encMs : (encodeAvgMs * 0.85f + encMs * 0.15f);
+        }
         auto pkt = std::make_shared<EncodedFrame>();
         pkt->data = std::move(pktData);
         pkt->width = encoder.getWidth();
@@ -721,6 +775,13 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
 
     while (g_running) {
         bool wantUnlim = g_unlimitedFpsFlag.load();
+        bool wantBoost = g_gameBoostFlag.load();
+        if (wantBoost != gameBoost) {
+            gameBoost = wantBoost;
+            applyGameProcessBoost(gameBoost);
+            encoder.setGameLowLatency(gameBoost);
+            pushGuiSnapshot(0.0f, 0.0f);
+        }
         if (wantUnlim != unlimitedFps) {
             unlimitedFps = wantUnlim;
             bool dummy = false;
@@ -738,7 +799,7 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
             std::this_thread::sleep_for(std::chrono::milliseconds(40));
             nextEncodeTime = std::chrono::steady_clock::now();
         } else {
-            if (!unlimitedFps) {
+            if (!unlimitedFps && !gameBoost) {
                 auto nowBefore = std::chrono::steady_clock::now();
                 if (nowBefore + std::chrono::microseconds(250) < nextEncodeTime) {
                     std::this_thread::sleep_until(nextEncodeTime);
@@ -764,11 +825,13 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
                 uint64_t ptsUs = std::chrono::duration_cast<std::chrono::microseconds>(encodeNow - startTime).count();
                 bool isKey = false;
                 if (encodeCapturedFrame(ptsUs, isKey)) {
-                    emitEncoded(annexB, isKey, ptsUs);
+                    float encMs = std::chrono::duration<float, std::milli>(
+                        std::chrono::steady_clock::now() - encodeNow).count();
+                    emitEncoded(annexB, isKey, ptsUs, encMs);
                 }
                 syncStreamMetadata();
 
-                if (!unlimitedFps) {
+                if (!unlimitedFps && !gameBoost) {
                     // Drift-free fixed cadence without compounding encode latency into frame period
                     nextEncodeTime += minFrameGap;
                     auto afterEncode = std::chrono::steady_clock::now();
@@ -783,7 +846,7 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
             while (encoder.popPendingFrame(annexB, isKeyPending)) {
                 uint64_t drainPtsUs = std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - startTime).count();
-                emitEncoded(annexB, isKeyPending, drainPtsUs);
+                emitEncoded(annexB, isKeyPending, drainPtsUs, -1.0f);
             }
             syncStreamMetadata();
         }
@@ -906,6 +969,14 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         [&]() {
             g_unlimitedFpsFlag.store(!g_unlimitedFpsFlag.load());
             g_stateChangedSeq++;
+        },
+        [&]() {
+            bool nextBoost = !g_gameBoostFlag.load();
+            g_gameBoostFlag.store(nextBoost);
+            g_stateChangedSeq++;
+            gui.setStatusBanner(nextBoost
+                ? "Game Boost ENABLED: High Priority + EcoQoS Off + Low-Latency NVENC VBV."
+                : "Game Boost balanced mode enabled.");
         },
         [&]() {
             if (g_installingVdd.load()) return;

@@ -11,6 +11,9 @@ struct WinMirrorStatus {
     bool hasVdd = false;
     bool installingVdd = false;
     bool unlimitedFps = false;
+    bool gameBoost = true;
+    bool ecoQosOff = false;
+    bool firewallOk = false;
     bool hdrActive = false;
     bool isHevc = false;
     bool dllLoaded = false;
@@ -25,8 +28,12 @@ struct WinMirrorStatus {
     uint32_t targetFps = 60;
     uint32_t targetMbps = 0;
     uint32_t audioRate = 48000;
+    uint32_t keyframesSent = 0;
+    uint32_t captureSkips = 0;
     float actualFps = 0.0f;
     float actualMbps = 0.0f;
+    float encodeAvgMs = 0.0f;
+    float avgFrameKb = 0.0f;
     std::string gpuMode = "INIT";
     std::string encoderName;
     std::string captureName;
@@ -36,7 +43,7 @@ struct WinMirrorStatus {
     std::string endpointsSummary;
     std::string primaryConnectAddr;
     std::string dllVersion;
-    std::string statusBanner = "Starting WinMirror AirPlay engine...";
+    std::string statusBanner = "Starting WinMirror Game AirPlay engine...";
 };
 
 class WinMirrorGui {
@@ -45,6 +52,7 @@ public:
     ~WinMirrorGui();
 
     void setActions(std::function<void()> onToggleUnlimitedFps,
+                    std::function<void()> onToggleGameBoost,
                     std::function<void()> onInstallVdd,
                     std::function<void()> onQuit);
 
@@ -71,6 +79,7 @@ private:
 
     HWND m_hwnd = nullptr;
     HWND m_btnFps = nullptr;
+    HWND m_btnBoost = nullptr;
     HWND m_btnVdd = nullptr;
     HWND m_btnCopy = nullptr;
     HWND m_btnTray = nullptr;
@@ -92,6 +101,7 @@ private:
     WinMirrorStatus m_status;
 
     std::function<void()> m_onToggleUnlimited;
+    std::function<void()> m_onToggleGameBoost;
     std::function<void()> m_onInstallVdd;
     std::function<void()> m_onQuit;
 };

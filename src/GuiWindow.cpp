@@ -12,30 +12,33 @@ constexpr UINT WM_APP_REFRESH = WM_APP + 1;
 constexpr UINT WM_APP_TRAY = WM_APP + 2;
 constexpr UINT_PTR TIMER_COPY_RESET = 101;
 
-constexpr int ID_BTN_FPS  = 1001;
-constexpr int ID_BTN_VDD  = 1002;
-constexpr int ID_BTN_COPY = 1003;
-constexpr int ID_BTN_TRAY = 1004;
+constexpr int ID_BTN_FPS   = 1001;
+constexpr int ID_BTN_BOOST = 1002;
+constexpr int ID_BTN_VDD   = 1003;
+constexpr int ID_BTN_COPY  = 1004;
+constexpr int ID_BTN_TRAY  = 1005;
 
-constexpr int ID_TRAY_OPEN = 2001;
-constexpr int ID_TRAY_FPS  = 2002;
-constexpr int ID_TRAY_QUIT = 2003;
+constexpr int ID_TRAY_OPEN  = 2001;
+constexpr int ID_TRAY_FPS   = 2002;
+constexpr int ID_TRAY_BOOST = 2003;
+constexpr int ID_TRAY_QUIT  = 2004;
 
-constexpr int BASE_W = 540;
-constexpr int BASE_H = 446;
+constexpr int BASE_W = 580;
+constexpr int BASE_H = 506;
 
-constexpr COLORREF COL_BG        = RGB(14, 17, 23);
-constexpr COLORREF COL_CARD      = RGB(22, 27, 36);
-constexpr COLORREF COL_BORDER    = RGB(38, 46, 61);
+constexpr COLORREF COL_BG        = RGB(13, 17, 23);
+constexpr COLORREF COL_CARD      = RGB(21, 26, 35);
+constexpr COLORREF COL_BORDER    = RGB(38, 47, 63);
 constexpr COLORREF COL_TEXT      = RGB(242, 246, 252);
 constexpr COLORREF COL_MUTED     = RGB(139, 149, 167);
 constexpr COLORREF COL_ACCENT    = RGB(37, 99, 235);
 constexpr COLORREF COL_ACCENT_HV = RGB(59, 130, 246);
+constexpr COLORREF COL_CYAN      = RGB(56, 189, 248);
 constexpr COLORREF COL_GREEN     = RGB(52, 211, 153);
 constexpr COLORREF COL_AMBER     = RGB(251, 191, 36);
 constexpr COLORREF COL_PURPLE    = RGB(167, 139, 250);
-constexpr COLORREF COL_BTN       = RGB(30, 36, 48);
-constexpr COLORREF COL_BTN_HV    = RGB(44, 53, 71);
+constexpr COLORREF COL_BTN       = RGB(29, 36, 48);
+constexpr COLORREF COL_BTN_HV    = RGB(44, 54, 72);
 
 int sc(int px, UINT dpi) {
     return MulDiv(px, static_cast<int>(dpi), 96);
@@ -188,9 +191,11 @@ WinMirrorGui::~WinMirrorGui() {
 }
 
 void WinMirrorGui::setActions(std::function<void()> onToggleUnlimitedFps,
+                              std::function<void()> onToggleGameBoost,
                               std::function<void()> onInstallVdd,
                               std::function<void()> onQuit) {
     m_onToggleUnlimited = std::move(onToggleUnlimitedFps);
+    m_onToggleGameBoost = std::move(onToggleGameBoost);
     m_onInstallVdd = std::move(onInstallVdd);
     m_onQuit = std::move(onQuit);
 }
@@ -263,10 +268,11 @@ bool WinMirrorGui::createAndShow() {
         return b;
     };
 
-    m_btnFps  = makeBtn(ID_BTN_FPS,  L"FPS: Native");
-    m_btnVdd  = makeBtn(ID_BTN_VDD,  L"Install 4K HDR");
-    m_btnCopy = makeBtn(ID_BTN_COPY, L"Copy Address");
-    m_btnTray = makeBtn(ID_BTN_TRAY, L"Hide to Tray");
+    m_btnFps   = makeBtn(ID_BTN_FPS,   L"FPS: Native");
+    m_btnBoost = makeBtn(ID_BTN_BOOST, L"Game Boost: ON");
+    m_btnVdd   = makeBtn(ID_BTN_VDD,   L"Install 4K HDR");
+    m_btnCopy  = makeBtn(ID_BTN_COPY,  L"Copy IP");
+    m_btnTray  = makeBtn(ID_BTN_TRAY,  L"Hide Tray");
 
     layoutChildren();
     addTrayIcon();
@@ -277,12 +283,13 @@ bool WinMirrorGui::createAndShow() {
 
 void WinMirrorGui::layoutChildren() {
     if (!m_hwnd) return;
-    int y = sc(376, m_dpi);
-    int h = sc(34, m_dpi);
-    SetWindowPos(m_btnFps,  nullptr, sc(20,  m_dpi), y, sc(118, m_dpi), h, SWP_NOZORDER);
-    SetWindowPos(m_btnVdd,  nullptr, sc(148, m_dpi), y, sc(126, m_dpi), h, SWP_NOZORDER);
-    SetWindowPos(m_btnCopy, nullptr, sc(284, m_dpi), y, sc(114, m_dpi), h, SWP_NOZORDER);
-    SetWindowPos(m_btnTray, nullptr, sc(408, m_dpi), y, sc(112, m_dpi), h, SWP_NOZORDER);
+    int y = sc(420, m_dpi);
+    int h = sc(36, m_dpi);
+    SetWindowPos(m_btnFps,   nullptr, sc(20,  m_dpi), y, sc(102, m_dpi), h, SWP_NOZORDER);
+    SetWindowPos(m_btnBoost, nullptr, sc(131, m_dpi), y, sc(108, m_dpi), h, SWP_NOZORDER);
+    SetWindowPos(m_btnVdd,   nullptr, sc(248, m_dpi), y, sc(114, m_dpi), h, SWP_NOZORDER);
+    SetWindowPos(m_btnCopy,  nullptr, sc(371, m_dpi), y, sc(92,  m_dpi), h, SWP_NOZORDER);
+    SetWindowPos(m_btnTray,  nullptr, sc(472, m_dpi), y, sc(88,  m_dpi), h, SWP_NOZORDER);
 }
 
 void WinMirrorGui::updateStatus(const WinMirrorStatus& st) {
@@ -371,6 +378,7 @@ void WinMirrorGui::showTrayContextMenu() {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, ID_TRAY_OPEN, L"Open WinMirror Dashboard");
     AppendMenuW(menu, MF_STRING | (snap.unlimitedFps ? MF_CHECKED : 0), ID_TRAY_FPS, L"Unlimited FPS Mode");
+    AppendMenuW(menu, MF_STRING | (snap.gameBoost ? MF_CHECKED : 0), ID_TRAY_BOOST, L"Game Low-Latency Boost");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_TRAY_QUIT, L"Quit WinMirror");
 
@@ -383,6 +391,8 @@ void WinMirrorGui::showTrayContextMenu() {
         showFromTray();
     } else if (cmd == ID_TRAY_FPS) {
         if (m_onToggleUnlimited) m_onToggleUnlimited();
+    } else if (cmd == ID_TRAY_BOOST) {
+        if (m_onToggleGameBoost) m_onToggleGameBoost();
     } else if (cmd == ID_TRAY_QUIT) {
         requestClose();
     }
@@ -436,14 +446,21 @@ void WinMirrorGui::drawButton(const DRAWITEMSTRUCT* dis) {
 
     std::wstring label;
     if (id == ID_BTN_FPS) {
-        label = snap.unlimitedFps ? L"FPS: Unlimited" : L"FPS: Native";
+        label = snap.unlimitedFps ? L"FPS: Unlim" : L"FPS: Native";
         if (snap.unlimitedFps) {
             bg = hovered ? COL_ACCENT_HV : COL_ACCENT;
             bd = COL_ACCENT_HV;
         }
+    } else if (id == ID_BTN_BOOST) {
+        label = snap.gameBoost ? L"Boost: ON" : L"Boost: Std";
+        if (snap.gameBoost) {
+            bg = hovered ? RGB(20, 83, 58) : RGB(16, 65, 45);
+            bd = COL_GREEN;
+            fg = COL_GREEN;
+        }
     } else if (id == ID_BTN_VDD) {
         if (snap.installingVdd) {
-            label = L"Installing VDD...";
+            label = L"Installing...";
             fg = COL_AMBER;
         } else if (snap.hasVdd) {
             label = L"4K HDR Ready";
@@ -452,13 +469,13 @@ void WinMirrorGui::drawButton(const DRAWITEMSTRUCT* dis) {
             label = L"Install 4K HDR";
         }
     } else if (id == ID_BTN_COPY) {
-        label = m_copiedFlash ? L"Copied IP!" : L"Copy Address";
+        label = m_copiedFlash ? L"Copied!" : L"Copy IP";
         if (m_copiedFlash) {
             fg = COL_GREEN;
             bd = COL_GREEN;
         }
     } else if (id == ID_BTN_TRAY) {
-        label = L"Hide to Tray";
+        label = L"Hide Tray";
     }
 
     if (pressed) {
@@ -512,15 +529,15 @@ void WinMirrorGui::paintWindow(HWND hwnd) {
     };
 
     // Header
-    textOutRect({ sc(20, m_dpi), sc(14, m_dpi), sc(260, m_dpi), sc(42, m_dpi) },
+    textOutRect({ sc(20, m_dpi), sc(14, m_dpi), sc(310, m_dpi), sc(42, m_dpi) },
                 m_fontTitle, COL_TEXT, L"WinMirror AirPlay");
-    wchar_t verLine[96] = {};
-    std::swprintf(verLine, ARRAYSIZE(verLine), L"v%hs  |  Max 200 Mbps Engine", WINMIRROR_VERSION);
-    textOutRect({ sc(20, m_dpi), sc(40, m_dpi), sc(310, m_dpi), sc(58, m_dpi) },
+    wchar_t verLine[112] = {};
+    std::swprintf(verLine, ARRAYSIZE(verLine), L"v%hs  |  Game Screen Low-Latency Studio (Max 200 Mbps)", WINMIRROR_VERSION);
+    textOutRect({ sc(20, m_dpi), sc(40, m_dpi), sc(385, m_dpi), sc(58, m_dpi) },
                 m_fontSmall, COL_MUTED, verLine);
 
     // Status pill
-    RECT pill = { sc(348, m_dpi), sc(18, m_dpi), sc(520, m_dpi), sc(48, m_dpi) };
+    RECT pill = { sc(392, m_dpi), sc(18, m_dpi), sc(560, m_dpi), sc(48, m_dpi) };
     COLORREF pillBg = snap.clients > 0 ? RGB(16, 42, 34) : (snap.streamingReady ? RGB(38, 31, 16) : RGB(27, 34, 48));
     COLORREF pillBd = snap.clients > 0 ? RGB(30, 90, 68) : (snap.streamingReady ? RGB(82, 62, 24) : COL_BORDER);
     COLORREF dotCol = snap.clients > 0 ? COL_GREEN : (snap.streamingReady ? COL_AMBER : COL_MUTED);
@@ -550,74 +567,107 @@ void WinMirrorGui::paintWindow(HWND hwnd) {
     textOutRect({ dx + dr + sc(8, m_dpi), pill.top, pill.right - sc(8, m_dpi), pill.bottom },
                 m_fontBody, COL_TEXT, pillTxt);
 
+    auto drawCardTopStripe = [&](const RECT& r, COLORREF accent) {
+        RECT bar = { r.left + sc(12, m_dpi), r.top + sc(1, m_dpi), r.right - sc(12, m_dpi), r.top + sc(4, m_dpi) };
+        HBRUSH ab = CreateSolidBrush(accent);
+        FillRect(memDc, &bar, ab);
+        DeleteObject(ab);
+    };
+
     // 3 Top Metric Cards
-    const int cardY = sc(72, m_dpi);
-    const int cardH = sc(88, m_dpi);
-    const int cardW = sc(160, m_dpi);
+    const int cardY = sc(70, m_dpi);
+    const int cardH = sc(100, m_dpi);
+    const int cardW = sc(172, m_dpi);
     const int radius = sc(10, m_dpi);
 
-    // Card 1: FPS
+    // Card 1: FRAME PACING
     RECT c1 = { sc(20, m_dpi), cardY, sc(20, m_dpi) + cardW, cardY + cardH };
     fillRoundRect(memDc, c1, radius, COL_CARD, COL_BORDER);
+    drawCardTopStripe(c1, COL_ACCENT_HV);
     textOutRect({ c1.left + sc(12, m_dpi), c1.top + sc(10, m_dpi), c1.right - sc(10, m_dpi), c1.top + sc(26, m_dpi) },
-                m_fontLabel, COL_MUTED, L"STREAM FPS");
+                m_fontLabel, COL_MUTED, L"FRAME PACING");
     wchar_t fpsMain[48] = {};
     if (!snap.streamingReady) {
         std::swprintf(fpsMain, ARRAYSIZE(fpsMain), L"-- FPS");
     } else {
         std::swprintf(fpsMain, ARRAYSIZE(fpsMain), L"%.1f FPS", snap.actualFps);
     }
-    textOutRect({ c1.left + sc(12, m_dpi), c1.top + sc(28, m_dpi), c1.right - sc(10, m_dpi), c1.top + sc(58, m_dpi) },
+    textOutRect({ c1.left + sc(12, m_dpi), c1.top + sc(27, m_dpi), c1.right - sc(10, m_dpi), c1.top + sc(56, m_dpi) },
                 m_fontMetric, COL_TEXT, fpsMain);
-    wchar_t fpsSub[64] = {};
-    std::swprintf(fpsSub, ARRAYSIZE(fpsSub), L"%ls | %hs",
-                  snap.unlimitedFps ? L"UNLIMITED" : L"Native Sync",
-                  snap.gpuMode.c_str());
-    textOutRect({ c1.left + sc(12, m_dpi), c1.top + sc(60, m_dpi), c1.right - sc(10, m_dpi), c1.top + sc(78, m_dpi) },
-                m_fontSmall, RGB(96, 165, 250), fpsSub);
+    wchar_t fpsSub1[64] = {};
+    std::swprintf(fpsSub1, ARRAYSIZE(fpsSub1), L"%ls (%uHz) | Enc %.1fms",
+                  snap.unlimitedFps ? L"UNLIM" : L"Native", snap.targetFps, snap.encodeAvgMs);
+    textOutRect({ c1.left + sc(12, m_dpi), c1.top + sc(59, m_dpi), c1.right - sc(10, m_dpi), c1.top + sc(75, m_dpi) },
+                m_fontSmall, COL_CYAN, fpsSub1);
+    wchar_t fpsSub2[64] = {};
+    std::swprintf(fpsSub2, ARRAYSIZE(fpsSub2), L"%hs | Skips %u", snap.gpuMode.c_str(), snap.captureSkips);
+    textOutRect({ c1.left + sc(12, m_dpi), c1.top + sc(76, m_dpi), c1.right - sc(10, m_dpi), c1.top + sc(92, m_dpi) },
+                m_fontSmall, COL_MUTED, fpsSub2);
 
-    // Card 2: BITRATE (up to 200 Mbps)
-    RECT c2 = { sc(190, m_dpi), cardY, sc(190, m_dpi) + cardW, cardY + cardH };
+    // Card 2: BITRATE & CAPACITY METER (up to 200 Mbps)
+    RECT c2 = { sc(204, m_dpi), cardY, sc(204, m_dpi) + cardW, cardY + cardH };
     fillRoundRect(memDc, c2, radius, COL_CARD, COL_BORDER);
+    drawCardTopStripe(c2, snap.bitrateScalePct < 100 ? COL_AMBER : COL_GREEN);
     textOutRect({ c2.left + sc(12, m_dpi), c2.top + sc(10, m_dpi), c2.right - sc(10, m_dpi), c2.top + sc(26, m_dpi) },
-                m_fontLabel, COL_MUTED, L"BITRATE (MAX 200)");
+                m_fontLabel, COL_MUTED, L"THROUGHPUT (MAX 200)");
     wchar_t mbpsMain[48] = {};
     if (!snap.streamingReady) {
         std::swprintf(mbpsMain, ARRAYSIZE(mbpsMain), L"-- Mbps");
     } else {
         std::swprintf(mbpsMain, ARRAYSIZE(mbpsMain), L"%.1f Mbps", snap.actualMbps);
     }
-    textOutRect({ c2.left + sc(12, m_dpi), c2.top + sc(28, m_dpi), c2.right - sc(10, m_dpi), c2.top + sc(58, m_dpi) },
+    textOutRect({ c2.left + sc(12, m_dpi), c2.top + sc(27, m_dpi), c2.right - sc(10, m_dpi), c2.top + sc(56, m_dpi) },
                 m_fontMetric, COL_TEXT, mbpsMain);
+
+    // Progress meter inside Card 2 (0..200 Mbps scale)
+    RECT barTrack = { c2.left + sc(12, m_dpi), c2.top + sc(62, m_dpi), c2.right - sc(12, m_dpi), c2.top + sc(68, m_dpi) };
+    HBRUSH trackBr = CreateSolidBrush(RGB(34, 42, 56));
+    FillRect(memDc, &barTrack, trackBr);
+    DeleteObject(trackBr);
+    double pctFill = std::min(1.0, std::max(0.0, static_cast<double>(snap.actualMbps) / 200.0));
+    if (pctFill > 0.0) {
+        RECT barFill = barTrack;
+        barFill.right = barTrack.left + static_cast<int>((barTrack.right - barTrack.left) * pctFill);
+        HBRUSH fillBr = CreateSolidBrush(snap.bitrateScalePct < 100 ? COL_AMBER : COL_GREEN);
+        FillRect(memDc, &barFill, fillBr);
+        DeleteObject(fillBr);
+    }
+
     wchar_t mbpsSub[64] = {};
-    std::swprintf(mbpsSub, ARRAYSIZE(mbpsSub), L"Target %u Mbps (%d%%)", snap.targetMbps, snap.bitrateScalePct);
-    textOutRect({ c2.left + sc(12, m_dpi), c2.top + sc(60, m_dpi), c2.right - sc(10, m_dpi), c2.top + sc(78, m_dpi) },
+    std::swprintf(mbpsSub, ARRAYSIZE(mbpsSub), L"Target %uM (%d%%) | %.0fKB",
+                  snap.targetMbps, snap.bitrateScalePct, snap.avgFrameKb);
+    textOutRect({ c2.left + sc(12, m_dpi), c2.top + sc(75, m_dpi), c2.right - sc(10, m_dpi), c2.top + sc(92, m_dpi) },
                 m_fontSmall, snap.bitrateScalePct < 100 ? COL_AMBER : COL_GREEN, mbpsSub);
 
-    // Card 3: DISPLAY
-    RECT c3 = { sc(360, m_dpi), cardY, sc(360, m_dpi) + cardW, cardY + cardH };
+    // Card 3: GAME DISPLAY
+    RECT c3 = { sc(388, m_dpi), cardY, sc(388, m_dpi) + cardW, cardY + cardH };
     fillRoundRect(memDc, c3, radius, COL_CARD, COL_BORDER);
+    drawCardTopStripe(c3, snap.hdrActive ? COL_PURPLE : COL_CYAN);
     textOutRect({ c3.left + sc(12, m_dpi), c3.top + sc(10, m_dpi), c3.right - sc(10, m_dpi), c3.top + sc(26, m_dpi) },
-                m_fontLabel, COL_MUTED, L"DISPLAY OUTPUT");
+                m_fontLabel, COL_MUTED, L"GAME DISPLAY");
     wchar_t resMain[48] = {};
     if (snap.width > 0 && snap.height > 0) {
         std::swprintf(resMain, ARRAYSIZE(resMain), L"%ux%u", snap.width, snap.height);
     } else {
         std::swprintf(resMain, ARRAYSIZE(resMain), L"Detecting...");
     }
-    textOutRect({ c3.left + sc(12, m_dpi), c3.top + sc(28, m_dpi), c3.right - sc(10, m_dpi), c3.top + sc(58, m_dpi) },
+    textOutRect({ c3.left + sc(12, m_dpi), c3.top + sc(27, m_dpi), c3.right - sc(10, m_dpi), c3.top + sc(56, m_dpi) },
                 m_fontMetric, COL_TEXT, resMain);
-    std::wstring dispSub = std::wstring(snap.isHevc ? L"HEVC " : L"H.264 ") +
-                           (snap.hdrActive ? L"10-bit HDR10 PQ" : L"8-bit SDR");
-    textOutRect({ c3.left + sc(12, m_dpi), c3.top + sc(60, m_dpi), c3.right - sc(10, m_dpi), c3.top + sc(78, m_dpi) },
-                m_fontSmall, snap.hdrActive ? COL_PURPLE : COL_MUTED, dispSub);
+    std::wstring dispSub1 = std::wstring(snap.isHevc ? L"HEVC " : L"H.264 ") +
+                            (snap.hdrActive ? L"10-bit HDR10 PQ" : L"8-bit SDR BT.709");
+    textOutRect({ c3.left + sc(12, m_dpi), c3.top + sc(59, m_dpi), c3.right - sc(10, m_dpi), c3.top + sc(75, m_dpi) },
+                m_fontSmall, snap.hdrActive ? COL_PURPLE : COL_TEXT, dispSub1);
+    wchar_t dispSub2[48] = {};
+    std::swprintf(dispSub2, ARRAYSIZE(dispSub2), L"Panel %u Hz | IDR %u", snap.monitorHz, snap.keyframesSent);
+    textOutRect({ c3.left + sc(12, m_dpi), c3.top + sc(76, m_dpi), c3.right - sc(10, m_dpi), c3.top + sc(92, m_dpi) },
+                m_fontSmall, COL_MUTED, dispSub2);
 
-    // System & Transports Details Panel
-    RECT infoCard = { sc(20, m_dpi), sc(172, m_dpi), sc(520, m_dpi), sc(360, m_dpi) };
+    // System & Game Telemetry Panel (6 Rows)
+    RECT infoCard = { sc(20, m_dpi), sc(182, m_dpi), sc(560, m_dpi), sc(404, m_dpi) };
     fillRoundRect(memDc, infoCard, radius, COL_CARD, COL_BORDER);
 
     auto drawRow = [&](int rowIdx, const wchar_t* k, const std::wstring& v, COLORREF vCol = COL_TEXT) {
-        int ry = infoCard.top + sc(14 + rowIdx * 34, m_dpi);
+        int ry = infoCard.top + sc(12 + rowIdx * 34, m_dpi);
         textOutRect({ infoCard.left + sc(16, m_dpi), ry, infoCard.left + sc(122, m_dpi), ry + sc(24, m_dpi) },
                     m_fontLabel, COL_MUTED, k);
         textOutRect({ infoCard.left + sc(126, m_dpi), ry, infoCard.right - sc(14, m_dpi), ry + sc(24, m_dpi) },
@@ -625,26 +675,37 @@ void WinMirrorGui::paintWindow(HWND hwnd) {
     };
 
     std::wstring encVal = utf8ToWide(snap.encoderName);
+    wchar_t encExtra[64] = {};
+    std::swprintf(encExtra, ARRAYSIZE(encExtra), L"  |  CBR %ls  |  %.1fms",
+                  snap.gameBoost ? L"Low-Lat" : L"Std", snap.encodeAvgMs);
+    if (!encVal.empty()) encVal += encExtra;
+
     std::wstring capVal = utf8ToWide(snap.captureName);
     if (!snap.pixelFormat.empty()) {
         capVal += L" (" + utf8ToWide(snap.pixelFormat) + L")";
     }
+    std::wstring optVal = snap.gameBoost
+        ? (std::wstring(L"HIGH Priority | MMCSS Games | 0.5ms Timer | ") +
+           (snap.ecoQosOff ? L"EcoQoS Off" : L"Foreground"))
+        : L"Standard Priority | Balanced VBV Buffer";
     std::wstring audVal = snap.audioActive
-        ? (utf8ToWide(snap.audioName) + L" [" + std::to_wstring(snap.audioRate / 1000) + L" kHz]")
+        ? (utf8ToWide(snap.audioName) + L" [" + std::to_wstring(snap.audioRate / 1000) + L" kHz Stereo]")
         : L"Loopback Off";
     std::wstring netVal = utf8ToWide(snap.endpointsSummary);
-    std::wstring rtBtVal = (snap.dllLoaded ? (L"DLL v" + utf8ToWide(snap.dllVersion)) : L"Built-in Timer") +
-                           L"  |  BT: " + utf8ToWide(snap.btStatus) +
-                           L"  |  4K VDD: " + (snap.hasVdd ? L"Installed" : L"Not Installed");
+    std::wstring sysVal = (snap.dllLoaded ? (L"DLL v" + utf8ToWide(snap.dllVersion)) : L"1ms Timer") +
+                          L" | FW:" + (snap.firewallOk ? L"OK" : L"Std") +
+                          L" | BT:" + utf8ToWide(snap.btStatus) +
+                          L" | 4K VDD:" + (snap.hasVdd ? L"Ready" : L"Missing");
 
     drawRow(0, L"ENCODER",    encVal);
     drawRow(1, L"CAPTURE",    capVal);
-    drawRow(2, L"AUDIO",      audVal);
-    drawRow(3, L"TRANSPORTS", netVal, RGB(147, 197, 253));
-    drawRow(4, L"SYSTEM",     rtBtVal, snap.hasVdd ? COL_GREEN : COL_MUTED);
+    drawRow(2, L"GAME OPT",   optVal, snap.gameBoost ? COL_GREEN : COL_MUTED);
+    drawRow(3, L"AUDIO",      audVal);
+    drawRow(4, L"TRANSPORTS", netVal, RGB(147, 197, 253));
+    drawRow(5, L"SYSTEM",     sysVal, snap.hasVdd ? COL_GREEN : COL_MUTED);
 
     // Subtle status footer bar below buttons
-    textOutRect({ sc(20, m_dpi), sc(416, m_dpi), sc(520, m_dpi), sc(438, m_dpi) },
+    textOutRect({ sc(20, m_dpi), sc(468, m_dpi), sc(560, m_dpi), sc(494, m_dpi) },
                 m_fontSmall, COL_MUTED, utf8ToWide(snap.statusBanner));
 
     BitBlt(screenDc, 0, 0, cw, ch, memDc, 0, 0, SRCCOPY);
@@ -681,6 +742,7 @@ LRESULT WinMirrorGui::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             if (newHover != m_hoverBtnId) {
                 m_hoverBtnId = newHover;
                 InvalidateRect(m_btnFps, nullptr, FALSE);
+                InvalidateRect(m_btnBoost, nullptr, FALSE);
                 InvalidateRect(m_btnVdd, nullptr, FALSE);
                 InvalidateRect(m_btnCopy, nullptr, FALSE);
                 InvalidateRect(m_btnTray, nullptr, FALSE);
@@ -690,6 +752,7 @@ LRESULT WinMirrorGui::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         case WM_APP_REFRESH:
             InvalidateRect(hwnd, nullptr, FALSE);
             if (m_btnFps) InvalidateRect(m_btnFps, nullptr, FALSE);
+            if (m_btnBoost) InvalidateRect(m_btnBoost, nullptr, FALSE);
             if (m_btnVdd) InvalidateRect(m_btnVdd, nullptr, FALSE);
             if (m_btnCopy) InvalidateRect(m_btnCopy, nullptr, FALSE);
             if (m_btnTray) InvalidateRect(m_btnTray, nullptr, FALSE);
@@ -698,6 +761,8 @@ LRESULT WinMirrorGui::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             int id = LOWORD(wParam);
             if (id == ID_BTN_FPS && m_onToggleUnlimited) {
                 m_onToggleUnlimited();
+            } else if (id == ID_BTN_BOOST && m_onToggleGameBoost) {
+                m_onToggleGameBoost();
             } else if (id == ID_BTN_VDD && m_onInstallVdd) {
                 m_onInstallVdd();
             } else if (id == ID_BTN_COPY) {

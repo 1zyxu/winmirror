@@ -24,7 +24,7 @@
 #include <chrono>
 #include <memory>
 
-#define WINMIRROR_VERSION "2.1.9"
+#define WINMIRROR_VERSION "2.2.0"
 #define WINMIRROR_REPO "1zyxu/winmirror"
 #define AIRPLAY_PORT 7001
 #define BEACON_PORT 8889

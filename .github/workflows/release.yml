@@ -59,14 +59,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build winmirror_mac
+      - name: Build winmirror_mac and WinMirror.dmg
         run: ./build.sh mac
 
       - name: Upload macOS Artifact
         uses: actions/upload-artifact@v4
         with:
           name: winmirror-macos
-          path: winmirror_mac
+          path: |
+            winmirror_mac
+            WinMirror.dmg
 
   publish-release:
     needs: [build-windows, build-macos]
@@ -92,6 +94,7 @@ jobs:
             winmirror_rt.dll
             winmirror-windows.zip
             winmirror_mac
+            WinMirror.dmg
           draft: false
           prerelease: false
           generate_release_notes: true

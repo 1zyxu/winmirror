@@ -37,15 +37,66 @@ build_win() {
 }
 
 build_mac() {
-    echo "==> Building winmirror_mac (macOS arm64 VideoToolbox HDR + CoreAudio + IOBluetooth)..."
+    echo "==> Building winmirror_mac + WinMirror.app + WinMirror.dmg (macOS arm64 VideoToolbox HDR + CoreAudio + IOBluetooth)..."
     clang++ -O3 -std=c++17 \
         -Wl,-sectcreate,__TEXT,__info_plist,mac/Info.plist \
         -framework Cocoa -framework QuartzCore -framework VideoToolbox \
         -framework AVFoundation -framework CoreMedia -framework CoreVideo \
         -framework AudioToolbox -framework CoreAudio -framework IOBluetooth \
         mac/main.mm -o winmirror_mac
-    echo "==> Built winmirror_mac successfully!"
-    ls -lh winmirror_mac
+
+    rm -rf WinMirror.app .dmg_stage .iconset_tmp WinMirror.dmg
+    mkdir -p WinMirror.app/Contents/MacOS WinMirror.app/Contents/Resources .iconset_tmp/AppIcon.iconset
+    cp winmirror_mac WinMirror.app/Contents/MacOS/winmirror_mac
+    cp mac/Info.plist WinMirror.app/Contents/Info.plist
+    chmod +x WinMirror.app/Contents/MacOS/winmirror_mac
+
+    python3 - <<'PYEOF'
+import struct, zlib
+W = H = 512
+rows = []
+for y in range(H):
+    row = bytearray([0])
+    for x in range(W):
+        dx = max(0, max(96 - x, x - 415))
+        dy = max(0, max(96 - y, y - 415))
+        if dx * dx + dy * dy > 96 * 96:
+            row.extend((0, 0, 0, 0))
+            continue
+        r, g, b = (30, 88, 224) if y < 256 else (20, 62, 184)
+        if 96 <= x <= 415 and 128 <= y <= 344 and (x < 114 or x > 397 or y < 146 or y > 326):
+            r, g, b = 248, 250, 252
+        elif 176 <= x <= 336 and 372 <= y <= 390:
+            r, g, b = 147, 197, 253
+        elif 216 <= x <= 316 and 186 <= y <= 286 and abs(y - 236) <= (316 - x) // 2:
+            r, g, b = 52, 211, 153
+        row.extend((r, g, b, 255))
+    rows.append(bytes(row))
+def chunk(tag, data):
+    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
+ihdr = struct.pack(">IIBBBBB", W, H, 8, 6, 0, 0, 0)
+idat = zlib.compress(b"".join(rows), 6)
+with open(".iconset_tmp/base.png", "wb") as f:
+    f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b""))
+PYEOF
+    sips -z 128 128 .iconset_tmp/base.png --out .iconset_tmp/AppIcon.iconset/icon_128x128.png >/dev/null
+    sips -z 256 256 .iconset_tmp/base.png --out .iconset_tmp/AppIcon.iconset/icon_128x128@2x.png >/dev/null
+    sips -z 256 256 .iconset_tmp/base.png --out .iconset_tmp/AppIcon.iconset/icon_256x256.png >/dev/null
+    cp .iconset_tmp/base.png .iconset_tmp/AppIcon.iconset/icon_256x256@2x.png
+    cp .iconset_tmp/base.png .iconset_tmp/AppIcon.iconset/icon_512x512.png
+    iconutil -c icns .iconset_tmp/AppIcon.iconset -o WinMirror.app/Contents/Resources/AppIcon.icns
+    rm -rf .iconset_tmp
+
+    codesign --force --deep --sign - WinMirror.app 2>/dev/null || true
+
+    mkdir -p .dmg_stage
+    cp -R WinMirror.app .dmg_stage/
+    ln -s /Applications .dmg_stage/Applications
+    hdiutil create -volname "WinMirror AirPlay" -srcfolder .dmg_stage -ov -format UDZO WinMirror.dmg >/dev/null
+    rm -rf .dmg_stage
+
+    echo "==> Built winmirror_mac + WinMirror.app + WinMirror.dmg successfully!"
+    ls -lh winmirror_mac WinMirror.dmg
 }
 
 TARGET="${1:-all}"

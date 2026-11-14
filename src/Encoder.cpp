@@ -632,12 +632,14 @@ void Encoder::cleanupVideoProcessor() {
 bool Encoder::configureMftTypes(const GUID& outputSubtype, bool wantP010, UINT32 bitrate) {
     auto applyRtProps = [&]() {
         if (!m_codecApi) return;
+        bool lowLat = m_gameLowLatency.load();
+        m_appliedGameLowLatency = lowLat;
         setCodecBool(m_codecApi, CODECAPI_AVLowLatencyMode, true);
         setCodecBool(m_codecApi, CODECAPI_AVEncCommonRealTime, true);
-        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonQualityVsSpeed, 40);
+        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonQualityVsSpeed, lowLat ? 25u : 45u);
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonMeanBitRate, bitrate);
-        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonBufferSize, bitrate / 8);
+        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonBufferSize, lowLat ? (bitrate / 10u) : (bitrate / 6u));
         setCodecUint32(m_codecApi, CODECAPI_AVEncMPVDefaultBPictureCount, 0);
         UINT32 gopSize = std::min<UINT32>(600u, std::max<UINT32>(120u, m_fps * 4u));
         setCodecUint32(m_codecApi, CODECAPI_AVEncMPVGOPSize, gopSize);
@@ -1243,10 +1245,14 @@ bool Encoder::submitSampleToMft(IMFSample* sample, std::vector<uint8_t>& outAnne
     if (!sample) return false;
 
     int targetPct = m_bitrateScalePct.load();
-    if (m_codecApi && targetPct != m_appliedScalePct) {
-        UINT32 newMbps = getTargetBitrateMbps();
-        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonMeanBitRate, newMbps * 1000000u);
+    bool wantLowLat = m_gameLowLatency.load();
+    if (m_codecApi && (targetPct != m_appliedScalePct || wantLowLat != m_appliedGameLowLatency)) {
+        UINT32 newBps = getTargetBitrateMbps() * 1000000u;
+        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonMeanBitRate, newBps);
+        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonQualityVsSpeed, wantLowLat ? 25u : 45u);
+        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonBufferSize, wantLowLat ? (newBps / 10u) : (newBps / 6u));
         m_appliedScalePct = targetPct;
+        m_appliedGameLowLatency = wantLowLat;
     }
 
     if ((m_forceKeyframe.exchange(false) || !m_hasEmittedKeyframe) && m_codecApi) {
@@ -1444,7 +1450,7 @@ bool Encoder::pumpAsyncEvents(bool waitOutput) {
             if (!waitOutput || !m_readyOutputs.empty()) break;
             auto elapsed = std::chrono::steady_clock::now() - start;
             if (elapsed > waitBudget) break;
-            if (elapsed < std::chrono::microseconds(500)) {
+            if (elapsed < std::chrono::microseconds(m_gameLowLatency.load() ? 1200 : 500)) {
                 Sleep(0);
             } else {
                 Sleep(1);

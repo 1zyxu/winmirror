@@ -24,6 +24,27 @@
 
 #include "../src/TransportPolicy.h"
 
+static std::atomic<bool> g_macGameLowLatency{true};
+
+static std::string collectLocalMacIpSummary() {
+    struct ifaddrs *ifap = nullptr;
+    if (getifaddrs(&ifap) != 0 || !ifap) return "Scanning...";
+    std::string out;
+    for (struct ifaddrs *ifa = ifap; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK)) continue;
+        char buf[INET_ADDRSTRLEN] = {};
+        auto *sin = reinterpret_cast<struct sockaddr_in *>(ifa->ifa_addr);
+        if (!inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf))) continue;
+        std::string ip(buf);
+        if (!isPreferredPrivateIp(ip)) continue;
+        if (!out.empty()) out += " | ";
+        out += std::string(ifa->ifa_name) + ": " + ip;
+    }
+    freeifaddrs(ifap);
+    return out.empty() ? "No active LAN/USB IP" : out;
+}
+
 #include <string>
 #include <vector>
 #include <deque>
@@ -554,9 +575,14 @@ static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObject
 @property (nonatomic, strong) AVSampleBufferDisplayLayer *displayLayer;
 @property (nonatomic, strong) CALayer *cursorLayer;
 @property (nonatomic, assign) BOOL hudVisible;
+@property (nonatomic, assign) BOOL streamingActive;
+@property (nonatomic, copy) void (^onConnectHost)(NSString *host);
+@property (nonatomic, copy) void (^onToggleBoost)(void);
+@property (nonatomic, copy) void (^onToggleHud)(void);
 - (void)updateCursor:(const CursorPayload *)meta bitmap:(const uint8_t *)bgra size:(size_t)bgraLen;
 - (void)setVideoDimensions:(uint32_t)w height:(uint32_t)h hdr:(BOOL)isHdr;
 - (void)updateTelemetryText:(NSString *)text;
+- (void)updateLobbyStatus:(NSString *)statusText hostHint:(NSString *)hostHint boostOn:(BOOL)boostOn;
 @end
 
 @implementation AirPlayVideoView {
@@ -567,13 +593,21 @@ static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObject
     CGImageRef _cursorImage;
     NSView *_hudBox;
     NSTextField *_hudLabel;
+    NSView *_lobbyBox;
+    NSTextField *_lobbyTitle;
+    NSTextField *_lobbySub;
+    NSTextField *_lobbyStatus;
+    NSTextField *_ipField;
+    NSButton *_connectBtn;
+    NSButton *_boostBtn;
+    NSButton *_hudBtn;
 }
 
 - (instancetype)initWithFrame:(NSRect)frameRect {
     self = [super initWithFrame:frameRect];
     if (self) {
         self.wantsLayer = YES;
-        self.layer.backgroundColor = [NSColor blackColor].CGColor;
+        self.layer.backgroundColor = [NSColor colorWithCalibratedRed:0.051 green:0.067 blue:0.090 alpha:1.0].CGColor;
 
         _displayLayer = [AVSampleBufferDisplayLayer layer];
         _displayLayer.frame = self.bounds;
@@ -592,10 +626,10 @@ static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObject
 
         _hudBox = [[NSView alloc] initWithFrame:NSMakeRect(14, 14, 340, 88)];
         _hudBox.wantsLayer = YES;
-        _hudBox.layer.backgroundColor = [[NSColor colorWithCalibratedWhite:0.06 alpha:0.82] CGColor];
+        _hudBox.layer.backgroundColor = [[NSColor colorWithCalibratedWhite:0.05 alpha:0.84] CGColor];
         _hudBox.layer.cornerRadius = 8.0;
         _hudBox.layer.borderWidth = 1.0;
-        _hudBox.layer.borderColor = [[NSColor colorWithCalibratedWhite:1.0 alpha:0.15] CGColor];
+        _hudBox.layer.borderColor = [[NSColor colorWithCalibratedRed:0.23 green:0.51 blue:0.96 alpha:0.40] CGColor];
         _hudBox.layer.zPosition = 200.0;
         _hudBox.hidden = YES;
 
@@ -606,12 +640,78 @@ static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObject
         _hudLabel.drawsBackground = NO;
         _hudLabel.usesSingleLineMode = NO;
         _hudLabel.font = [NSFont monospacedSystemFontOfSize:11.0 weight:NSFontWeightMedium];
-        _hudLabel.textColor = [NSColor colorWithCalibratedWhite:0.94 alpha:1.0];
+        _hudLabel.textColor = [NSColor colorWithCalibratedWhite:0.95 alpha:1.0];
         _hudLabel.stringValue = @"";
         [_hudBox addSubview:_hudLabel];
         [self addSubview:_hudBox];
 
+        // Dark centered Game Receiver Lobby card (auto-hides as soon as video frames stream)
+        _lobbyBox = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 500, 224)];
+        _lobbyBox.wantsLayer = YES;
+        _lobbyBox.layer.backgroundColor = [[NSColor colorWithCalibratedRed:0.086 green:0.106 blue:0.137 alpha:0.96] CGColor];
+        _lobbyBox.layer.cornerRadius = 12.0;
+        _lobbyBox.layer.borderWidth = 1.0;
+        _lobbyBox.layer.borderColor = [[NSColor colorWithCalibratedRed:0.18 green:0.24 blue:0.33 alpha:1.0] CGColor];
+        _lobbyBox.layer.zPosition = 150.0;
+
+        auto makeLabel = ^(NSRect r, CGFloat pt, NSFontWeight w, NSColor *col, NSString *txt) {
+            NSTextField *tf = [[[NSTextField alloc] initWithFrame:r] autorelease];
+            tf.editable = NO;
+            tf.selectable = NO;
+            tf.bezeled = NO;
+            tf.drawsBackground = NO;
+            tf.font = [NSFont systemFontOfSize:pt weight:w];
+            tf.textColor = col;
+            tf.stringValue = txt;
+            return tf;
+        };
+
+        _lobbyTitle = [makeLabel(NSMakeRect(24, 174, 452, 26), 19.0, NSFontWeightSemibold,
+                                 [NSColor whiteColor], @"WinMirror AirPlay v2.2.0") retain];
+        _lobbySub = [makeLabel(NSMakeRect(24, 150, 452, 18), 12.0, NSFontWeightRegular,
+                               [NSColor colorWithCalibratedRed:0.55 green:0.60 blue:0.68 alpha:1.0],
+                               @"Game Screen Low-Latency Receiver  |  Max 200 Mbps HEVC HDR10") retain];
+        _lobbyStatus = [makeLabel(NSMakeRect(24, 108, 452, 34), 11.5, NSFontWeightMedium,
+                                  [NSColor colorWithCalibratedRed:0.45 green:0.75 blue:0.99 alpha:1.0],
+                                  @"Searching for Windows PC via USB / 5GHz Wi-Fi / Bluetooth...") retain];
+        _lobbyStatus.usesSingleLineMode = NO;
+
+        _ipField = [[NSTextField alloc] initWithFrame:NSMakeRect(24, 62, 326, 28)];
+        _ipField.placeholderString = @"Optional Windows PC IP (e.g. 192.168.0.105)";
+        _ipField.font = [NSFont monospacedSystemFontOfSize:12.0 weight:NSFontWeightRegular];
+        _ipField.bezelStyle = NSTextFieldRoundedBezel;
+        _ipField.target = self;
+        _ipField.action = @selector(lobbyConnectClicked:);
+
+        _connectBtn = [[NSButton alloc] initWithFrame:NSMakeRect(360, 60, 116, 32)];
+        _connectBtn.title = @"Connect IP";
+        _connectBtn.bezelStyle = NSBezelStyleRounded;
+        _connectBtn.target = self;
+        _connectBtn.action = @selector(lobbyConnectClicked:);
+
+        _boostBtn = [[NSButton alloc] initWithFrame:NSMakeRect(24, 20, 180, 28)];
+        _boostBtn.title = @"Game Boost: ON [G]";
+        _boostBtn.bezelStyle = NSBezelStyleRounded;
+        _boostBtn.target = self;
+        _boostBtn.action = @selector(lobbyBoostClicked:);
+
+        _hudBtn = [[NSButton alloc] initWithFrame:NSMakeRect(216, 20, 148, 28)];
+        _hudBtn.title = @"Telemetry HUD [S]";
+        _hudBtn.bezelStyle = NSBezelStyleRounded;
+        _hudBtn.target = self;
+        _hudBtn.action = @selector(lobbyHudClicked:);
+
+        [_lobbyBox addSubview:_lobbyTitle];
+        [_lobbyBox addSubview:_lobbySub];
+        [_lobbyBox addSubview:_lobbyStatus];
+        [_lobbyBox addSubview:_ipField];
+        [_lobbyBox addSubview:_connectBtn];
+        [_lobbyBox addSubview:_boostBtn];
+        [_lobbyBox addSubview:_hudBtn];
+        [self addSubview:_lobbyBox];
+
         _hudVisible = NO;
+        _streamingActive = NO;
         _videoW = 1920;
         _videoH = 1080;
         _hasCursorMeta = NO;
@@ -620,16 +720,57 @@ static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObject
     return self;
 }
 
+- (void)lobbyConnectClicked:(id)sender {
+    NSString *ip = [_ipField.stringValue stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (ip.length > 0 && self.onConnectHost) {
+        self.onConnectHost(ip);
+    }
+}
+
+- (void)lobbyBoostClicked:(id)sender {
+    if (self.onToggleBoost) self.onToggleBoost();
+}
+
+- (void)lobbyHudClicked:(id)sender {
+    if (self.onToggleHud) self.onToggleHud();
+}
+
+- (void)setStreamingActive:(BOOL)streamingActive {
+    _streamingActive = streamingActive;
+    _lobbyBox.hidden = streamingActive;
+}
+
+- (void)updateLobbyStatus:(NSString *)statusText hostHint:(NSString *)hostHint boostOn:(BOOL)boostOn {
+    if (_lobbyStatus && statusText.length > 0) {
+        _lobbyStatus.stringValue = statusText;
+    }
+    if (_ipField && _ipField.stringValue.length == 0 && hostHint.length > 0) {
+        _ipField.placeholderString = [NSString stringWithFormat:@"PC IP (Detected: %@)", hostHint];
+    }
+    if (_boostBtn) {
+        _boostBtn.title = boostOn ? @"Game Boost: ON [G]" : @"Game Boost: Std [G]";
+    }
+}
+
 - (void)layoutHud {
     if (!_hudBox || !_hudLabel) return;
     NSSize textSz = [_hudLabel fittingSize];
     CGFloat padX = 12.0;
     CGFloat padY = 9.0;
-    CGFloat boxW = std::max<CGFloat>(260.0, textSz.width + padX * 2.0);
+    CGFloat boxW = std::max<CGFloat>(280.0, textSz.width + padX * 2.0);
     CGFloat boxH = std::max<CGFloat>(48.0, textSz.height + padY * 2.0);
     CGFloat y = std::max<CGFloat>(14.0, self.bounds.size.height - boxH - 14.0);
     _hudBox.frame = NSMakeRect(14.0, y, boxW, boxH);
     _hudLabel.frame = NSMakeRect(padX, padY, boxW - padX * 2.0, boxH - padY * 2.0);
+}
+
+- (void)layoutLobby {
+    if (!_lobbyBox) return;
+    CGFloat w = _lobbyBox.frame.size.width;
+    CGFloat h = _lobbyBox.frame.size.height;
+    CGFloat x = std::max<CGFloat>(16.0, (self.bounds.size.width - w) * 0.5);
+    CGFloat y = std::max<CGFloat>(16.0, (self.bounds.size.height - h) * 0.5);
+    _lobbyBox.frame = NSMakeRect(x, y, w, h);
 }
 
 - (void)setHudVisible:(BOOL)hudVisible {
@@ -656,6 +797,7 @@ static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObject
     [self repositionCursor];
     [CATransaction commit];
     [self layoutHud];
+    [self layoutLobby];
 }
 
 - (void)setVideoDimensions:(uint32_t)w height:(uint32_t)h hdr:(BOOL)isHdr {
@@ -1189,11 +1331,16 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
 @property (nonatomic, strong) NSPopUpButton *audioPopup;
 @property (nonatomic, strong) NSMenu *topAudioMenu;
 @property (nonatomic, strong) NSMenuItem *hudMenuItem;
+@property (nonatomic, strong) NSMenuItem *boostMenuItem;
+@property (nonatomic, strong) NSStatusItem *statusItem;
+@property (nonatomic, strong) NSMenuItem *statusHudItem;
+@property (nonatomic, strong) NSMenuItem *statusBoostItem;
 @property (nonatomic, strong) NSMutableArray<NSDictionary *> *pcAudioDevices;
 
 @property (nonatomic, assign) double currentFps;
 @property (nonatomic, assign) double currentMbps;
 @property (nonatomic, assign) double avgFrameMs;
+@property (nonatomic, assign) double decodeAvgMs;
 @property (nonatomic, assign) double frameJitterMs;
 @property (nonatomic, assign) uint64_t totalFrames;
 @property (nonatomic, assign) uint32_t dropCount;
@@ -1213,6 +1360,7 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
 
 - (void)addDiscoveredHost:(NSString *)ip port:(int)port source:(NSString *)src;
 - (std::string)pickTargetHost:(int &)outPort;
+- (BOOL)consumeManualHost:(std::string &)outHost port:(int &)outPort;
 - (BOOL)findBetterUsbTargetForCurrent:(const std::string &)currentHost
                           currentPort:(int)currentPort
                            currentRtt:(double)currentRttMs
@@ -1230,6 +1378,8 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
     std::string _cliHost;
     int _cliPort;
     BOOL _hasCliHost;
+    std::string _manualHost;
+    std::atomic<bool> _manualConnectPending;
     std::string _lineBuf;
     std::atomic<int> _pendingPcAudioSrc;
     std::atomic<bool> _pendingKeyReq;
@@ -1243,6 +1393,7 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
         _pcAudioDevices = [[NSMutableArray alloc] init];
         _pendingPcAudioSrc = -999;
         _pendingKeyReq = false;
+        _manualConnectPending = false;
         _shuttingDown = false;
         _currentWidth = 1920;
         _currentHeight = 1080;
@@ -1250,6 +1401,7 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
         _currentColor = COLOR_SDR_BT709;
         _lastRttMs = 0.0;
         _avgFrameMs = 0.0;
+        _decodeAvgMs = 0.0;
         _frameJitterMs = 0.0;
         _pcAudioRate = 48000;
         _btLinked = NO;
@@ -1278,14 +1430,29 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
                                               styleMask:style
                                                 backing:NSBackingStoreBuffered
                                                   defer:NO];
-        [_window setTitle:@"WinMirror | Discovering PC via Bluetooth & LAN..."];
-        [_window setBackgroundColor:[NSColor blackColor]];
+        [_window setTitle:@"WinMirror AirPlay v2.2.0 | Game Receiver Ready"];
+        [_window setBackgroundColor:[NSColor colorWithCalibratedRed:0.051 green:0.067 blue:0.090 alpha:1.0]];
         [_window setMinSize:NSMakeSize(800, 450)];
         [_window setDelegate:self];
 
         _videoView = [[AirPlayVideoView alloc] initWithFrame:[[_window contentView] bounds]];
         [_videoView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
         [[_window contentView] addSubview:_videoView];
+
+        __unsafe_unretained MirrorWindowController *weakCtrl = self;
+        _videoView.onConnectHost = ^(NSString *manualIp) {
+            [weakCtrl connectToManualHost:manualIp];
+        };
+        _videoView.onToggleBoost = ^{
+            [weakCtrl toggleGameBoostAction:nil];
+        };
+        _videoView.onToggleHud = ^{
+            [weakCtrl toggleTelemetryHudAction:nil];
+        };
+
+        std::string macIps = collectLocalMacIpSummary();
+        NSString *lobbyInit = [NSString stringWithFormat:@"Searching PC via USB / 5GHz Wi-Fi / BT...\nMac Interfaces: %s", macIps.c_str()];
+        [_videoView updateLobbyStatus:lobbyInit hostHint:_activeTransportHost boostOn:g_macGameLowLatency.load()];
 
         [self setupAudioSwitchBarAndMenus];
 
@@ -1316,6 +1483,41 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
         if (t.first == ipStr && t.second == port) return;
     }
     _discoveredTargets.push_back({ ipStr, port });
+    NSString *hintIp = [NSString stringWithUTF8String:ipStr.c_str()];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!self.videoView.streamingActive) {
+            NSString *msg = [NSString stringWithFormat:@"Found PC via %@ (%s:%d)\nMac Interfaces: %s",
+                             src ?: @"Discovery", ipStr.c_str(), port, collectLocalMacIpSummary().c_str()];
+            [self.videoView updateLobbyStatus:msg hostHint:hintIp boostOn:g_macGameLowLatency.load()];
+        }
+    });
+}
+
+- (void)connectToManualHost:(NSString *)host {
+    if (!host.length) return;
+    std::string h = [host UTF8String];
+    {
+        std::lock_guard<std::mutex> lock(_targetMutex);
+        _cliHost = h;
+        _cliPort = AIRPLAY_PORT;
+        _hasCliHost = YES;
+        _manualHost = h;
+    }
+    _manualConnectPending.store(true);
+    _activeTransportHost = host;
+    [self addDiscoveredHost:host port:AIRPLAY_PORT source:@"Manual IP"];
+    [_videoView updateLobbyStatus:[NSString stringWithFormat:@"Connecting directly to %s:%d...", h.c_str(), AIRPLAY_PORT]
+                         hostHint:host
+                          boostOn:g_macGameLowLatency.load()];
+}
+
+- (BOOL)consumeManualHost:(std::string &)outHost port:(int &)outPort {
+    if (!_manualConnectPending.exchange(false)) return NO;
+    std::lock_guard<std::mutex> lock(_targetMutex);
+    if (_manualHost.empty()) return NO;
+    outHost = _manualHost;
+    outPort = AIRPLAY_PORT;
+    return YES;
 }
 
 - (std::string)pickTargetHost:(int &)outPort {
@@ -1548,6 +1750,13 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
     _hudMenuItem.state = NSControlStateValueOff;
     [viewMenu addItem:_hudMenuItem];
 
+    _boostMenuItem = [[NSMenuItem alloc] initWithTitle:@"Game Low-Latency Boost"
+                                                action:@selector(toggleGameBoostAction:)
+                                         keyEquivalent:@"g"];
+    _boostMenuItem.target = self;
+    _boostMenuItem.state = g_macGameLowLatency.load() ? NSControlStateValueOn : NSControlStateValueOff;
+    [viewMenu addItem:_boostMenuItem];
+
     NSMenuItem *keyItem = [[[NSMenuItem alloc] initWithTitle:@"Request Keyframe (IDR)"
                                                      action:@selector(requestKeyframeAction:)
                                               keyEquivalent:@"r"] autorelease];
@@ -1565,9 +1774,47 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
     [NSApp setMainMenu:mainMenu];
     [self refreshAudioSwitchControls];
 
-    // 3. Keyboard shortcuts: F = Fullscreen, M = Mute, S = Telemetry HUD, R = Request Keyframe
+    // 3. macOS Status Bar (Menu Bar) quick controls so Terminal is never needed
+    _statusItem = [[[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength] retain];
+    if (_statusItem.button) {
+        _statusItem.button.title = @"WM";
+        _statusItem.button.toolTip = @"WinMirror AirPlay v2.2.0";
+    }
+    NSMenu *sbMenu = [[[NSMenu alloc] initWithTitle:@"WinMirror"] autorelease];
+    NSMenuItem *sbShow = [[[NSMenuItem alloc] initWithTitle:@"Focus Receiver Window"
+                                                     action:@selector(focusWindowAction:)
+                                              keyEquivalent:@""] autorelease];
+    sbShow.target = self;
+    [sbMenu addItem:sbShow];
+    _statusHudItem = [[NSMenuItem alloc] initWithTitle:@"Telemetry HUD [S]"
+                                                action:@selector(toggleTelemetryHudAction:)
+                                         keyEquivalent:@""];
+    _statusHudItem.target = self;
+    [sbMenu addItem:_statusHudItem];
+    _statusBoostItem = [[NSMenuItem alloc] initWithTitle:@"Game Low-Latency Boost [G]"
+                                                  action:@selector(toggleGameBoostAction:)
+                                           keyEquivalent:@""];
+    _statusBoostItem.target = self;
+    _statusBoostItem.state = g_macGameLowLatency.load() ? NSControlStateValueOn : NSControlStateValueOff;
+    [sbMenu addItem:_statusBoostItem];
+    NSMenuItem *sbKey = [[[NSMenuItem alloc] initWithTitle:@"Force Keyframe (IDR) [R]"
+                                                    action:@selector(requestKeyframeAction:)
+                                             keyEquivalent:@""] autorelease];
+    sbKey.target = self;
+    [sbMenu addItem:sbKey];
+    [sbMenu addItem:[NSMenuItem separatorItem]];
+    NSMenuItem *sbQuit = [[[NSMenuItem alloc] initWithTitle:@"Quit WinMirror"
+                                                     action:@selector(terminate:)
+                                              keyEquivalent:@""] autorelease];
+    [sbMenu addItem:sbQuit];
+    _statusItem.menu = sbMenu;
+
+    // 4. Keyboard shortcuts: F = Fullscreen, M = Mute, S = Telemetry HUD, G = Game Boost, R = Request Keyframe
     __unsafe_unretained MirrorWindowController *weakSelf = self;
     [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent *(NSEvent *ev) {
+        if ([[NSApp keyWindow].firstResponder isKindOfClass:[NSTextView class]]) {
+            return ev;
+        }
         if (ev.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagOption | NSEventModifierFlagControl)) {
             return ev;
         }
@@ -1582,6 +1829,10 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
         }
         if ([c isEqualToString:@"s"]) {
             [weakSelf toggleTelemetryHudAction:nil];
+            return nil;
+        }
+        if ([c isEqualToString:@"g"]) {
+            [weakSelf toggleGameBoostAction:nil];
             return nil;
         }
         if ([c isEqualToString:@"r"]) {
@@ -1798,7 +2049,26 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
     BOOL next = !_videoView.hudVisible;
     _videoView.hudVisible = next;
     _hudMenuItem.state = next ? NSControlStateValueOn : NSControlStateValueOff;
+    if (_statusHudItem) _statusHudItem.state = next ? NSControlStateValueOn : NSControlStateValueOff;
     [self refreshTitle];
+}
+
+- (void)toggleGameBoostAction:(id)sender {
+    bool next = !g_macGameLowLatency.load();
+    g_macGameLowLatency.store(next);
+    NSControlStateValue st = next ? NSControlStateValueOn : NSControlStateValueOff;
+    if (_boostMenuItem) _boostMenuItem.state = st;
+    if (_statusBoostItem) _statusBoostItem.state = st;
+    NSString *msg = [NSString stringWithFormat:@"Game Boost %s  |  Mac Interfaces: %s",
+                     next ? "ENABLED (tight 5-frame game queue)" : "Standard",
+                     collectLocalMacIpSummary().c_str()];
+    [_videoView updateLobbyStatus:msg hostHint:_activeTransportHost boostOn:(next ? YES : NO)];
+    [self refreshTitle];
+}
+
+- (void)focusWindowAction:(id)sender {
+    [NSApp activateIgnoringOtherApps:YES];
+    [_window makeKeyAndOrderFront:nil];
 }
 
 - (void)requestKeyframeFromPc {
@@ -1838,27 +2108,35 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
     uint32_t khzRate = rateHz / 1000;
     BOOL isUnlimited = (_pcHelloFlags & HELLO_FLAG_UNLIMITED_FPS) != 0;
     NSString *fpsTargetStr = isUnlimited ? @"UNLIMITED" : [NSString stringWithFormat:@"%uHz", _targetStreamFps ? _targetStreamFps : 60];
+    BOOL boostOn = g_macGameLowLatency.load();
 
-    NSString *title = [NSString stringWithFormat:@"WinMirror | %@ | %ux%u %@ | %@ [%@] %.1f FPS (%@) | %.1f Mbps | %.1f ms | %u kHz | %@",
+    if (_statusItem.button) {
+        _statusItem.button.title = (_totalFrames > 0)
+            ? [NSString stringWithFormat:@"WM %.0f", _currentFps]
+            : @"WM";
+    }
+
+    NSString *title = [NSString stringWithFormat:@"WinMirror | %@ | %ux%u %@ | %@ [%@] %.1f FPS (%@) | %.1f Mbps | Dec %.1fms | RTT %.1fms | %u kHz | %@ | %@",
                        _pcHostName, _currentWidth, _currentHeight, hdrStr, codecStr,
-                       gpuStr, _currentFps, fpsTargetStr, _currentMbps, _lastRttMs, khzRate, btStr];
+                       gpuStr, _currentFps, fpsTargetStr, _currentMbps, _decodeAvgMs, _lastRttMs, khzRate, btStr,
+                       boostOn ? @"GameBoost" : @"Balanced"];
     [_window setTitle:title];
 
     if (_videoView.hudVisible) {
         NSString *sigTxt = _audioPlayer.muted ? @"Muted" : (_audioPlayer.hasActiveSignal ? @"Active" : @"Idle");
         NSString *hostAddr = _activeTransportHost.length ? _activeTransportHost : @"Auto";
         NSString *hudText = [NSString stringWithFormat:
-            @"Host: %@ (%@) [%@]\n"
+            @"Host: %@ (%@) [%@] | Mode: %@\n"
             @"Pipeline: %ux%u %@ | %@ [%@] | Target %@\n"
-            @"Rate: %.1f FPS | %.2f Mbps | Frame %.1f ms (Jitter %.1f ms)\n"
-            @"Stream: %llu Frames | Drops %u | IDR %u\n"
-            @"Audio: %u kHz | %@ | Buffer %u ms | Net RTT %.1f ms\n"
-            @"Keys: [S] Telemetry HUD  [R] Request Keyframe  [M] Mute  [F] Fullscreen",
-            _pcHostName, hostAddr, btStr,
+            @"Rate: %.1f FPS | %.2f Mbps | Dec %.1f ms | Frame %.1f ms (Jit %.1f ms)\n"
+            @"Stream: %llu Frames | Drops %u | IDR %u | Net RTT %.1f ms\n"
+            @"Audio: %u kHz | %@ | Buffer %u ms\n"
+            @"Keys: [S] Telemetry HUD  [G] Game Boost  [R] Keyframe  [M] Mute  [F] Fullscreen",
+            _pcHostName, hostAddr, btStr, (boostOn ? @"Game Low-Latency" : @"Balanced"),
             _currentWidth, _currentHeight, hdrStr, codecStr, gpuStr, fpsTargetStr,
-            _currentFps, _currentMbps, _avgFrameMs, _frameJitterMs,
-            (unsigned long long)_totalFrames, _dropCount, _keyframeCount,
-            khzRate, sigTxt, _audioPlayer.bufferedMs, _lastRttMs];
+            _currentFps, _currentMbps, _decodeAvgMs, _avgFrameMs, _frameJitterMs,
+            (unsigned long long)_totalFrames, _dropCount, _keyframeCount, _lastRttMs,
+            khzRate, sigTxt, _audioPlayer.bufferedMs];
         [_videoView updateTelemetryText:hudText];
     }
 }
@@ -1870,6 +2148,7 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
                       fps:(double)fps
                      mbps:(double)mbps
                avgFrameMs:(double)avgMs
+              decodeAvgMs:(double)decodeMs
                  jitterMs:(double)jitterMs
               totalFrames:(uint64_t)total
                     drops:(uint32_t)drops
@@ -1881,10 +2160,14 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
     _currentFps = fps;
     _currentMbps = mbps;
     _avgFrameMs = avgMs;
+    _decodeAvgMs = decodeMs;
     _frameJitterMs = jitterMs;
     _totalFrames = total;
     _dropCount = drops;
     _keyframeCount = keyframes;
+    if (total > 0 && !_videoView.streamingActive) {
+        _videoView.streamingActive = YES;
+    }
     [self refreshTitle];
 }
 
@@ -1988,7 +2271,9 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
     while (*running) {
         int port = AIRPLAY_PORT;
         std::string host;
-        if (!preferredHost.empty()) {
+        if ([controller consumeManualHost:host port:port]) {
+            preferredHost.clear();
+        } else if (!preferredHost.empty()) {
             host = std::move(preferredHost);
             preferredHost.clear();
             port = preferredPort;
@@ -2005,7 +2290,7 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
         int nodelay = 1;
         setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
-        int rcvbuf = 512 * 1024;
+        int rcvbuf = 1024 * 1024;
         setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
         int svcType = NET_SERVICE_TYPE_VI;
@@ -2065,6 +2350,7 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
             uint32_t decodedFpsFrames = 0;
             uint64_t totalFrames = 0;
             double avgIntervalMs = 16.67;
+            double avgDecodeMs = 0.0;
             double jitterMs = 0.0;
             std::chrono::steady_clock::time_point lastDecodeErrKeyReq{};
 
@@ -2080,14 +2366,18 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
                     remainingAfterPop = vq.queue.size();
                 }
 
+                bool gameLowLat = g_macGameLowLatency.load();
                 auto decNow = std::chrono::steady_clock::now();
                 int64_t msSincePresent = std::chrono::duration_cast<std::chrono::milliseconds>(decNow - lastPresentTime).count();
-                bool presentFrame = shouldPresentQueuedFrame(remainingAfterPop, msSincePresent, vq.streamFpsHint.load());
+                bool presentFrame = shouldPresentQueuedFrame(remainingAfterPop, msSincePresent, vq.streamFpsHint.load(), gameLowLat);
 
                 @autoreleasepool {
                     if (decoder.decodeAndPresent(pkt.data.data(), pkt.data.size(),
                                                  pkt.codec, pkt.color, controller.videoView.displayLayer,
                                                  presentFrame)) {
+                        double decDurMs = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - decNow).count();
+                        avgDecodeMs = (avgDecodeMs <= 0.001) ? decDurMs : (avgDecodeMs * 0.85 + decDurMs * 0.15);
                         decodedFpsFrames++;
                         totalFrames++;
                         if (presentFrame) {
@@ -2126,6 +2416,7 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
                     uint32_t w = controller.currentWidth;
                     uint32_t h = controller.currentHeight;
                     double snapAvg = avgIntervalMs;
+                    double snapDec = avgDecodeMs;
                     double snapJit = jitterMs;
                     uint64_t snapTot = totalFrames;
                     uint32_t snapDrop = vq.dropCount.load();
@@ -2140,6 +2431,7 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
                                                   fps:fps
                                                  mbps:mbps
                                            avgFrameMs:snapAvg
+                                          decodeAvgMs:snapDec
                                              jitterMs:snapJit
                                           totalFrames:snapTot
                                                 drops:snapDrop
@@ -2198,6 +2490,11 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
                     switchingTransport = true;
                     break;
                 }
+            }
+
+            if ([controller consumeManualHost:preferredHost port:preferredPort]) {
+                switchingTransport = true;
+                break;
             }
 
             struct pollfd pfd = { sock, POLLIN, 0 };
@@ -2270,7 +2567,7 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
                                 vq.dropCount += static_cast<uint32_t>(vq.queue.size());
                                 vq.queue.clear();
                             }
-                        } else if (vq.queue.size() >= 10) {
+                        } else if (shouldFlushVideoQueue(vq.queue.size(), g_macGameLowLatency.load())) {
                             // Emergency catch-up only on large outage; small Wi-Fi bursts catch up cleanly without IDR freeze
                             vq.dropCount += static_cast<uint32_t>(vq.queue.size()) + 1;
                             vq.queue.clear();
@@ -2337,6 +2634,18 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
             decodeThread.join();
         }
         decoder.cleanup();
+        if (!switchingTransport) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                controller.totalFrames = 0;
+                controller.videoView.streamingActive = NO;
+                NSString *msg = [NSString stringWithFormat:@"Waiting for Windows PC (reconnecting %s)...\nMac Interfaces: %s",
+                                 host.c_str(), collectLocalMacIpSummary().c_str()];
+                [controller.videoView updateLobbyStatus:msg
+                                               hostHint:[NSString stringWithUTF8String:host.c_str()]
+                                                boostOn:g_macGameLowLatency.load()];
+                [controller refreshTitle];
+            });
+        }
         usleep(switchingTransport ? 30000 : 250000);
     }
 }

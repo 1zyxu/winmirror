@@ -57,6 +57,8 @@ public:
         return std::max<uint32_t>(12u, (base * static_cast<uint32_t>(m_bitrateScalePct.load())) / 100u);
     }
     int getBitrateScalePct() const { return m_bitrateScalePct.load(); }
+    void setGameLowLatency(bool enable) { m_gameLowLatency.store(enable); }
+    bool isGameLowLatency() const { return m_gameLowLatency.load(); }
     const std::string& getEncoderName() const { return m_encoderName; }
     DXGI_FORMAT getSrcFormat() const { return m_srcFormat; }
 
@@ -122,6 +124,8 @@ private:
     std::atomic<bool> m_forceKeyframe{true};
     std::atomic<int> m_bitrateScalePct{100};
     int m_appliedScalePct = 100;
+    std::atomic<bool> m_gameLowLatency{true};
+    bool m_appliedGameLowLatency = true;
     std::atomic<uint64_t> m_lastCongestionMs{0};
     std::atomic<uint64_t> m_lastRateAdjustMs{0};
 
