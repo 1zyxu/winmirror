@@ -37,6 +37,7 @@ private:
     bool captureGdi(RawFrame& outFrame);
 
     static void initHalfTable();
+    static void drawCursor(uint8_t* bgra, uint32_t width, uint32_t height);
 
     bool m_useDxgi = true;
     uint32_t m_width = 0;

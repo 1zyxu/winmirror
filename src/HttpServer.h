@@ -19,6 +19,7 @@ public:
 private:
     void acceptLoop();
     void handleClient(SOCKET clientSock);
+    void handleRaw(SOCKET clientSock);
     void handleStream(SOCKET clientSock);
     void handleIndex(SOCKET clientSock);
     void handleSnapshot(SOCKET clientSock);

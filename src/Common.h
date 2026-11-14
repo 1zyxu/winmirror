@@ -18,10 +18,21 @@
 #include <atomic>
 #include <chrono>
 
-#define WINMIRROR_VERSION "1.0.2"
+#define WINMIRROR_VERSION "1.0.3"
 #define WINMIRROR_REPO "1zyxu/winmirror"
 #define DEFAULT_PORT 8888
 #define BEACON_PORT 8889
+
+#define RAW_FRAME_MAGIC 0x52494D57 // 'WMIR' in little-endian
+
+#pragma pack(push, 1)
+struct RawFrameHeader {
+    uint32_t magic;       // RAW_FRAME_MAGIC
+    uint32_t width;       // Physical Width (e.g. 1920, 3840)
+    uint32_t height;      // Physical Height (e.g. 1080, 2160)
+    uint32_t payloadSize; // JPEG payload bytes following header
+};
+#pragma pack(pop)
 
 struct FrameData {
     std::vector<uint8_t> jpegData;

@@ -49,13 +49,91 @@ void ScreenCapture::initHalfTable() {
         } else if (f >= 1.0f) {
             s_halfToByteTable[i] = 255;
         } else {
-            // Standard sRGB gamma 2.2 curve for vibrant, true colors
+            // Standard sRGB gamma 2.2 curve
             float srgb = std::pow(f, 1.0f / 2.2f);
             s_halfToByteTable[i] = static_cast<uint8_t>(srgb * 255.0f + 0.5f);
         }
     }
 
     s_tableInitialized = true;
+}
+
+void ScreenCapture::drawCursor(uint8_t* bgra, uint32_t width, uint32_t height) {
+    CURSORINFO ci = { sizeof(CURSORINFO) };
+    if (!GetCursorInfo(&ci)) return;
+    if (!(ci.flags & CURSOR_SHOWING) || !ci.hCursor) return;
+
+    ICONINFO ii = {};
+    if (!GetIconInfo(ci.hCursor, &ii)) return;
+
+    int cx = GetSystemMetrics(SM_CXCURSOR);
+    int cy = GetSystemMetrics(SM_CYCURSOR);
+    if (cx <= 0) cx = 32;
+    if (cy <= 0) cy = 32;
+
+    int cursorX = ci.ptScreenPos.x - ii.xHotspot;
+    int cursorY = ci.ptScreenPos.y - ii.yHotspot;
+
+    HDC hdcScreen = GetDC(NULL);
+    HDC hdcMem = CreateCompatibleDC(hdcScreen);
+
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = cx;
+    bmi.bmiHeader.biHeight = -cy; // top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void* pBits = nullptr;
+    HBITMAP hbmMem = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
+    HBITMAP hbmOld = static_cast<HBITMAP>(SelectObject(hdcMem, hbmMem));
+
+    uint32_t* pPixels = reinterpret_cast<uint32_t*>(pBits);
+    for (int i = 0; i < cx * cy; ++i) {
+        pPixels[i] = 0x00FF00FF; // magenta transparent key
+    }
+
+    DrawIconEx(hdcMem, 0, 0, ci.hCursor, cx, cy, 0, NULL, DI_NORMAL);
+
+    for (int y = 0; y < cy; ++y) {
+        int screenY = cursorY + y;
+        if (screenY < 0 || screenY >= static_cast<int>(height)) continue;
+
+        for (int x = 0; x < cx; ++x) {
+            int screenX = cursorX + x;
+            if (screenX < 0 || screenX >= static_cast<int>(width)) continue;
+
+            uint32_t cur = pPixels[y * cx + x];
+            if (cur == 0x00FF00FF) continue;
+
+            size_t screenIdx = (static_cast<size_t>(screenY) * width + screenX) * 4;
+            uint8_t curB = cur & 0xFF;
+            uint8_t curG = (cur >> 8) & 0xFF;
+            uint8_t curR = (cur >> 16) & 0xFF;
+            uint8_t curA = (cur >> 24) & 0xFF;
+
+            if (curA == 0 || curA == 255) {
+                bgra[screenIdx]     = curB;
+                bgra[screenIdx + 1] = curG;
+                bgra[screenIdx + 2] = curR;
+            } else {
+                float a = curA / 255.0f;
+                float invA = 1.0f - a;
+                bgra[screenIdx]     = static_cast<uint8_t>(curB * a + bgra[screenIdx] * invA);
+                bgra[screenIdx + 1] = static_cast<uint8_t>(curG * a + bgra[screenIdx + 1] * invA);
+                bgra[screenIdx + 2] = static_cast<uint8_t>(curR * a + bgra[screenIdx + 2] * invA);
+            }
+        }
+    }
+
+    SelectObject(hdcMem, hbmOld);
+    DeleteObject(hbmMem);
+    DeleteDC(hdcMem);
+    ReleaseDC(NULL, hdcScreen);
+
+    if (ii.hbmColor) DeleteObject(ii.hbmColor);
+    if (ii.hbmMask) DeleteObject(ii.hbmMask);
 }
 
 ScreenCapture::ScreenCapture() = default;
@@ -164,6 +242,8 @@ void ScreenCapture::cleanupDxgi() {
 bool ScreenCapture::capture(RawFrame& outFrame) {
     if (m_useDxgi) {
         if (captureDxgi(outFrame)) {
+            // Draw mouse cursor seamlessly onto the captured frame
+            drawCursor(outFrame.bgra.data(), outFrame.width, outFrame.height);
             return true;
         }
         if (!m_duplication) {
@@ -171,7 +251,12 @@ bool ScreenCapture::capture(RawFrame& outFrame) {
         }
         return false;
     }
-    return captureGdi(outFrame);
+
+    if (captureGdi(outFrame)) {
+        drawCursor(outFrame.bgra.data(), outFrame.width, outFrame.height);
+        return true;
+    }
+    return false;
 }
 
 bool ScreenCapture::captureDxgi(RawFrame& outFrame) {
@@ -200,7 +285,7 @@ bool ScreenCapture::captureDxgi(RawFrame& outFrame) {
     D3D11_TEXTURE2D_DESC actualDesc;
     desktopImage->GetDesc(&actualDesc);
 
-    // Recreate staging texture if resolution or pixel format changed
+    // Recreate staging texture if resolution or pixel format changed (e.g. 4K, 1080p, HDR Float16)
     if (!m_stagingTexture || m_width != actualDesc.Width || m_height != actualDesc.Height || m_format != actualDesc.Format) {
         if (m_stagingTexture) {
             m_stagingTexture->Release();
@@ -216,7 +301,7 @@ bool ScreenCapture::captureDxgi(RawFrame& outFrame) {
         desc.Height = m_height;
         desc.MipLevels = 1;
         desc.ArraySize = 1;
-        desc.Format = m_format; // EXACT matching format (supports HDR Float16 & SDR BGRA)
+        desc.Format = m_format;
         desc.SampleDesc.Count = 1;
         desc.Usage = D3D11_USAGE_STAGING;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -250,7 +335,7 @@ bool ScreenCapture::captureDxgi(RawFrame& outFrame) {
     uint8_t* dstRow = outFrame.bgra.data();
 
     if (m_format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
-        // Windows 11 HDR / Auto-HDR (scRGB 64-bit float) -> 32-bit BGRA
+        // Windows 11 HDR (scRGB 64-bit float) -> 32-bit BGRA (True 1:1 pixel mapping)
         for (uint32_t y = 0; y < m_height; ++y) {
             const HalfRGBA* srcPixel = reinterpret_cast<const HalfRGBA*>(srcRow);
             uint8_t* dstPixel = dstRow;

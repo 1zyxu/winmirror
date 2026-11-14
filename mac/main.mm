@@ -10,7 +10,17 @@
 #include <thread>
 #include <atomic>
 #include <vector>
-#include <sstream>
+
+#define RAW_FRAME_MAGIC 0x52494D57 // 'WMIR'
+
+#pragma pack(push, 1)
+struct RawFrameHeader {
+    uint32_t magic;
+    uint32_t width;
+    uint32_t height;
+    uint32_t payloadSize;
+};
+#pragma pack(pop)
 
 @interface RenderView : NSView
 - (void)updateWithCGImage:(CGImageRef)image;
@@ -45,6 +55,8 @@
 @property (nonatomic, strong) NSString *hostName;
 @property (atomic, assign) BOOL isRenderPending;
 @property (atomic, assign) CGImageRef latestImage;
+@property (nonatomic, assign) uint32_t currentWidth;
+@property (nonatomic, assign) uint32_t currentHeight;
 @end
 
 @implementation MirrorWindowController
@@ -54,8 +66,8 @@
     if (self) {
         _hostName = host;
         NSRect screenRect = [[NSScreen mainScreen] visibleFrame];
-        NSRect frame = NSMakeRect(screenRect.origin.x + 60, screenRect.origin.y + 60,
-                                  screenRect.size.width - 120, screenRect.size.height - 120);
+        NSRect frame = NSMakeRect(screenRect.origin.x + 50, screenRect.origin.y + 50,
+                                  screenRect.size.width - 100, screenRect.size.height - 100);
 
         NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                            NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
@@ -64,7 +76,7 @@
                                               styleMask:style
                                                 backing:NSBackingStoreBuffered
                                                   defer:NO];
-        [_window setTitle:@"WinMirror — Connecting..."];
+        [_window setTitle:[NSString stringWithFormat:@"WinMirror Pro — Connecting to %@...", host]];
         [_window setBackgroundColor:[NSColor blackColor]];
         [_window setMinSize:NSMakeSize(800, 450)];
         [_window setDelegate:self];
@@ -79,7 +91,10 @@
     return self;
 }
 
-- (void)pushFrameData:(const uint8_t *)bytes length:(size_t)len {
+- (void)pushFrameData:(const uint8_t *)bytes length:(size_t)len width:(uint32_t)w height:(uint32_t)h {
+    self.currentWidth = w;
+    self.currentHeight = h;
+
     CFDataRef cfData = CFDataCreate(kCFAllocatorDefault, bytes, len);
     if (!cfData) return;
 
@@ -109,13 +124,21 @@
             }
 
             NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-            if (now - self.lastFpsTime >= 1.0) {
+            if (now - self.lastFpsTime >= 0.5) {
                 double fps = (self.frameCount) / (now - self.lastFpsTime);
                 self.frameCount = 0;
                 self.lastFpsTime = now;
-                [self.window setTitle:[NSString stringWithFormat:@"WinMirror — %@ | %.0f FPS", self.hostName, fps]];
+                [self.window setTitle:[NSString stringWithFormat:@"WinMirror Pro — %ux%u | %.0f FPS",
+                                      self.currentWidth, self.currentHeight, fps]];
             }
         });
+    }
+}
+
+- (void)keyDown:(NSEvent *)event {
+    if ([[event charactersIgnoringModifiers] isEqualToString:@"f"] ||
+        [[event charactersIgnoringModifiers] isEqualToString:@"F"]) {
+        [self.window toggleFullScreen:nil];
     }
 }
 
@@ -124,6 +147,17 @@
 }
 
 @end
+
+static bool recvExact(int sock, void* buf, size_t len) {
+    uint8_t* p = static_cast<uint8_t*>(buf);
+    size_t total = 0;
+    while (total < len) {
+        ssize_t r = recv(sock, p + total, len - total, 0);
+        if (r <= 0) return false;
+        total += r;
+    }
+    return true;
+}
 
 static void streamWorker(MirrorWindowController *controller, std::string host, int port, std::atomic<bool> *running) {
     while (*running) {
@@ -139,7 +173,7 @@ static void streamWorker(MirrorWindowController *controller, std::string host, i
         int rcvbuf = 2 * 1024 * 1024;
         setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
-        struct timeval tv = { 4, 0 };
+        struct timeval tv = { 5, 0 };
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         sockaddr_in saddr = {};
@@ -153,59 +187,45 @@ static void streamWorker(MirrorWindowController *controller, std::string host, i
             continue;
         }
 
-        std::string req = "GET /stream HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n";
+        // Request ultra-fast raw binary stream
+        std::string req = "GET /raw HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n";
         send(sock, req.c_str(), req.size(), 0);
 
-        std::vector<uint8_t> buffer;
-        buffer.reserve(1024 * 1024);
-        char chunk[65536];
+        // Read until HTTP header boundary "\r\n\r\n"
+        std::string headerBuf;
+        char ch;
+        while (headerBuf.find("\r\n\r\n") == std::string::npos) {
+            if (recv(sock, &ch, 1, 0) <= 0) break;
+            headerBuf += ch;
+            if (headerBuf.size() > 2048) break;
+        }
+
+        std::vector<uint8_t> payloadBuf;
+        payloadBuf.reserve(1024 * 1024);
 
         while (*running) {
-            ssize_t bytes = recv(sock, chunk, sizeof(chunk), 0);
-            if (bytes <= 0) break;
+            RawFrameHeader header = {};
+            if (!recvExact(sock, &header, sizeof(header))) break;
 
-            buffer.insert(buffer.end(), chunk, chunk + bytes);
-
-            // Robust multipart parser using exact Content-Length
-            while (true) {
-                // Find header delimiter: "\r\n\r\n"
-                std::string bufStr(reinterpret_cast<char*>(buffer.data()), buffer.size());
-                size_t headerEnd = bufStr.find("\r\n\r\n");
-                if (headerEnd == std::string::npos) break;
-
-                // Look for "Content-Length:" inside header
-                size_t clPos = bufStr.find("Content-Length:");
-                if (clPos == std::string::npos || clPos > headerEnd) {
-                    // Skip boundary line if before Content-Length
-                    buffer.erase(buffer.begin(), buffer.begin() + headerEnd + 4);
-                    continue;
-                }
-
-                size_t valStart = clPos + 15;
-                while (valStart < headerEnd && (bufStr[valStart] == ' ' || bufStr[valStart] == '\t')) valStart++;
-                size_t valEnd = bufStr.find("\r\n", valStart);
-                if (valEnd == std::string::npos || valEnd > headerEnd) break;
-
-                size_t contentLength = 0;
-                try {
-                    contentLength = std::stoul(bufStr.substr(valStart, valEnd - valStart));
-                } catch (...) {
-                    buffer.erase(buffer.begin(), buffer.begin() + headerEnd + 4);
-                    continue;
-                }
-
-                size_t bodyStart = headerEnd + 4;
-                if (buffer.size() < bodyStart + contentLength) {
-                    // Wait for remaining frame bytes to arrive
-                    break;
-                }
-
-                // Complete valid JPEG frame
-                [controller pushFrameData:buffer.data() + bodyStart length:contentLength];
-
-                // Remove processed frame from buffer
-                buffer.erase(buffer.begin(), buffer.begin() + bodyStart + contentLength);
+            if (header.magic != RAW_FRAME_MAGIC) {
+                // Out of sync, reconnect
+                break;
             }
+
+            if (header.payloadSize == 0 || header.payloadSize > 10 * 1024 * 1024) {
+                break;
+            }
+
+            if (payloadBuf.size() < header.payloadSize) {
+                payloadBuf.resize(header.payloadSize);
+            }
+
+            if (!recvExact(sock, payloadBuf.data(), header.payloadSize)) break;
+
+            [controller pushFrameData:payloadBuf.data()
+                               length:header.payloadSize
+                                width:header.width
+                               height:header.height];
         }
 
         close(sock);
