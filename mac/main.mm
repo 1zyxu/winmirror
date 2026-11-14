@@ -1,5 +1,6 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
+#import <ImageIO/ImageIO.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -9,14 +10,13 @@
 #include <thread>
 #include <atomic>
 #include <vector>
-#include <iostream>
+#include <sstream>
 
-@interface FastImageView : NSView
-@property (nonatomic, strong) NSImage *currentImage;
-- (void)displayImage:(NSImage *)image;
+@interface RenderView : NSView
+- (void)updateWithCGImage:(CGImageRef)image;
 @end
 
-@implementation FastImageView
+@implementation RenderView
 
 - (instancetype)initWithFrame:(NSRect)frameRect {
     self = [super initWithFrame:frameRect];
@@ -24,15 +24,14 @@
         self.wantsLayer = YES;
         self.layer.drawsAsynchronously = YES;
         self.layer.contentsGravity = kCAGravityResizeAspect;
+        self.layer.backgroundColor = [NSColor blackColor].CGColor;
     }
     return self;
 }
 
-- (void)displayImage:(NSImage *)image {
-    if (!image) return;
-    CGImageRef cgImage = [image CGImageForProposedRect:nil context:nil hints:nil];
-    if (cgImage) {
-        self.layer.contents = (__bridge id)cgImage;
+- (void)updateWithCGImage:(CGImageRef)image {
+    if (image) {
+        self.layer.contents = (__bridge id)image;
     }
 }
 
@@ -40,13 +39,12 @@
 
 @interface MirrorWindowController : NSObject <NSWindowDelegate>
 @property (nonatomic, strong) NSWindow *window;
-@property (nonatomic, strong) FastImageView *renderView;
-@property (nonatomic, strong) NSTextField *fpsBadge;
+@property (nonatomic, strong) RenderView *renderView;
 @property (nonatomic, assign) NSInteger frameCount;
 @property (nonatomic, assign) NSTimeInterval lastFpsTime;
-@property (atomic, strong) NSData *latestJpegData;
-@property (atomic, assign) BOOL isRenderScheduled;
 @property (nonatomic, strong) NSString *hostName;
+@property (atomic, assign) BOOL isRenderPending;
+@property (atomic, assign) CGImageRef latestImage;
 @end
 
 @implementation MirrorWindowController
@@ -56,7 +54,8 @@
     if (self) {
         _hostName = host;
         NSRect screenRect = [[NSScreen mainScreen] visibleFrame];
-        NSRect frame = NSMakeRect(screenRect.origin.x + 50, screenRect.origin.y + 50, screenRect.size.width - 100, screenRect.size.height - 100);
+        NSRect frame = NSMakeRect(screenRect.origin.x + 60, screenRect.origin.y + 60,
+                                  screenRect.size.width - 120, screenRect.size.height - 120);
 
         NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                            NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
@@ -65,27 +64,14 @@
                                               styleMask:style
                                                 backing:NSBackingStoreBuffered
                                                   defer:NO];
-        [_window setTitle:[NSString stringWithFormat:@"WinMirror — Connecting to %@...", host]];
+        [_window setTitle:@"WinMirror — Connecting..."];
         [_window setBackgroundColor:[NSColor blackColor]];
-        [_window setMinSize:NSMakeSize(640, 360)];
+        [_window setMinSize:NSMakeSize(800, 450)];
         [_window setDelegate:self];
 
-        _renderView = [[FastImageView alloc] initWithFrame:[[_window contentView] bounds]];
+        _renderView = [[RenderView alloc] initWithFrame:[[_window contentView] bounds]];
         [_renderView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
         [[_window contentView] addSubview:_renderView];
-
-        _fpsBadge = [[NSTextField alloc] initWithFrame:NSMakeRect(20, [[_window contentView] bounds].size.height - 45, 260, 30)];
-        [_fpsBadge setAutoresizingMask:NSViewMinYMargin | NSViewMaxXMargin];
-        [_fpsBadge setEditable:NO];
-        [_fpsBadge setSelectable:NO];
-        [_fpsBadge setBezeled:NO];
-        [_fpsBadge setDrawsBackground:YES];
-        [_fpsBadge setBackgroundColor:[NSColor colorWithCalibratedRed:0 green:0 blue:0 alpha:0.65]];
-        [_fpsBadge setTextColor:[NSColor colorWithCalibratedRed:0.2 green:0.9 blue:0.4 alpha:1.0]];
-        [_fpsBadge setFont:[NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightBold]];
-        [_fpsBadge setStringValue:@"Connecting..."];
-        [_fpsBadge.layer setCornerRadius:6];
-        [[_window contentView] addSubview:_fpsBadge];
 
         [_window makeKeyAndOrderFront:nil];
         _lastFpsTime = [NSDate timeIntervalSinceReferenceDate];
@@ -93,26 +79,40 @@
     return self;
 }
 
-- (void)pushJpegFrame:(NSData *)jpegData {
-    self.latestJpegData = jpegData;
+- (void)pushFrameData:(const uint8_t *)bytes length:(size_t)len {
+    CFDataRef cfData = CFDataCreate(kCFAllocatorDefault, bytes, len);
+    if (!cfData) return;
+
+    CGImageSourceRef source = CGImageSourceCreateWithData(cfData, NULL);
+    CFRelease(cfData);
+    if (!source) return;
+
+    CGImageRef cgImage = CGImageSourceCreateImageAtIndex(source, 0, NULL);
+    CFRelease(source);
+    if (!cgImage) return;
+
+    CGImageRef oldImage = self.latestImage;
+    self.latestImage = cgImage;
+    if (oldImage) {
+        CGImageRelease(oldImage);
+    }
+
     self.frameCount++;
 
-    if (!self.isRenderScheduled) {
-        self.isRenderScheduled = YES;
+    if (!self.isRenderPending) {
+        self.isRenderPending = YES;
         dispatch_async(dispatch_get_main_queue(), ^{
-            NSData *data = self.latestJpegData;
-            self.isRenderScheduled = NO;
-            if (data) {
-                NSImage *image = [[NSImage alloc] initWithData:data];
-                [self.renderView displayImage:image];
+            CGImageRef imgToRender = self.latestImage;
+            self.isRenderPending = NO;
+            if (imgToRender) {
+                [self.renderView updateWithCGImage:imgToRender];
             }
 
             NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-            if (now - self.lastFpsTime >= 0.5) {
+            if (now - self.lastFpsTime >= 1.0) {
                 double fps = (self.frameCount) / (now - self.lastFpsTime);
                 self.frameCount = 0;
                 self.lastFpsTime = now;
-                [self.fpsBadge setStringValue:[NSString stringWithFormat:@"⚡ %.0f FPS (Unlimited)", fps]];
                 [self.window setTitle:[NSString stringWithFormat:@"WinMirror — %@ | %.0f FPS", self.hostName, fps]];
             }
         });
@@ -129,17 +129,17 @@ static void streamWorker(MirrorWindowController *controller, std::string host, i
     while (*running) {
         int sock = socket(AF_INET, SOCK_STREAM, 0);
         if (sock < 0) {
-            usleep(200000);
+            usleep(250000);
             continue;
         }
 
         int nodelay = 1;
         setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
-        int rcvbuf = 1024 * 1024;
+        int rcvbuf = 2 * 1024 * 1024;
         setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
-        struct timeval tv = { 3, 0 };
+        struct timeval tv = { 4, 0 };
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         sockaddr_in saddr = {};
@@ -157,8 +157,8 @@ static void streamWorker(MirrorWindowController *controller, std::string host, i
         send(sock, req.c_str(), req.size(), 0);
 
         std::vector<uint8_t> buffer;
-        buffer.reserve(512 * 1024);
-        char chunk[32768];
+        buffer.reserve(1024 * 1024);
+        char chunk[65536];
 
         while (*running) {
             ssize_t bytes = recv(sock, chunk, sizeof(chunk), 0);
@@ -166,41 +166,45 @@ static void streamWorker(MirrorWindowController *controller, std::string host, i
 
             buffer.insert(buffer.end(), chunk, chunk + bytes);
 
-            while (buffer.size() >= 4) {
-                // Find SOI (0xFF 0xD8)
-                size_t soi = std::string::npos;
-                for (size_t i = 0; i + 1 < buffer.size(); ++i) {
-                    if (buffer[i] == 0xFF && buffer[i + 1] == 0xD8) {
-                        soi = i;
-                        break;
-                    }
+            // Robust multipart parser using exact Content-Length
+            while (true) {
+                // Find header delimiter: "\r\n\r\n"
+                std::string bufStr(reinterpret_cast<char*>(buffer.data()), buffer.size());
+                size_t headerEnd = bufStr.find("\r\n\r\n");
+                if (headerEnd == std::string::npos) break;
+
+                // Look for "Content-Length:" inside header
+                size_t clPos = bufStr.find("Content-Length:");
+                if (clPos == std::string::npos || clPos > headerEnd) {
+                    // Skip boundary line if before Content-Length
+                    buffer.erase(buffer.begin(), buffer.begin() + headerEnd + 4);
+                    continue;
                 }
 
-                if (soi == std::string::npos) {
-                    buffer.clear();
+                size_t valStart = clPos + 15;
+                while (valStart < headerEnd && (bufStr[valStart] == ' ' || bufStr[valStart] == '\t')) valStart++;
+                size_t valEnd = bufStr.find("\r\n", valStart);
+                if (valEnd == std::string::npos || valEnd > headerEnd) break;
+
+                size_t contentLength = 0;
+                try {
+                    contentLength = std::stoul(bufStr.substr(valStart, valEnd - valStart));
+                } catch (...) {
+                    buffer.erase(buffer.begin(), buffer.begin() + headerEnd + 4);
+                    continue;
+                }
+
+                size_t bodyStart = headerEnd + 4;
+                if (buffer.size() < bodyStart + contentLength) {
+                    // Wait for remaining frame bytes to arrive
                     break;
                 }
 
-                // Find EOI (0xFF 0xD9)
-                size_t eoi = std::string::npos;
-                for (size_t i = soi + 2; i + 1 < buffer.size(); ++i) {
-                    if (buffer[i] == 0xFF && buffer[i + 1] == 0xD9) {
-                        eoi = i + 2;
-                        break;
-                    }
-                }
+                // Complete valid JPEG frame
+                [controller pushFrameData:buffer.data() + bodyStart length:contentLength];
 
-                if (eoi == std::string::npos) {
-                    if (soi > 0) {
-                        buffer.erase(buffer.begin(), buffer.begin() + soi);
-                    }
-                    break;
-                }
-
-                NSData *frameData = [NSData dataWithBytes:&buffer[soi] length:(eoi - soi)];
-                [controller pushJpegFrame:frameData];
-
-                buffer.erase(buffer.begin(), buffer.begin() + eoi);
+                // Remove processed frame from buffer
+                buffer.erase(buffer.begin(), buffer.begin() + bodyStart + contentLength);
             }
         }
 

@@ -1,6 +1,12 @@
 #include "ScreenCapture.h"
 #include <iostream>
 
+#ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+#define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((DPI_AWARENESS_CONTEXT)-4)
+#endif
+
+typedef BOOL(WINAPI* PFN_SetProcessDpiAwarenessContext)(DPI_AWARENESS_CONTEXT);
+
 ScreenCapture::ScreenCapture() = default;
 
 ScreenCapture::~ScreenCapture() {
@@ -8,16 +14,24 @@ ScreenCapture::~ScreenCapture() {
 }
 
 bool ScreenCapture::init() {
+    // Enable Per-Monitor V2 DPI awareness to prevent Windows GDI/DPI virtualization mismatches
+    HMODULE hUser32 = GetModuleHandleA("user32.dll");
+    if (hUser32) {
+        auto setDpiAwareness = (PFN_SetProcessDpiAwarenessContext)GetProcAddress(hUser32, "SetProcessDpiAwarenessContext");
+        if (setDpiAwareness) {
+            setDpiAwareness(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+    }
+
     if (initDxgi()) {
-        std::cout << "[ScreenCapture] Initialized DXGI Desktop Duplication (Ultra-Low Latency GPU Capture: "
-                  << m_width << "x" << m_height << ")" << std::endl;
+        std::cout << "[ScreenCapture] DXGI GPU Capture Active (" << m_width << "x" << m_height << ")" << std::endl;
         m_useDxgi = true;
         return true;
     }
 
-    std::cout << "[ScreenCapture] DXGI Duplication failed, falling back to GDI capture..." << std::endl;
+    std::cout << "[ScreenCapture] Falling back to GDI capture..." << std::endl;
     if (initGdi()) {
-        std::cout << "[ScreenCapture] Initialized GDI Capture (" << m_width << "x" << m_height << ")" << std::endl;
+        std::cout << "[ScreenCapture] GDI Capture Active (" << m_width << "x" << m_height << ")" << std::endl;
         m_useDxgi = false;
         return true;
     }
@@ -84,20 +98,6 @@ bool ScreenCapture::initDxgi() {
     dxgiOutput1->Release();
     if (FAILED(hr)) { cleanupDxgi(); return false; }
 
-    // Prepare staging texture
-    D3D11_TEXTURE2D_DESC desc = {};
-    desc.Width = m_width;
-    desc.Height = m_height;
-    desc.MipLevels = 1;
-    desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    desc.SampleDesc.Count = 1;
-    desc.Usage = D3D11_USAGE_STAGING;
-    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-
-    hr = m_d3dDevice->CreateTexture2D(&desc, nullptr, &m_stagingTexture);
-    if (FAILED(hr)) { cleanupDxgi(); return false; }
-
     return true;
 }
 
@@ -113,7 +113,6 @@ bool ScreenCapture::capture(RawFrame& outFrame) {
         if (captureDxgi(outFrame)) {
             return true;
         }
-        // If DXGI failed due to display change or access lost, retry init
         if (!m_duplication) {
             initDxgi();
         }
@@ -123,17 +122,16 @@ bool ScreenCapture::capture(RawFrame& outFrame) {
 }
 
 bool ScreenCapture::captureDxgi(RawFrame& outFrame) {
-    if (!m_duplication || !m_d3dContext || !m_stagingTexture) return false;
+    if (!m_duplication || !m_d3dContext) return false;
 
     DXGI_OUTDUPL_FRAME_INFO frameInfo;
     IDXGIResource* desktopResource = nullptr;
 
     HRESULT hr = m_duplication->AcquireNextFrame(16, &frameInfo, &desktopResource);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-        return false; // Screen did not change within timeout
+        return false;
     }
     if (FAILED(hr)) {
-        // Access lost (e.g. UAC popup, screen lock, resolution switch)
         cleanupDxgi();
         return false;
     }
@@ -144,6 +142,37 @@ bool ScreenCapture::captureDxgi(RawFrame& outFrame) {
     if (FAILED(hr)) {
         m_duplication->ReleaseFrame();
         return false;
+    }
+
+    // Always get the EXACT physical pixel dimensions of the GPU surface
+    D3D11_TEXTURE2D_DESC actualDesc;
+    desktopImage->GetDesc(&actualDesc);
+
+    if (!m_stagingTexture || m_width != actualDesc.Width || m_height != actualDesc.Height) {
+        if (m_stagingTexture) {
+            m_stagingTexture->Release();
+            m_stagingTexture = nullptr;
+        }
+
+        m_width = actualDesc.Width;
+        m_height = actualDesc.Height;
+
+        D3D11_TEXTURE2D_DESC desc = {};
+        desc.Width = m_width;
+        desc.Height = m_height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+        hr = m_d3dDevice->CreateTexture2D(&desc, nullptr, &m_stagingTexture);
+        if (FAILED(hr)) {
+            desktopImage->Release();
+            m_duplication->ReleaseFrame();
+            return false;
+        }
     }
 
     m_d3dContext->CopyResource(m_stagingTexture, desktopImage);
@@ -167,6 +196,7 @@ bool ScreenCapture::captureDxgi(RawFrame& outFrame) {
     uint8_t* dstRow = outFrame.bgra.data();
     size_t rowBytes = (size_t)m_width * 4;
 
+    // Strict row pitch copy: handles GPU padding/alignment perfectly without stride drift
     for (uint32_t y = 0; y < m_height; ++y) {
         memcpy(dstRow, srcRow, rowBytes);
         srcRow += mapped.RowPitch;
@@ -192,7 +222,7 @@ bool ScreenCapture::initGdi() {
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bmi.bmiHeader.biWidth = m_width;
-    bmi.bmiHeader.biHeight = -static_cast<LONG>(m_height); // Top-down
+    bmi.bmiHeader.biHeight = -static_cast<LONG>(m_height);
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;

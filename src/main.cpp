@@ -28,9 +28,9 @@ static BOOL WINAPI consoleCtrlHandler(DWORD signal) {
 
 static void printLocalIps(int port) {
     std::cout << "\n========================================================" << std::endl;
-    std::cout << "  WINMIRROR v" << WINMIRROR_VERSION << " -- UNLIMITED FPS MODE" << std::endl;
+    std::cout << "  WINMIRROR Pro v" << WINMIRROR_VERSION << " -- High Performance 60 FPS" << std::endl;
     std::cout << "========================================================" << std::endl;
-    std::cout << "Connect Mac client to:" << std::endl;
+    std::cout << "Available Endpoints (USB & LAN/Wi-Fi):" << std::endl;
 
     ULONG bufLen = sizeof(IP_ADAPTER_INFO);
     std::vector<BYTE> buf(bufLen);
@@ -46,12 +46,12 @@ static void printLocalIps(int port) {
             std::string ip = pAdapter->IpAddressList.IpAddress.String;
             if (ip != "0.0.0.0" && ip != "127.0.0.1") {
                 std::cout << "  -> http://" << ip << ":" << port
-                          << " (" << pAdapter->Description << ")" << std::endl;
+                          << " [" << pAdapter->Description << "]" << std::endl;
             }
             pAdapter = pAdapter->Next;
         }
     }
-    std::cout << "  -> http://localhost:" << port << " (Local Loopback)" << std::endl;
+    std::cout << "  -> http://localhost:" << port << " [Loopback / USB Port Forward]" << std::endl;
     std::cout << "========================================================\n" << std::endl;
 }
 
@@ -60,8 +60,8 @@ int main(int argc, char* argv[]) {
     timeBeginPeriod(1);
 
     int port = DEFAULT_PORT;
-    float quality = 0.70f;
-    int targetFps = 0; // 0 = UNLIMITED (as fast as GPU/display refreshes)
+    float quality = 0.55f;
+    int targetFps = 60;
     bool checkUpdate = true;
 
     for (int i = 1; i < argc; ++i) {
@@ -114,9 +114,7 @@ int main(int argc, char* argv[]) {
     Beacon beacon(port);
     beacon.start();
 
-    std::cout << "[WinMirror] Streaming ACTIVE at "
-              << (targetFps == 0 ? "UNLIMITED FPS" : std::to_string(targetFps) + " FPS")
-              << " | Quality: " << quality << "\n" << std::endl;
+    std::cout << "[WinMirror] Running rock-solid 60 FPS stream (USB & Network active)\n" << std::endl;
 
     RawFrame rawFrame;
     std::vector<uint8_t> jpegData;
@@ -124,7 +122,7 @@ int main(int argc, char* argv[]) {
     auto lastReport = std::chrono::steady_clock::now();
     uint32_t capturedFrames = 0;
 
-    const auto frameDuration = (targetFps > 0) ? std::chrono::microseconds(1000000 / targetFps) : std::chrono::microseconds(0);
+    const auto frameDuration = std::chrono::microseconds(1000000 / targetFps);
 
     while (g_running) {
         auto frameStart = std::chrono::steady_clock::now();
@@ -136,26 +134,23 @@ int main(int argc, char* argv[]) {
                 capturedFrames++;
             }
         } else {
-            // When screen is static, sleep 1ms to yield CPU
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
         auto now = std::chrono::steady_clock::now();
-        if (now - lastReport >= std::chrono::seconds(3)) {
+        if (now - lastReport >= std::chrono::seconds(4)) {
             float elapsedSec = std::chrono::duration<float>(now - lastReport).count();
             float currentFps = capturedFrames / elapsedSec;
             std::cout << "[WinMirror] Live: " << std::fixed << std::setprecision(1) << currentFps << " FPS"
-                      << " | Clients: " << server.getActiveClients()
+                      << " | Active Viewers: " << server.getActiveClients()
                       << " | GPU: " << (capture.isDxgiActive() ? "DXGI 11" : "GDI") << std::endl;
             capturedFrames = 0;
             lastReport = now;
         }
 
-        if (targetFps > 0) {
-            auto frameTime = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - frameStart);
-            if (frameTime < frameDuration) {
-                std::this_thread::sleep_for(frameDuration - frameTime);
-            }
+        auto frameTime = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - frameStart);
+        if (frameTime < frameDuration) {
+            std::this_thread::sleep_for(frameDuration - frameTime);
         }
     }
 
