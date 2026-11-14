@@ -94,6 +94,7 @@ int main(int argc, char* argv[]) {
     ensureAdminPrivileges(argc, argv);
 
     SetConsoleCtrlHandler(consoleCtrlHandler, TRUE);
+    SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
     timeBeginPeriod(1);
 
     int port = AIRPLAY_PORT;
@@ -188,12 +189,13 @@ int main(int argc, char* argv[]) {
 
     auto startTime = std::chrono::steady_clock::now();
     auto lastReport = startTime;
-    auto lastEncodeTime = startTime;
+    auto nextEncodeTime = startTime;
     uint32_t encodedFrames = 0;
     uint64_t frameSeq = 0;
 
     const auto minFrameGap = std::chrono::microseconds(1000000 / targetFps);
-    const auto cursorTick = std::chrono::milliseconds(8); // 120Hz cursor responsiveness
+    const auto idleTick = std::chrono::milliseconds(8);
+    const auto activeTick = std::chrono::milliseconds(1);
 
     RawFrame cpuFallbackFrame;
     std::vector<uint8_t> annexB;
@@ -207,13 +209,13 @@ int main(int argc, char* argv[]) {
     while (g_running) {
         auto loopStart = std::chrono::steady_clock::now();
 
-        // 1. Hardware mouse cursor tracking (120 Hz zero-lag cursor overlay)
+        // 1. Hardware mouse cursor tracking
         if (capture.pollCursor(cursorMeta, cursorBgra, false)) {
             server.broadcastCursor(cursorMeta, cursorBgra);
         }
 
-        // 2. Capture & GPU Hardware Video Encode (at up to targetFps)
-        if (loopStart - lastEncodeTime >= minFrameGap) {
+        // 2. Capture & GPU Hardware Video Encode (at up to targetFps, drift-free)
+        if (loopStart + std::chrono::microseconds(800) >= nextEncodeTime) {
             bool gotNewScreen = capture.acquireFrame();
             if (gotNewScreen) {
                 // Re-initialize encoder seamlessly if resolution or HDR mode switched (e.g. launching fullscreen game)
@@ -261,7 +263,10 @@ int main(int argc, char* argv[]) {
                     server.broadcastVideo(std::move(pkt));
                     encodedFrames++;
                 }
-                lastEncodeTime = loopStart;
+            }
+            nextEncodeTime += minFrameGap;
+            if (nextEncodeTime + minFrameGap < loopStart) {
+                nextEncodeTime = loopStart + minFrameGap;
             }
         }
 
@@ -284,9 +289,10 @@ int main(int argc, char* argv[]) {
             lastReport = now;
         }
 
+        auto targetSleep = (server.getActiveClients() > 0) ? activeTick : idleTick;
         auto spent = std::chrono::steady_clock::now() - loopStart;
-        if (spent < cursorTick) {
-            std::this_thread::sleep_for(cursorTick - spent);
+        if (spent < targetSleep) {
+            std::this_thread::sleep_for(targetSleep - spent);
         }
     }
 

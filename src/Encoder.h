@@ -46,9 +46,11 @@ private:
     bool tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwareOnly, const char* label);
     void cleanupMft();
 
-    bool convertGpuToPackedYuv(ID3D11Texture2D* gpuSrcTex, std::vector<uint8_t>& outYuv);
+    bool copyTextureToPackedYuv(ID3D11Texture2D* gpuYuvTex, std::vector<uint8_t>& outYuv);
     static void convertBgraToNv12Studio(const uint8_t* bgra, uint32_t width, uint32_t height, std::vector<uint8_t>& outNv12);
 
+    bool waitAsyncInputReady();
+    bool submitSampleToMft(IMFSample* sample, std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe);
     bool encodePackedYuv(const std::vector<uint8_t>& yuvData, uint64_t ptsUs,
                          std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe);
     bool collectSyncOutput(std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe);
@@ -69,16 +71,23 @@ private:
     std::string m_encoderName = "Uninitialized";
     std::atomic<bool> m_forceKeyframe{true};
 
-    // D3D11 Video Processor (GPU HDR/SDR color conversion -> NV12/P010)
+    // D3D11 Video Processor (GPU HDR/SDR color conversion -> NV12/P010 ring)
+    static constexpr int kVpRingSize = 3;
     ID3D11VideoDevice* m_videoDevice = nullptr;
     ID3D11VideoContext* m_videoContext = nullptr;
     ID3D11VideoContext1* m_videoContext1 = nullptr;
     ID3D11VideoProcessorEnumerator* m_vpEnum = nullptr;
     ID3D11VideoProcessor* m_vp = nullptr;
-    ID3D11Texture2D* m_vpOutTex = nullptr;
-    ID3D11VideoProcessorOutputView* m_vpOutView = nullptr;
+    ID3D11Texture2D* m_vpOutTex[kVpRingSize] = {};
+    ID3D11VideoProcessorOutputView* m_vpOutView[kVpRingSize] = {};
+    int m_vpRingIdx = 0;
     ID3D11Texture2D* m_vpStagingTex = nullptr;
     bool m_hasVideoProcessor = false;
+
+    // Zero-Copy D3D11 Media Foundation Manager
+    IMFDXGIDeviceManager* m_dxgiManager = nullptr;
+    UINT m_dxgiResetToken = 0;
+    bool m_useD3dManager = false;
 
     // Media Foundation Transform
     bool m_mfStarted = false;

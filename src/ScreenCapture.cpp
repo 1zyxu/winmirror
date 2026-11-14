@@ -214,6 +214,7 @@ bool ScreenCapture::initDxgi() {
     IDXGIDevice* dxgiDevice = nullptr;
     hr = m_d3dDevice->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgiDevice));
     if (FAILED(hr)) { cleanupDxgi(); return false; }
+    dxgiDevice->SetGPUThreadPriority(5);
 
     IDXGIAdapter* dxgiAdapter = nullptr;
     hr = dxgiDevice->GetParent(__uuidof(IDXGIAdapter), reinterpret_cast<void**>(&dxgiAdapter));
@@ -303,7 +304,7 @@ bool ScreenCapture::acquireDxgi() {
     DXGI_OUTDUPL_FRAME_INFO frameInfo = {};
     IDXGIResource* desktopResource = nullptr;
 
-    HRESULT hr = m_duplication->AcquireNextFrame(16, &frameInfo, &desktopResource);
+    HRESULT hr = m_duplication->AcquireNextFrame(1, &frameInfo, &desktopResource);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
         return false;
     }

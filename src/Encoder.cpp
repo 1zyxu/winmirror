@@ -78,6 +78,15 @@ bool Encoder::init(ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dContext,
         return false;
     }
 
+    if (m_d3dDevice) {
+        if (SUCCEEDED(MFCreateDXGIDeviceManager(&m_dxgiResetToken, &m_dxgiManager)) && m_dxgiManager) {
+            if (FAILED(m_dxgiManager->ResetDevice(m_d3dDevice, m_dxgiResetToken))) {
+                m_dxgiManager->Release();
+                m_dxgiManager = nullptr;
+            }
+        }
+    }
+
     // 1. If HDR monitor/game active, try 10-bit HEVC HDR10 (P010 + BT.2020 ST2084 PQ) on GPU
     if (m_isHdrSource && m_d3dDevice && initVideoProcessor(srcFormat, true)) {
         if (tryCreateMft(MFVideoFormat_HEVC, true, true, "HEVC 10-bit HDR10 (GPU)")) {
@@ -125,6 +134,10 @@ bool Encoder::init(ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dContext,
 void Encoder::cleanup() {
     cleanupMft();
     cleanupVideoProcessor();
+    if (m_dxgiManager) {
+        m_dxgiManager->Release();
+        m_dxgiManager = nullptr;
+    }
     if (m_mfStarted) {
         MFShutdown();
         m_mfStarted = false;
@@ -153,7 +166,7 @@ bool Encoder::initVideoProcessor(DXGI_FORMAT srcFormat, bool useP010) {
     contentDesc.OutputFrameRate.Denominator = 1;
     contentDesc.OutputWidth = m_width;
     contentDesc.OutputHeight = m_height;
-    contentDesc.Usage = D3D11_VIDEO_USAGE_OPTIMAL_QUALITY;
+    contentDesc.Usage = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
 
     hr = m_videoDevice->CreateVideoProcessorEnumerator(&contentDesc, &m_vpEnum);
     if (FAILED(hr) || !m_vpEnum) { cleanupVideoProcessor(); return false; }
@@ -182,16 +195,23 @@ bool Encoder::initVideoProcessor(DXGI_FORMAT srcFormat, bool useP010) {
     outDesc.Format = outFmt;
     outDesc.SampleDesc.Count = 1;
     outDesc.Usage = D3D11_USAGE_DEFAULT;
-    outDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    outDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
 
-    hr = m_d3dDevice->CreateTexture2D(&outDesc, nullptr, &m_vpOutTex);
-    if (FAILED(hr) || !m_vpOutTex) { cleanupVideoProcessor(); return false; }
+    m_vpRingIdx = 0;
+    for (int i = 0; i < kVpRingSize; ++i) {
+        hr = m_d3dDevice->CreateTexture2D(&outDesc, nullptr, &m_vpOutTex[i]);
+        if (FAILED(hr) || !m_vpOutTex[i]) {
+            outDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+            hr = m_d3dDevice->CreateTexture2D(&outDesc, nullptr, &m_vpOutTex[i]);
+        }
+        if (FAILED(hr) || !m_vpOutTex[i]) { cleanupVideoProcessor(); return false; }
 
-    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovDesc = {};
-    ovDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-    ovDesc.Texture2D.MipSlice = 0;
-    hr = m_videoDevice->CreateVideoProcessorOutputView(m_vpOutTex, m_vpEnum, &ovDesc, &m_vpOutView);
-    if (FAILED(hr) || !m_vpOutView) { cleanupVideoProcessor(); return false; }
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovDesc = {};
+        ovDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+        ovDesc.Texture2D.MipSlice = 0;
+        hr = m_videoDevice->CreateVideoProcessorOutputView(m_vpOutTex[i], m_vpEnum, &ovDesc, &m_vpOutView[i]);
+        if (FAILED(hr) || !m_vpOutView[i]) { cleanupVideoProcessor(); return false; }
+    }
 
     outDesc.Usage = D3D11_USAGE_STAGING;
     outDesc.BindFlags = 0;
@@ -228,8 +248,11 @@ bool Encoder::initVideoProcessor(DXGI_FORMAT srcFormat, bool useP010) {
 void Encoder::cleanupVideoProcessor() {
     m_hasVideoProcessor = false;
     if (m_vpStagingTex) { m_vpStagingTex->Release(); m_vpStagingTex = nullptr; }
-    if (m_vpOutView) { m_vpOutView->Release(); m_vpOutView = nullptr; }
-    if (m_vpOutTex) { m_vpOutTex->Release(); m_vpOutTex = nullptr; }
+    for (int i = 0; i < kVpRingSize; ++i) {
+        if (m_vpOutView[i]) { m_vpOutView[i]->Release(); m_vpOutView[i] = nullptr; }
+        if (m_vpOutTex[i]) { m_vpOutTex[i]->Release(); m_vpOutTex[i] = nullptr; }
+    }
+    m_vpRingIdx = 0;
     if (m_vp) { m_vp->Release(); m_vp = nullptr; }
     if (m_vpEnum) { m_vpEnum->Release(); m_vpEnum = nullptr; }
     if (m_videoContext1) { m_videoContext1->Release(); m_videoContext1 = nullptr; }
@@ -259,11 +282,13 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
             continue;
         }
 
-        // Handle Async MFT unlock if hardware driver exposes async interface
+        // Handle Async MFT unlock and D3D11 zero-copy binding if hardware driver supports it
         IMFAttributes* mftAttr = nullptr;
         UINT32 isAsync = 0;
+        UINT32 d3dAware = 0;
         if (SUCCEEDED(m_mft->GetAttributes(&mftAttr)) && mftAttr) {
             mftAttr->GetUINT32(MF_TRANSFORM_ASYNC, &isAsync);
+            mftAttr->GetUINT32(MF_SA_D3D11_AWARE, &d3dAware);
             if (isAsync) {
                 if (FAILED(mftAttr->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE))) {
                     mftAttr->Release();
@@ -279,6 +304,12 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
             mftAttr->Release();
         }
 
+        if (hardwareOnly && d3dAware && m_dxgiManager && m_hasVideoProcessor) {
+            if (SUCCEEDED(m_mft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, reinterpret_cast<ULONG_PTR>(m_dxgiManager)))) {
+                m_useD3dManager = true;
+            }
+        }
+
         DWORD inCount = 0, outCount = 0;
         if (SUCCEEDED(m_mft->GetStreamCount(&inCount, &outCount)) && inCount > 0 && outCount > 0) {
             DWORD inIds[8] = {}, outIds[8] = {};
@@ -291,9 +322,9 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
             }
         }
 
-        // Calculate optimal target bitrate: ~25 Mbps for 1080p60, ~45 Mbps for 4K60
+        // Optimal streaming bitrate: ~18 Mbps for 1080p60, ~36 Mbps for 4K60
         uint64_t pixels = static_cast<uint64_t>(m_width) * m_height;
-        UINT32 bitrate = (pixels > 3000000ULL) ? 45000000u : 24000000u;
+        UINT32 bitrate = (pixels > 3000000ULL) ? 36000000u : 18000000u;
 
         m_mft->QueryInterface(__uuidof(ICodecAPI), reinterpret_cast<void**>(&m_codecApi));
 
@@ -319,9 +350,11 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
         outType->Release();
         if (FAILED(hr)) continue;
 
-        // Low-latency ICodecAPI settings (0 B-frames, low-latency CBR, 2s GOP)
+        // Low-latency real-time game capture settings (0 B-frames, speed preset 0, 2s GOP)
         if (m_codecApi) {
             setCodecBool(m_codecApi, CODECAPI_AVLowLatencyMode, true);
+            setCodecBool(m_codecApi, CODECAPI_AVEncCommonRealTime, true);
+            setCodecUint32(m_codecApi, CODECAPI_AVEncCommonQualityVsSpeed, 0);
             setCodecUint32(m_codecApi, CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
             setCodecUint32(m_codecApi, CODECAPI_AVEncCommonMeanBitRate, bitrate);
             setCodecUint32(m_codecApi, CODECAPI_AVEncMPVDefaultBPictureCount, 0);
@@ -374,9 +407,11 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
             if (utf8Len > 1) {
                 std::string s(utf8Len - 1, '\0');
                 WideCharToMultiByte(CP_UTF8, 0, friendlyName, -1, &s[0], utf8Len, nullptr, nullptr);
-                hwName = std::string(label) + " [" + s + "]";
+                hwName = std::string(label) + " [" + s + "]" + (m_useD3dManager ? " (D3D11 Zero-Copy)" : "");
             }
             CoTaskMemFree(friendlyName);
+        } else if (m_useD3dManager) {
+            hwName += " (D3D11 Zero-Copy)";
         }
         m_encoderName = hwName;
         m_forceKeyframe.store(true);
@@ -401,31 +436,15 @@ void Encoder::cleanupMft() {
     if (m_codecApi) { m_codecApi->Release(); m_codecApi = nullptr; }
     if (m_mft) { m_mft->Release(); m_mft = nullptr; }
     m_isAsync = false;
+    m_useD3dManager = false;
     m_needInputCount = 0;
     m_seqHeader.clear();
 }
 
-bool Encoder::convertGpuToPackedYuv(ID3D11Texture2D* gpuSrcTex, std::vector<uint8_t>& outYuv) {
-    if (!m_hasVideoProcessor || !gpuSrcTex || !m_videoDevice || !m_videoContext) return false;
+bool Encoder::copyTextureToPackedYuv(ID3D11Texture2D* gpuYuvTex, std::vector<uint8_t>& outYuv) {
+    if (!gpuYuvTex || !m_vpStagingTex || !m_d3dContext) return false;
 
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivDesc = {};
-    ivDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-    ivDesc.Texture2D.MipSlice = 0;
-    ivDesc.Texture2D.ArraySlice = 0;
-
-    ID3D11VideoProcessorInputView* inView = nullptr;
-    HRESULT hr = m_videoDevice->CreateVideoProcessorInputView(gpuSrcTex, m_vpEnum, &ivDesc, &inView);
-    if (FAILED(hr) || !inView) return false;
-
-    D3D11_VIDEO_PROCESSOR_STREAM stream = {};
-    stream.Enable = TRUE;
-    stream.pInputSurface = inView;
-
-    hr = m_videoContext->VideoProcessorBlt(m_vp, m_vpOutView, 0, 1, &stream);
-    inView->Release();
-    if (FAILED(hr)) return false;
-
-    m_d3dContext->CopyResource(m_vpStagingTex, m_vpOutTex);
+    m_d3dContext->CopyResource(m_vpStagingTex, gpuYuvTex);
 
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (FAILED(m_d3dContext->Map(m_vpStagingTex, 0, D3D11_MAP_READ, 0, &mapped))) {
@@ -498,8 +517,66 @@ void Encoder::convertBgraToNv12Studio(const uint8_t* bgra, uint32_t width, uint3
 
 bool Encoder::encodeGpuFrame(ID3D11Texture2D* gpuSrcTex, uint64_t ptsUs,
                              std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe) {
-    if (!m_mft || !gpuSrcTex) return false;
-    if (!convertGpuToPackedYuv(gpuSrcTex, m_yuvBuffer)) return false;
+    if (!m_mft || !m_hasVideoProcessor || !gpuSrcTex || !m_videoDevice || !m_videoContext) return false;
+
+    int slot = m_vpRingIdx;
+    m_vpRingIdx = (m_vpRingIdx + 1) % kVpRingSize;
+    ID3D11Texture2D* outTex = m_vpOutTex[slot];
+    ID3D11VideoProcessorOutputView* outView = m_vpOutView[slot];
+    if (!outTex || !outView) return false;
+
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivDesc = {};
+    ivDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    ivDesc.Texture2D.MipSlice = 0;
+    ivDesc.Texture2D.ArraySlice = 0;
+
+    ID3D11VideoProcessorInputView* inView = nullptr;
+    HRESULT hr = m_videoDevice->CreateVideoProcessorInputView(gpuSrcTex, m_vpEnum, &ivDesc, &inView);
+    if (FAILED(hr) || !inView) return false;
+
+    D3D11_VIDEO_PROCESSOR_STREAM stream = {};
+    stream.Enable = TRUE;
+    stream.pInputSurface = inView;
+
+    hr = m_videoContext->VideoProcessorBlt(m_vp, outView, 0, 1, &stream);
+    inView->Release();
+    if (FAILED(hr)) return false;
+
+    if (m_useD3dManager) {
+        if (!waitAsyncInputReady()) return false;
+
+        IMFMediaBuffer* mfBuf = nullptr;
+        if (SUCCEEDED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), outTex, 0, FALSE, &mfBuf)) && mfBuf) {
+            IMF2DBuffer* buf2d = nullptr;
+            if (SUCCEEDED(mfBuf->QueryInterface(__uuidof(IMF2DBuffer), reinterpret_cast<void**>(&buf2d))) && buf2d) {
+                DWORD contigLen = 0;
+                if (SUCCEEDED(buf2d->GetContiguousLength(&contigLen))) {
+                    mfBuf->SetCurrentLength(contigLen);
+                }
+                buf2d->Release();
+            }
+
+            IMFSample* sample = nullptr;
+            if (SUCCEEDED(MFCreateSample(&sample)) && sample) {
+                sample->AddBuffer(mfBuf);
+                mfBuf->Release();
+                sample->SetSampleTime(static_cast<LONGLONG>(ptsUs) * 10);
+                sample->SetSampleDuration(10000000LL / m_fps);
+
+                if (submitSampleToMft(sample, outAnnexB, outIsKeyframe)) {
+                    return true;
+                }
+            } else {
+                mfBuf->Release();
+            }
+        }
+
+        // Driver rejected DXGI surface input; cleanly disable D3D manager and fall back once
+        m_useD3dManager = false;
+        m_mft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
+    }
+
+    if (!copyTextureToPackedYuv(outTex, m_yuvBuffer)) return false;
     return encodePackedYuv(m_yuvBuffer, ptsUs, outAnnexB, outIsKeyframe);
 }
 
@@ -510,29 +587,55 @@ bool Encoder::encodeBgraCpu(const uint8_t* bgra, uint32_t width, uint32_t height
     return encodePackedYuv(m_yuvBuffer, ptsUs, outAnnexB, outIsKeyframe);
 }
 
-bool Encoder::encodePackedYuv(const std::vector<uint8_t>& yuvData, uint64_t ptsUs,
-                              std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe) {
-    if (!m_mft || yuvData.empty()) return false;
+bool Encoder::waitAsyncInputReady() {
+    if (!m_isAsync) return true;
 
-    if (m_isAsync) {
-        std::vector<uint8_t> dummy;
-        bool dummyKey = false;
+    std::vector<uint8_t> dummy;
+    bool dummyKey = false;
+    pumpAsyncEvents(dummy, dummyKey, false);
+
+    auto waitStart = std::chrono::steady_clock::now();
+    while (m_needInputCount <= 0) {
         pumpAsyncEvents(dummy, dummyKey, false);
-
-        auto waitStart = std::chrono::steady_clock::now();
-        while (m_needInputCount <= 0) {
-            pumpAsyncEvents(dummy, dummyKey, false);
-            if (m_needInputCount > 0) break;
-            if (std::chrono::steady_clock::now() - waitStart > std::chrono::milliseconds(25)) {
-                return false;
-            }
+        if (m_needInputCount > 0) break;
+        auto elapsed = std::chrono::steady_clock::now() - waitStart;
+        if (elapsed > std::chrono::milliseconds(20)) {
+            return false;
+        }
+        if (elapsed < std::chrono::milliseconds(4)) {
+            SwitchToThread();
+        } else {
             Sleep(1);
         }
     }
+    return true;
+}
+
+bool Encoder::submitSampleToMft(IMFSample* sample, std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe) {
+    if (!sample) return false;
 
     if (m_forceKeyframe.exchange(false) && m_codecApi) {
         setCodecUint32(m_codecApi, CODECAPI_AVEncVideoForceKeyFrame, 1);
     }
+
+    HRESULT hr = m_mft->ProcessInput(m_inStreamId, sample, 0);
+    sample->Release();
+
+    if (FAILED(hr)) {
+        return false;
+    }
+
+    if (m_isAsync) {
+        m_needInputCount--;
+        return pumpAsyncEvents(outAnnexB, outIsKeyframe, true);
+    }
+    return collectSyncOutput(outAnnexB, outIsKeyframe);
+}
+
+bool Encoder::encodePackedYuv(const std::vector<uint8_t>& yuvData, uint64_t ptsUs,
+                              std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe) {
+    if (!m_mft || yuvData.empty()) return false;
+    if (!waitAsyncInputReady()) return false;
 
     IMFMediaBuffer* mfBuf = nullptr;
     DWORD dataSize = static_cast<DWORD>(yuvData.size());
@@ -555,18 +658,7 @@ bool Encoder::encodePackedYuv(const std::vector<uint8_t>& yuvData, uint64_t ptsU
     sample->SetSampleTime(static_cast<LONGLONG>(ptsUs) * 10);
     sample->SetSampleDuration(10000000LL / m_fps);
 
-    HRESULT hr = m_mft->ProcessInput(m_inStreamId, sample, 0);
-    sample->Release();
-
-    if (FAILED(hr)) {
-        return false;
-    }
-
-    if (m_isAsync) {
-        m_needInputCount--;
-        return pumpAsyncEvents(outAnnexB, outIsKeyframe, true);
-    }
-    return collectSyncOutput(outAnnexB, outIsKeyframe);
+    return submitSampleToMft(sample, outAnnexB, outIsKeyframe);
 }
 
 bool Encoder::collectSyncOutput(std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe) {
@@ -669,8 +761,13 @@ bool Encoder::pumpAsyncEvents(std::vector<uint8_t>& outAnnexB, bool& outIsKeyfra
         HRESULT hr = m_eventGen->GetEvent(MF_EVENT_FLAG_NO_WAIT, &ev);
         if (hr == MF_E_NO_EVENTS_AVAILABLE) {
             if (!waitOutput || gotPacket) break;
-            if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(40)) break;
-            Sleep(1);
+            auto elapsed = std::chrono::steady_clock::now() - start;
+            if (elapsed > std::chrono::milliseconds(30)) break;
+            if (elapsed < std::chrono::milliseconds(4)) {
+                SwitchToThread();
+            } else {
+                Sleep(1);
+            }
             continue;
         }
         if (FAILED(hr) || !ev) break;
