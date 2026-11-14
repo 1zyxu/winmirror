@@ -11,26 +11,59 @@
 #include <chrono>
 #include <iphlpapi.h>
 #include <mmsystem.h>
+#include <shellapi.h>
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "shell32.lib")
 
 static std::atomic<bool> g_running{true};
 
 static BOOL WINAPI consoleCtrlHandler(DWORD signal) {
     if (signal == CTRL_C_EVENT || signal == CTRL_CLOSE_EVENT) {
-        std::cout << "\n[WinMirror] Stopping server..." << std::endl;
+        std::cout << "\n\n[WinMirror] Stopping server..." << std::endl;
         g_running = false;
         return TRUE;
     }
     return FALSE;
 }
 
+static bool isRunningAsAdmin() {
+    BOOL isAdmin = FALSE;
+    PSID adminGroup = NULL;
+    SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+    if (AllocateAndInitializeSid(&ntAuth, 2, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &adminGroup)) {
+        CheckTokenMembership(NULL, adminGroup, &isAdmin);
+        FreeSid(adminGroup);
+    }
+    return isAdmin == TRUE;
+}
+
+static void ensureAdminPrivileges(int argc, char* argv[]) {
+    if (isRunningAsAdmin()) {
+        return;
+    }
+
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(NULL, exePath, MAX_PATH);
+
+    std::string args;
+    for (int i = 1; i < argc; ++i) {
+        args += "\"" + std::string(argv[i]) + "\" ";
+    }
+
+    std::cout << "[WinMirror] Elevating to Administrator..." << std::endl;
+    HINSTANCE hInst = ShellExecuteA(NULL, "runas", exePath, args.empty() ? NULL : args.c_str(), NULL, SW_SHOWNORMAL);
+    if ((INT_PTR)hInst > 32) {
+        exit(0);
+    }
+}
+
 static void printLocalIps(int port) {
-    std::cout << "\n========================================================" << std::endl;
-    std::cout << "  WINMIRROR Pro v" << WINMIRROR_VERSION << " -- High Performance 60 FPS" << std::endl;
     std::cout << "========================================================" << std::endl;
-    std::cout << "Available Endpoints (USB & LAN/Wi-Fi):" << std::endl;
+    std::cout << "  WINMIRROR v" << WINMIRROR_VERSION << " -- High Performance Screen Mirror" << std::endl;
+    std::cout << "========================================================" << std::endl;
+    std::cout << "Endpoints (USB & LAN/Wi-Fi):" << std::endl;
 
     ULONG bufLen = sizeof(IP_ADAPTER_INFO);
     std::vector<BYTE> buf(bufLen);
@@ -56,6 +89,8 @@ static void printLocalIps(int port) {
 }
 
 int main(int argc, char* argv[]) {
+    ensureAdminPrivileges(argc, argv);
+
     SetConsoleCtrlHandler(consoleCtrlHandler, TRUE);
     timeBeginPeriod(1);
 
@@ -106,7 +141,7 @@ int main(int argc, char* argv[]) {
 
     HttpServer server(frameBuffer, port);
     if (!server.start()) {
-        std::cerr << "[Error] Failed to start HTTP streaming server on port " << port << std::endl;
+        std::cerr << "[Error] Failed to start HTTP server on port " << port << std::endl;
         timeEndPeriod(1);
         return 1;
     }
@@ -114,7 +149,7 @@ int main(int argc, char* argv[]) {
     Beacon beacon(port);
     beacon.start();
 
-    std::cout << "[WinMirror] Running rock-solid 60 FPS stream (USB & Network active)\n" << std::endl;
+    std::cout << "[WinMirror] Ready & Streaming (Press Ctrl+C to stop)\n" << std::endl;
 
     RawFrame rawFrame;
     std::vector<uint8_t> jpegData;
@@ -138,12 +173,16 @@ int main(int argc, char* argv[]) {
         }
 
         auto now = std::chrono::steady_clock::now();
-        if (now - lastReport >= std::chrono::seconds(4)) {
+        if (now - lastReport >= std::chrono::milliseconds(500)) {
             float elapsedSec = std::chrono::duration<float>(now - lastReport).count();
             float currentFps = capturedFrames / elapsedSec;
-            std::cout << "[WinMirror] Live: " << std::fixed << std::setprecision(1) << currentFps << " FPS"
-                      << " | Active Viewers: " << server.getActiveClients()
-                      << " | GPU: " << (capture.isDxgiActive() ? "DXGI 11" : "GDI") << std::endl;
+
+            // In-place single-line console update using \r without scrolling
+            std::cout << "\r[WinMirror] Live FPS: " << std::fixed << std::setprecision(1) << std::setw(4) << currentFps
+                      << " | Active Clients: " << server.getActiveClients()
+                      << " | Capture: " << (capture.isDxgiActive() ? "DXGI GPU" : "GDI")
+                      << "   " << std::flush;
+
             capturedFrames = 0;
             lastReport = now;
         }
@@ -160,6 +199,6 @@ int main(int argc, char* argv[]) {
     encoder.cleanup();
     timeEndPeriod(1);
 
-    std::cout << "[WinMirror] Shutdown complete." << std::endl;
+    std::cout << "\n[WinMirror] Shutdown complete." << std::endl;
     return 0;
 }

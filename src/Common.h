@@ -18,7 +18,7 @@
 #include <atomic>
 #include <chrono>
 
-#define WINMIRROR_VERSION "1.0.0"
+#define WINMIRROR_VERSION "1.0.1"
 #define WINMIRROR_REPO "1zyxu/winmirror"
 #define DEFAULT_PORT 8888
 #define BEACON_PORT 8889

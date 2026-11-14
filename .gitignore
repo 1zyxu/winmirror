@@ -11,3 +11,4 @@ winmirror_update.exe
 *.swp
 .vscode/
 .idea/
+*.pdb

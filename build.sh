@@ -18,7 +18,7 @@ build_win() {
         src/HttpServer.cpp \
         src/Beacon.cpp \
         src/Updater.cpp \
-        -ld3d11 -ldxgi -lole32 -loleaut32 -lgdi32 -lwindowscodecs -lws2_32 -lwinhttp -liphlpapi -lwinmm \
+        -ld3d11 -ldxgi -lole32 -loleaut32 -lgdi32 -lwindowscodecs -lws2_32 -lwinhttp -liphlpapi -lwinmm -lshell32 \
         -o winmirror.exe
     echo "==> Built winmirror.exe successfully!"
     ls -lh winmirror.exe
@@ -26,7 +26,7 @@ build_win() {
 
 build_mac() {
     echo "==> Building winmirror_mac (macOS arm64)..."
-    clang++ -O3 -std=c++17 -framework Cocoa -framework QuartzCore mac/main.mm -o winmirror_mac
+    clang++ -O3 -std=c++17 -framework Cocoa -framework QuartzCore -framework ImageIO mac/main.mm -o winmirror_mac
     echo "==> Built winmirror_mac successfully!"
     ls -lh winmirror_mac
 }
