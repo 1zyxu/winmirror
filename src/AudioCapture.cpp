@@ -142,6 +142,11 @@ std::string AudioCapture::getDeviceListSerialized() {
     return m_cachedDeviceList;
 }
 
+std::string AudioCapture::getActiveDeviceName() {
+    std::lock_guard<std::mutex> lock(m_devListMutex);
+    return m_activeDeviceName;
+}
+
 bool AudioCapture::tryActivateDevice(IMMDevice* dev, bool isInput) {
     if (!dev) return false;
 
@@ -163,7 +168,7 @@ bool AudioCapture::tryActivateDevice(IMMDevice* dev, bool isInput) {
     hr = client->Initialize(
         AUDCLNT_SHAREMODE_SHARED,
         streamFlags,
-        2000000, // 200ms buffer for low latency
+        1000000, // 100ms ring buffer for minimal WASAPI overhead
         0,
         pwfx,
         nullptr
@@ -192,6 +197,23 @@ bool AudioCapture::tryActivateDevice(IMMDevice* dev, bool isInput) {
     if (SUCCEEDED(m_device->GetId(&devId)) && devId) {
         m_deviceId = devId;
         CoTaskMemFree(devId);
+    }
+
+    std::string friendly = isInput ? "Input Device" : "Default Output";
+    IPropertyStore* props = nullptr;
+    if (SUCCEEDED(m_device->OpenPropertyStore(STGM_READ, &props)) && props) {
+        PROPVARIANT pv;
+        PropVariantInit(&pv);
+        if (SUCCEEDED(props->GetValue(WINMIRROR_PKEY_FriendlyName, &pv)) && pv.vt == VT_LPWSTR && pv.pwszVal) {
+            std::string conv = wideToUtf8(pv.pwszVal);
+            if (!conv.empty()) friendly = std::move(conv);
+        }
+        PropVariantClear(&pv);
+        props->Release();
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_devListMutex);
+        m_activeDeviceName = (isInput ? "IN: " : "OUT: ") + friendly;
     }
 
     m_sampleRate.store(m_pwfx->nSamplesPerSec);
@@ -357,6 +379,7 @@ void AudioCapture::captureLoop() {
     pcmOut.reserve(48000 * 2);
     int silentTailLeft = 0;
     auto lastEndpointPoll = std::chrono::steady_clock::now();
+    auto lastListPoll = lastEndpointPoll;
 
     while (m_running) {
         auto now = std::chrono::steady_clock::now();
@@ -367,10 +390,13 @@ void AudioCapture::captureLoop() {
             }
         }
 
-        // Poll device list + default playback endpoint every 300ms regardless of packet flow
-        if (now - lastEndpointPoll >= std::chrono::milliseconds(300)) {
-            lastEndpointPoll = now;
+        // Refresh full device inventory every 2s (heavy IPropertyStore), check default unplug at 400ms
+        if (now - lastListPoll >= std::chrono::milliseconds(2000)) {
+            lastListPoll = now;
             refreshDeviceList();
+        }
+        if (now - lastEndpointPoll >= std::chrono::milliseconds(400)) {
+            lastEndpointPoll = now;
 
             int reqIdxNow = m_requestedIndex.load();
             if (reqIdxNow < 0 && m_enumerator && m_captureClient) {

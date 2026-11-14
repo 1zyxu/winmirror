@@ -157,6 +157,17 @@ bool ScreenCapture::init() {
     return false;
 }
 
+const char* ScreenCapture::getPixelFormatName() const {
+    if (!m_useDxgi) return "GDI BGRA 8-bit";
+    switch (m_format) {
+        case DXGI_FORMAT_R16G16B16A16_FLOAT: return "16-bit scRGB HDR";
+        case DXGI_FORMAT_R10G10B10A2_UNORM:  return "10-bit RGB10A2";
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return "8-bit RGBA";
+        default: return "8-bit BGRA";
+    }
+}
+
 void ScreenCapture::cleanup() {
     cleanupDxgi();
     cleanupGdi();
@@ -359,7 +370,7 @@ bool ScreenCapture::acquireDxgi() {
     DXGI_OUTDUPL_FRAME_INFO frameInfo = {};
     IDXGIResource* desktopResource = nullptr;
 
-    HRESULT hr = m_duplication->AcquireNextFrame(1, &frameInfo, &desktopResource);
+    HRESULT hr = m_duplication->AcquireNextFrame(0, &frameInfo, &desktopResource);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
         return false;
     }

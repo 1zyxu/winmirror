@@ -25,6 +25,7 @@ public:
 
     bool isRunning() const { return m_running.load(); }
     uint32_t getSampleRate() const { return m_sampleRate.load(); }
+    std::string getActiveDeviceName();
 
 private:
     void captureLoop();
@@ -42,6 +43,7 @@ private:
     std::atomic<bool> m_forceReinit{false};
     std::mutex m_devListMutex;
     std::string m_cachedDeviceList;
+    std::string m_activeDeviceName = "Auto";
     std::wstring m_targetDeviceId;
     std::thread m_thread;
 

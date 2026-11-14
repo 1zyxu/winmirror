@@ -196,12 +196,20 @@ int main(int argc, char* argv[]) {
     Beacon beacon(port);
     beacon.start();
 
-    std::cout << "[AirPlay] Streaming Ready (Run winmirror_mac on Mac, Ctrl+C to stop)\n" << std::endl;
+    std::cout << "[Pipeline] Capture  : " << capture.getAdapterName()
+              << " (" << capture.getPixelFormatName() << ", " << capture.getWidth() << "x" << capture.getHeight() << ")" << std::endl;
+    std::cout << "[Pipeline] Encoder  : " << encoder.getEncoderName()
+              << " (" << encoder.getTargetBitrateMbps() << " Mbps @ " << targetFps << " FPS target)" << std::endl;
+    std::cout << "[Pipeline] Audio    : " << (audioCapture.isRunning()
+                  ? (audioCapture.getActiveDeviceName() + " [" + std::to_string(audioCapture.getSampleRate()) + " Hz]")
+                  : "Off") << std::endl;
+    std::cout << "[AirPlay]  Ready    : Start WinMirror on Mac (Ctrl+C to stop)\n" << std::endl;
 
     auto startTime = std::chrono::steady_clock::now();
     auto lastReport = startTime;
     auto nextEncodeTime = startTime;
     uint32_t encodedFrames = 0;
+    uint64_t encodedBytes = 0;
     uint64_t frameSeq = 0;
     bool lastZeroCopy = encoder.isZeroCopyActive();
 
@@ -251,22 +259,24 @@ int main(int argc, char* argv[]) {
 
             bool hasClients = (server.getActiveClients() > 0);
             bool encodedThisSlot = false;
+            bool gpuPathUsed = false;
 
             if (hasClients && (gotNewScreen || encoder.hasKeyframeRequest())) {
                 uint64_t ptsUs = std::chrono::duration_cast<std::chrono::microseconds>(loopStart - startTime).count();
                 bool isKey = false;
                 bool encoded = false;
 
-                if (capture.isDxgiActive() && capture.getGpuTexture()) {
+                if (capture.isDxgiActive() && capture.getGpuTexture() && encoder.hasVideoProcessor()) {
+                    gpuPathUsed = true;
                     encoded = encoder.encodeGpuFrame(capture.getGpuTexture(), ptsUs, annexB, isKey);
-                }
-                if (!encoded && capture.copyCurrentFrameToBgra(cpuFallbackFrame)) {
+                } else if (capture.copyCurrentFrameToBgra(cpuFallbackFrame)) {
                     encoded = encoder.encodeBgraCpu(cpuFallbackFrame.bgra.data(),
                                                     cpuFallbackFrame.width, cpuFallbackFrame.height,
                                                     ptsUs, annexB, isKey);
                 }
 
                 if (encoded && !annexB.empty()) {
+                    encodedBytes += annexB.size();
                     auto pkt = std::make_shared<EncodedFrame>();
                     pkt->data = std::move(annexB);
                     pkt->width = encoder.getWidth();
@@ -291,8 +301,8 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            // Only advance target frame slot once a frame actually lands (prevents missing 1ms later -> 33ms skip)
-            if (!hasClients || encodedThisSlot) {
+            // Advance slot when idle, frame produced, or GPU pipeline consumed the current screen frame
+            if (!hasClients || encodedThisSlot || (gpuPathUsed && gotNewScreen)) {
                 nextEncodeTime += minFrameGap;
                 if (nextEncodeTime + minFrameGap < loopStart) {
                     nextEncodeTime = loopStart + minFrameGap;
@@ -305,19 +315,22 @@ int main(int argc, char* argv[]) {
         if (now - lastReport >= std::chrono::milliseconds(500)) {
             float elapsedSec = std::chrono::duration<float>(now - lastReport).count();
             float currentFps = encodedFrames / elapsedSec;
+            float currentMbps = (encodedBytes * 8.0f) / (elapsedSec * 1000000.0f);
 
             uint16_t hflags = buildHelloFlags(btBridge.isRadioAvailable(), capture, encoder);
-            std::cout << "\r[AirPlay] " << std::fixed << std::setprecision(1) << std::setw(4) << currentFps
-                      << " FPS | " << (encoder.getCodec() == CODEC_HEVC ? "HEVC" : "H264")
-                      << "[" << gpuModeTag(hflags) << "]"
-                      << (encoder.isHdrActive() ? " HDR10" : " SDR")
+            std::cout << "\r[Stream] " << std::fixed << std::setprecision(1) << std::setw(4) << currentFps
+                      << " FPS | " << std::setw(4) << currentMbps << " Mbps | "
+                      << (encoder.getCodec() == CODEC_HEVC ? "HEVC" : "H264")
+                      << " [" << gpuModeTag(hflags) << "] "
+                      << (encoder.isHdrActive() ? "HDR10" : "SDR")
                       << " | " << encoder.getWidth() << "x" << encoder.getHeight()
-                      << " | BT:" << btBridge.getStatusText()
                       << " | Aud:" << (audioCapture.isRunning() ? (std::to_string(audioCapture.getSampleRate() / 1000) + "k") : "Off")
-                      << " | Viewers:" << server.getActiveClients()
+                      << " | BT:" << btBridge.getStatusText()
+                      << " | Clients:" << server.getActiveClients()
                       << "   " << std::flush;
 
             encodedFrames = 0;
+            encodedBytes = 0;
             lastReport = now;
         }
 

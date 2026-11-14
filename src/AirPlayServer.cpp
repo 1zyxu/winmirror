@@ -155,7 +155,7 @@ bool AirPlayServer::sendAll(SOCKET sock, const void* data, size_t len) {
 }
 
 bool AirPlayServer::sendPacket(SOCKET sock, uint16_t type, uint16_t flags, uint32_t extra1, uint32_t extra2,
-                               const void* payload, uint32_t payloadSize) {
+                               const void* payload, uint32_t payloadSize, std::vector<uint8_t>* txScratch) {
     PacketHeader hdr = {};
     hdr.magic = PACKET_MAGIC;
     hdr.type = type;
@@ -164,11 +164,20 @@ bool AirPlayServer::sendPacket(SOCKET sock, uint16_t type, uint16_t flags, uint3
     hdr.extra1 = extra1;
     hdr.extra2 = extra2;
 
-    if (!sendAll(sock, &hdr, sizeof(hdr))) return false;
-    if (payloadSize > 0 && payload) {
-        if (!sendAll(sock, payload, payloadSize)) return false;
+    if (payloadSize == 0 || !payload) {
+        return sendAll(sock, &hdr, sizeof(hdr));
     }
-    return true;
+
+    if (txScratch) {
+        // Coalesce 20-byte header + payload into one send() so Wi-Fi/LAN never splits them into two TCP segments
+        txScratch->resize(sizeof(hdr) + payloadSize);
+        memcpy(txScratch->data(), &hdr, sizeof(hdr));
+        memcpy(txScratch->data() + sizeof(hdr), payload, payloadSize);
+        return sendAll(sock, txScratch->data(), txScratch->size());
+    }
+
+    if (!sendAll(sock, &hdr, sizeof(hdr))) return false;
+    return sendAll(sock, payload, payloadSize);
 }
 
 void AirPlayServer::broadcastVideo(std::shared_ptr<const EncodedFrame> frame) {
@@ -186,8 +195,8 @@ void AirPlayServer::broadcastVideo(std::shared_ptr<const EncodedFrame> frame) {
             if (frame->isKeyframe) {
                 c->waitingForKeyframe = false;
             }
-            if (c->videoQueue.size() > 12) {
-                // Network congestion recovery: drop old P-frame chain and request immediate IDR
+            if (c->videoQueue.size() > 4) {
+                // Tight 4-frame (~66ms) congestion cap so interactive games stay snappy
                 c->videoQueue.clear();
                 if (!frame->isKeyframe) {
                     c->waitingForKeyframe = true;
@@ -351,18 +360,18 @@ void AirPlayServer::runClient(std::shared_ptr<ClientSession> session) {
         }
     }
 
-    if (!sendPacket(session->sock, PACKET_TYPE_HELLO, 0, 0, 0, &hello, sizeof(hello))) {
+    if (!sendPacket(session->sock, PACKET_TYPE_HELLO, 0, 0, 0, &hello, sizeof(hello), &session->txBuf)) {
         session->alive = false;
     } else {
         if (!initAudioDevs.empty()) {
             sendPacket(session->sock, PACKET_TYPE_AUDIO_DEVICES, 0, 0, 0,
-                       initAudioDevs.data(), static_cast<uint32_t>(initAudioDevs.size()));
+                       initAudioDevs.data(), static_cast<uint32_t>(initAudioDevs.size()), &session->txBuf);
         }
         if (sendInitCursor) {
             std::vector<uint8_t> payload(sizeof(CursorPayload) + initCursorBgra.size());
             memcpy(payload.data(), &initCursor, sizeof(CursorPayload));
             memcpy(payload.data() + sizeof(CursorPayload), initCursorBgra.data(), initCursorBgra.size());
-            sendPacket(session->sock, PACKET_TYPE_CURSOR, 0, 0, 0, payload.data(), static_cast<uint32_t>(payload.size()));
+            sendPacket(session->sock, PACKET_TYPE_CURSOR, 0, 0, 0, payload.data(), static_cast<uint32_t>(payload.size()), &session->txBuf);
         }
     }
 
@@ -431,7 +440,7 @@ void AirPlayServer::runClient(std::shared_ptr<ClientSession> session) {
                 std::lock_guard<std::mutex> ilock(m_infoMutex);
                 latestHello = m_hello;
             }
-            if (!sendPacket(session->sock, PACKET_TYPE_HELLO, 0, 0, 0, &latestHello, sizeof(latestHello))) {
+            if (!sendPacket(session->sock, PACKET_TYPE_HELLO, 0, 0, 0, &latestHello, sizeof(latestHello), &session->txBuf)) {
                 break;
             }
         }
@@ -444,7 +453,7 @@ void AirPlayServer::runClient(std::shared_ptr<ClientSession> session) {
             }
             if (!devsCopy.empty()) {
                 if (!sendPacket(session->sock, PACKET_TYPE_AUDIO_DEVICES, 0, 0, 0,
-                                devsCopy.data(), static_cast<uint32_t>(devsCopy.size()))) {
+                                devsCopy.data(), static_cast<uint32_t>(devsCopy.size()), &session->txBuf)) {
                     break;
                 }
             }
@@ -464,7 +473,7 @@ void AirPlayServer::runClient(std::shared_ptr<ClientSession> session) {
                 memcpy(cursorBuf.data() + sizeof(CursorPayload), curBgra.data(), curBgra.size());
             }
             if (!sendPacket(session->sock, PACKET_TYPE_CURSOR, 0, 0, 0,
-                            cursorBuf.data(), static_cast<uint32_t>(cursorBuf.size()))) {
+                            cursorBuf.data(), static_cast<uint32_t>(cursorBuf.size()), &session->txBuf)) {
                 break;
             }
         }
@@ -474,7 +483,7 @@ void AirPlayServer::runClient(std::shared_ptr<ClientSession> session) {
             for (const auto& pkt : audioBatch) {
                 if (!sendPacket(session->sock, PACKET_TYPE_AUDIO, 0, pkt->sampleRate,
                                 static_cast<uint32_t>(pkt->channels) | (16u << 16),
-                                pkt->pcm.data(), static_cast<uint32_t>(pkt->pcm.size()))) {
+                                pkt->pcm.data(), static_cast<uint32_t>(pkt->pcm.size()), &session->txBuf)) {
                     session->alive = false;
                     break;
                 }
@@ -491,7 +500,7 @@ void AirPlayServer::runClient(std::shared_ptr<ClientSession> session) {
                               (static_cast<uint32_t>(videoFrame->colorProfile) << 16) |
                               (videoFrame->width & 0xFFFF);
             if (!sendPacket(session->sock, PACKET_TYPE_VIDEO, flags, extra1, videoFrame->ptsMs,
-                            videoFrame->data.data(), static_cast<uint32_t>(videoFrame->data.size()))) {
+                            videoFrame->data.data(), static_cast<uint32_t>(videoFrame->data.size()), &session->txBuf)) {
                 break;
             }
         }

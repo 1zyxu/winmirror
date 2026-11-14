@@ -42,6 +42,7 @@ public:
     bool isDxgiActive() const { return m_useDxgi; }
     bool isHdrOutput() const { return m_isHdrOutput || m_format == DXGI_FORMAT_R16G16B16A16_FLOAT; }
     DXGI_FORMAT getPixelFormat() const { return m_format; }
+    const char* getPixelFormatName() const;
     const std::string& getAdapterName() const { return m_adapterName; }
     bool isNvidiaGpu() const { return m_isNvidiaGpu; }
 

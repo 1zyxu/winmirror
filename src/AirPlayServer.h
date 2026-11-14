@@ -51,13 +51,14 @@ private:
         bool hasPongPending = false;
         uint32_t pongExtra1 = 0;
         uint32_t pongExtra2 = 0;
+        std::vector<uint8_t> txBuf;
     };
 
     void acceptLoop();
     void runClient(std::shared_ptr<ClientSession> session);
     void clientRecvLoop(std::shared_ptr<ClientSession> session);
     static bool sendAll(SOCKET sock, const void* data, size_t len);
-    static bool sendPacket(SOCKET sock, uint16_t type, uint16_t flags, uint32_t extra1, uint32_t extra2, const void* payload, uint32_t payloadSize);
+    static bool sendPacket(SOCKET sock, uint16_t type, uint16_t flags, uint32_t extra1, uint32_t extra2, const void* payload, uint32_t payloadSize, std::vector<uint8_t>* txScratch = nullptr);
 
     int m_port;
     SOCKET m_listenSock = INVALID_SOCKET;

@@ -17,7 +17,6 @@
 
 #include <string>
 #include <vector>
-#include <deque>
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -202,11 +201,76 @@ static void unmuteMacDevice(AudioDeviceID devId, float targetVolume) {
     }
 }
 
+struct PcmRingBuffer {
+    std::vector<uint8_t> buf;
+    size_t readPos = 0;
+    size_t writePos = 0;
+    size_t count = 0;
+
+    void reset(size_t capacityBytes) {
+        capacityBytes &= ~size_t(3);
+        if (capacityBytes < 1024) capacityBytes = 1024;
+        buf.assign(capacityBytes, 0);
+        readPos = 0;
+        writePos = 0;
+        count = 0;
+    }
+
+    void clear() {
+        readPos = 0;
+        writePos = 0;
+        count = 0;
+    }
+
+    void push(const uint8_t *data, size_t len) {
+        len &= ~size_t(3);
+        if (!data || len == 0 || buf.empty()) return;
+        const size_t cap = buf.size();
+        if (len >= cap) {
+            std::memcpy(buf.data(), data + (len - cap), cap);
+            readPos = 0;
+            writePos = 0;
+            count = cap;
+            return;
+        }
+        if (count + len > cap) {
+            size_t overflow = (count + len - cap + 3) & ~size_t(3);
+            overflow = std::min(overflow, count);
+            readPos = (readPos + overflow) % cap;
+            count -= overflow;
+        }
+        const size_t first = std::min(len, cap - writePos);
+        std::memcpy(buf.data() + writePos, data, first);
+        if (len > first) {
+            std::memcpy(buf.data(), data + first, len - first);
+        }
+        writePos = (writePos + len) % cap;
+        count += len;
+    }
+
+    uint32_t pop(uint8_t *dst, uint32_t want) {
+        if (!dst || buf.empty() || count == 0) return 0;
+        const uint32_t avail = static_cast<uint32_t>(count);
+        const uint32_t toRead = std::min(want, avail) & ~3u;
+        if (toRead == 0) return 0;
+        const size_t cap = buf.size();
+        const size_t first = std::min<size_t>(toRead, cap - readPos);
+        std::memcpy(dst, buf.data() + readPos, first);
+        if (toRead > first) {
+            std::memcpy(dst + first, buf.data(), toRead - first);
+        }
+        readPos = (readPos + toRead) % cap;
+        count -= toRead;
+        return toRead;
+    }
+};
+
 @interface MacAudioPlayer : NSObject
 @property (nonatomic, copy) NSString *selectedDeviceUID;
 @property (nonatomic, assign) BOOL muted;
 @property (nonatomic, readonly) uint32_t activeSampleRate;
 @property (nonatomic, readonly) BOOL hasActiveSignal;
+@property (nonatomic, readonly) uint32_t bufferedMs;
 
 - (void)playPcm:(const uint8_t *)data length:(size_t)len sampleRate:(uint32_t)sampleRate;
 - (void)handleCallback:(AudioQueueBufferRef)buf;
@@ -220,13 +284,14 @@ static void unmuteMacDevice(AudioDeviceID devId, float targetVolume) {
     AudioQueueRef _audioQueue;
     std::mutex _queueMutex;
     std::mutex _bufMutex;
-    std::deque<uint8_t> _pcmRing;
+    PcmRingBuffer _pcmRing;
     uint32_t _sampleRate;
     UInt32 _chunkBytes;
     BOOL _started;
     std::atomic<bool> _disposing;
     std::atomic<bool> _alive;
     std::chrono::steady_clock::time_point _lastSignalTime;
+    std::chrono::steady_clock::time_point _lastQueueCheck;
 }
 
 static void AirPlayAudioCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueBufferRef inBuffer) {
@@ -249,12 +314,14 @@ static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObject
     if (self) {
         _sampleRate = 48000;
         _chunkBytes = (48000 / 50) * 4;
+        _pcmRing.reset((static_cast<size_t>(_sampleRate) * 4 * 80) / 1000);
         _started = NO;
         _disposing = false;
         _alive = true;
         _muted = NO;
         _selectedDeviceUID = nil;
         _lastSignalTime = std::chrono::steady_clock::time_point{};
+        _lastQueueCheck = std::chrono::steady_clock::time_point{};
 
         AudioObjectPropertyAddress defOutAddr = {
             kAudioHardwarePropertyDefaultOutputDevice,
@@ -273,6 +340,12 @@ static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObject
 - (BOOL)hasActiveSignal {
     auto age = std::chrono::steady_clock::now() - _lastSignalTime;
     return _lastSignalTime.time_since_epoch().count() > 0 && age < std::chrono::seconds(2);
+}
+
+- (uint32_t)bufferedMs {
+    std::lock_guard<std::mutex> lock(_bufMutex);
+    uint32_t bytesPerSec = (_sampleRate > 0 ? _sampleRate : 48000) * 4;
+    return static_cast<uint32_t>((_pcmRing.count * 1000) / bytesPerSec);
 }
 
 - (void)stopLocked {
@@ -300,6 +373,10 @@ static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObject
     _sampleRate = sr;
     _chunkBytes = ((sr / 50) * 4);
     if (_chunkBytes < 256) _chunkBytes = 3840;
+    {
+        std::lock_guard<std::mutex> lock(_bufMutex);
+        _pcmRing.reset((static_cast<size_t>(sr) * 4 * 80) / 1000);
+    }
 
     AudioStreamBasicDescription format = {};
     format.mSampleRate = static_cast<Float64>(sr);
@@ -359,12 +436,7 @@ static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObject
 
     if (!_muted) {
         std::lock_guard<std::mutex> lock(_bufMutex);
-        copied = std::min<UInt32>(want, static_cast<UInt32>(_pcmRing.size()));
-        copied &= ~3u; // keep stereo 16-bit 4-byte frame alignment
-        if (copied > 0) {
-            std::copy_n(_pcmRing.begin(), copied, dst);
-            _pcmRing.erase(_pcmRing.begin(), _pcmRing.begin() + copied);
-        }
+        copied = _pcmRing.pop(dst, want);
     }
 
     if (copied < want) {
@@ -394,25 +466,23 @@ static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObject
     std::lock_guard<std::mutex> qlock(_queueMutex);
     if (_muted) return;
 
-    UInt32 isRun = 0, runSz = sizeof(isRun);
-    BOOL queueDead = (!_audioQueue || _sampleRate != sampleRate || !_started ||
-                      AudioQueueGetProperty(_audioQueue, kAudioQueueProperty_IsRunning, &isRun, &runSz) != noErr ||
-                      isRun == 0);
+    auto now = std::chrono::steady_clock::now();
+    BOOL queueDead = (!_audioQueue || _sampleRate != sampleRate || !_started);
+    if (!queueDead && (now - _lastQueueCheck) >= std::chrono::milliseconds(1000)) {
+        _lastQueueCheck = now;
+        UInt32 isRun = 0, runSz = sizeof(isRun);
+        if (AudioQueueGetProperty(_audioQueue, kAudioQueueProperty_IsRunning, &isRun, &runSz) != noErr || isRun == 0) {
+            queueDead = YES;
+        }
+    }
     if (queueDead) {
         [self configureForSampleRateLocked:sampleRate];
+        _lastQueueCheck = now;
     }
     if (!_audioQueue) return;
 
     std::lock_guard<std::mutex> block(_bufMutex);
-    _pcmRing.insert(_pcmRing.end(), data, data + (len & ~3u));
-
-    // Cap buffer at ~100ms so A/V stays tightly synced on wireless/USB
-    const size_t maxBytes = static_cast<size_t>(_sampleRate) * 4 / 10;
-    if (_pcmRing.size() > maxBytes) {
-        size_t drop = (_pcmRing.size() - maxBytes + 3) & ~3u;
-        drop = std::min(drop, _pcmRing.size());
-        _pcmRing.erase(_pcmRing.begin(), _pcmRing.begin() + drop);
-    }
+    _pcmRing.push(data, len);
 }
 
 - (void)switchToDeviceUID:(NSString *)uid {
@@ -471,8 +541,10 @@ static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObject
 @interface AirPlayVideoView : NSView
 @property (nonatomic, strong) AVSampleBufferDisplayLayer *displayLayer;
 @property (nonatomic, strong) CALayer *cursorLayer;
+@property (nonatomic, assign) BOOL hudVisible;
 - (void)updateCursor:(const CursorPayload *)meta bitmap:(const uint8_t *)bgra size:(size_t)bgraLen;
 - (void)setVideoDimensions:(uint32_t)w height:(uint32_t)h hdr:(BOOL)isHdr;
+- (void)updateTelemetryText:(NSString *)text;
 @end
 
 @implementation AirPlayVideoView {
@@ -481,6 +553,8 @@ static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObject
     CursorPayload _lastCursor;
     BOOL _hasCursorMeta;
     CGImageRef _cursorImage;
+    NSView *_hudBox;
+    NSTextField *_hudLabel;
 }
 
 - (instancetype)initWithFrame:(NSRect)frameRect {
@@ -503,12 +577,62 @@ static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObject
         _cursorLayer.zPosition = 100.0;
         [self.layer addSublayer:_cursorLayer];
 
+        _hudBox = [[NSView alloc] initWithFrame:NSMakeRect(14, 14, 340, 88)];
+        _hudBox.wantsLayer = YES;
+        _hudBox.layer.backgroundColor = [[NSColor colorWithCalibratedWhite:0.06 alpha:0.82] CGColor];
+        _hudBox.layer.cornerRadius = 8.0;
+        _hudBox.layer.borderWidth = 1.0;
+        _hudBox.layer.borderColor = [[NSColor colorWithCalibratedWhite:1.0 alpha:0.15] CGColor];
+        _hudBox.layer.zPosition = 200.0;
+        _hudBox.hidden = YES;
+
+        _hudLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 8, 316, 72)];
+        _hudLabel.editable = NO;
+        _hudLabel.selectable = NO;
+        _hudLabel.bezeled = NO;
+        _hudLabel.drawsBackground = NO;
+        _hudLabel.usesSingleLineMode = NO;
+        _hudLabel.font = [NSFont monospacedSystemFontOfSize:11.0 weight:NSFontWeightMedium];
+        _hudLabel.textColor = [NSColor colorWithCalibratedWhite:0.94 alpha:1.0];
+        _hudLabel.stringValue = @"";
+        [_hudBox addSubview:_hudLabel];
+        [self addSubview:_hudBox];
+
+        _hudVisible = NO;
         _videoW = 1920;
         _videoH = 1080;
         _hasCursorMeta = NO;
         _cursorImage = nullptr;
     }
     return self;
+}
+
+- (void)layoutHud {
+    if (!_hudBox || !_hudLabel) return;
+    NSSize textSz = [_hudLabel fittingSize];
+    CGFloat padX = 12.0;
+    CGFloat padY = 9.0;
+    CGFloat boxW = std::max<CGFloat>(260.0, textSz.width + padX * 2.0);
+    CGFloat boxH = std::max<CGFloat>(48.0, textSz.height + padY * 2.0);
+    CGFloat y = std::max<CGFloat>(14.0, self.bounds.size.height - boxH - 14.0);
+    _hudBox.frame = NSMakeRect(14.0, y, boxW, boxH);
+    _hudLabel.frame = NSMakeRect(padX, padY, boxW - padX * 2.0, boxH - padY * 2.0);
+}
+
+- (void)setHudVisible:(BOOL)hudVisible {
+    _hudVisible = hudVisible;
+    _hudBox.hidden = !hudVisible;
+    if (hudVisible) {
+        [self layoutHud];
+    }
+}
+
+- (void)updateTelemetryText:(NSString *)text {
+    if (!_hudLabel) return;
+    _hudLabel.stringValue = text ? text : @"";
+    if (_hudVisible) {
+        [self layoutHud];
+    }
 }
 
 - (void)layout {
@@ -518,6 +642,7 @@ static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObject
     _displayLayer.frame = self.bounds;
     [self repositionCursor];
     [CATransaction commit];
+    [self layoutHud];
 }
 
 - (void)setVideoDimensions:(uint32_t)w height:(uint32_t)h hdr:(BOOL)isHdr {
@@ -611,6 +736,10 @@ static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObject
 
 - (void)dealloc {
     if (_cursorImage) CGImageRelease(_cursorImage);
+    [_hudLabel release];
+    _hudLabel = nil;
+    [_hudBox release];
+    _hudBox = nil;
     [super dealloc];
 }
 @end
@@ -633,6 +762,13 @@ public:
             CFRelease(_fmtDesc);
             _fmtDesc = nullptr;
         }
+        if (_cachedPixDesc) {
+            CFRelease(_cachedPixDesc);
+            _cachedPixDesc = nullptr;
+        }
+        _cachedW = 0;
+        _cachedH = 0;
+        _cachedPixFmt = 0;
         _vps.clear();
         _sps.clear();
         _pps.clear();
@@ -656,9 +792,7 @@ public:
                           ColorProfile colorProfile, AVSampleBufferDisplayLayer *layer) {
         if (!annexB || len < 4 || !layer) return false;
 
-        // Parse Annex-B NALUs (00 00 01 / 00 00 00 01)
-        struct NalSpan { const uint8_t *ptr; size_t len; };
-        std::vector<NalSpan> vclNals;
+        _vclNals.clear();
 
         bool paramChanged = false;
         if (codec != _activeCodec) {
@@ -706,7 +840,7 @@ public:
                             paramChanged = true;
                         }
                     } else if (nalType <= 31) {
-                        vclNals.push_back({ nal, nalLen });
+                        _vclNals.push_back({ nal, nalLen });
                     }
                 } else {
                     uint8_t nalType = nal[0] & 0x1F;
@@ -721,7 +855,7 @@ public:
                             paramChanged = true;
                         }
                     } else if (nalType == 1 || nalType == 5) {
-                        vclNals.push_back({ nal, nalLen });
+                        _vclNals.push_back({ nal, nalLen });
                     }
                 }
             }
@@ -738,15 +872,15 @@ public:
             if (!recreateSession(codec, colorProfile)) return false;
         }
 
-        if (vclNals.empty() || !_session || !_fmtDesc) return false;
+        if (_vclNals.empty() || !_session || !_fmtDesc) return false;
 
         // Pack VCL NALs into 4-byte Big-Endian AVCC/HVCC format
         size_t totalAvcc = 0;
-        for (const auto &n : vclNals) totalAvcc += 4 + n.len;
+        for (const auto &n : _vclNals) totalAvcc += 4 + n.len;
 
         _avccBuf.resize(totalAvcc);
         size_t offset = 0;
-        for (const auto &n : vclNals) {
+        for (const auto &n : _vclNals) {
             uint32_t l = static_cast<uint32_t>(n.len);
             _avccBuf[offset + 0] = (l >> 24) & 0xFF;
             _avccBuf[offset + 1] = (l >> 16) & 0xFF;
@@ -813,9 +947,24 @@ public:
             CVBufferSetAttachment(decodedPixelBuf, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
         }
 
-        CMVideoFormatDescriptionRef pixDesc = nullptr;
-        status = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, decodedPixelBuf, &pixDesc);
-        if (status == noErr && pixDesc) {
+        const size_t pbW = CVPixelBufferGetWidth(decodedPixelBuf);
+        const size_t pbH = CVPixelBufferGetHeight(decodedPixelBuf);
+        const OSType pbFmt = CVPixelBufferGetPixelFormatType(decodedPixelBuf);
+        if (!_cachedPixDesc || _cachedW != pbW || _cachedH != pbH || _cachedPixFmt != pbFmt || _cachedColor != colorProfile) {
+            if (_cachedPixDesc) {
+                CFRelease(_cachedPixDesc);
+                _cachedPixDesc = nullptr;
+            }
+            status = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, decodedPixelBuf, &_cachedPixDesc);
+            if (status == noErr && _cachedPixDesc) {
+                _cachedW = pbW;
+                _cachedH = pbH;
+                _cachedPixFmt = pbFmt;
+                _cachedColor = colorProfile;
+            }
+        }
+
+        if (_cachedPixDesc) {
             CMSampleTimingInfo timing = kCMTimingInfoInvalid;
             CMSampleBufferRef displaySample = nullptr;
             status = CMSampleBufferCreateForImageBuffer(
@@ -824,11 +973,10 @@ public:
                 true,
                 nullptr,
                 nullptr,
-                pixDesc,
+                _cachedPixDesc,
                 &timing,
                 &displaySample
             );
-            CFRelease(pixDesc);
 
             if (status == noErr && displaySample) {
                 CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(displaySample, YES);
@@ -851,6 +999,8 @@ public:
     }
 
 private:
+    struct NalSpan { const uint8_t *ptr; size_t len; };
+
     bool recreateSession(VideoCodec codec, ColorProfile color) {
         if (_session) {
             VTDecompressionSessionWaitForAsynchronousFrames(_session);
@@ -861,6 +1011,10 @@ private:
         if (_fmtDesc) {
             CFRelease(_fmtDesc);
             _fmtDesc = nullptr;
+        }
+        if (_cachedPixDesc) {
+            CFRelease(_cachedPixDesc);
+            _cachedPixDesc = nullptr;
         }
 
         OSStatus status = noErr;
@@ -882,6 +1036,9 @@ private:
             ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
             : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
 
+        NSDictionary *decoderSpec = @{
+            (id)kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: @YES
+        };
         NSDictionary *destAttrs = @{
             (id)kCVPixelBufferPixelFormatTypeKey: @(pixFmt),
             (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
@@ -895,7 +1052,7 @@ private:
         status = VTDecompressionSessionCreate(
             kCFAllocatorDefault,
             _fmtDesc,
-            nullptr,
+            (__bridge CFDictionaryRef)decoderSpec,
             (__bridge CFDictionaryRef)destAttrs,
             &cb,
             &_session
@@ -909,15 +1066,32 @@ private:
 
     VideoCodec _activeCodec = CODEC_H264;
     ColorProfile _activeColor = COLOR_SDR_BT709;
+    ColorProfile _cachedColor = COLOR_SDR_BT709;
     CMVideoFormatDescriptionRef _fmtDesc = nullptr;
+    CMVideoFormatDescriptionRef _cachedPixDesc = nullptr;
+    size_t _cachedW = 0;
+    size_t _cachedH = 0;
+    OSType _cachedPixFmt = 0;
     VTDecompressionSessionRef _session = nullptr;
     std::vector<uint8_t> _vps, _sps, _pps;
     std::vector<uint8_t> _avccBuf;
+    std::vector<NalSpan> _vclNals;
 };
 
 // ============================================================================
 // Bluetooth Discovery + Control Link Bridge + Window Controller
 // ============================================================================
+static NSImage *sfSymbol(NSString *name) {
+    if (@available(macOS 11.0, *)) {
+        NSImage *img = [NSImage imageWithSystemSymbolName:name accessibilityDescription:nil];
+        if (img) {
+            [img setTemplate:YES];
+            return img;
+        }
+    }
+    return nil;
+}
+
 @interface MirrorWindowController : NSObject <NSWindowDelegate, NSNetServiceDelegate, IOBluetoothRFCOMMChannelDelegate, NSMenuDelegate>
 @property (nonatomic, strong) NSWindow *window;
 @property (nonatomic, strong) AirPlayVideoView *videoView;
@@ -926,11 +1100,17 @@ private:
 @property (nonatomic, strong) IOBluetoothRFCOMMChannel *btChannel;
 @property (nonatomic, strong) NSPopUpButton *audioPopup;
 @property (nonatomic, strong) NSMenu *topAudioMenu;
+@property (nonatomic, strong) NSMenuItem *hudMenuItem;
 @property (nonatomic, strong) NSMutableArray<NSDictionary *> *pcAudioDevices;
 
-@property (nonatomic, assign) NSInteger frameCount;
-@property (nonatomic, assign) NSTimeInterval lastFpsTime;
 @property (nonatomic, assign) double currentFps;
+@property (nonatomic, assign) double currentMbps;
+@property (nonatomic, assign) double avgFrameMs;
+@property (nonatomic, assign) double frameJitterMs;
+@property (nonatomic, assign) uint64_t totalFrames;
+@property (nonatomic, assign) uint32_t dropCount;
+@property (nonatomic, assign) uint32_t keyframeCount;
+@property (nonatomic, assign) uint32_t pcAudioRate;
 @property (nonatomic, assign) uint32_t currentWidth;
 @property (nonatomic, assign) uint32_t currentHeight;
 @property (nonatomic, assign) VideoCodec currentCodec;
@@ -939,11 +1119,14 @@ private:
 @property (nonatomic, assign) BOOL btLinked;
 @property (nonatomic, assign) uint16_t pcHelloFlags;
 @property (nonatomic, copy) NSString *pcHostName;
+@property (nonatomic, copy) NSString *activeTransportHost;
 
 - (void)addDiscoveredHost:(NSString *)ip port:(int)port source:(NSString *)src;
 - (std::string)pickTargetHost:(int &)outPort;
 - (void)updatePcAudioDevices:(NSString *)serialized;
 - (int)consumePendingPcAudioSource;
+- (void)requestKeyframeFromPc;
+- (BOOL)consumePendingKeyframeReq;
 @end
 
 @implementation MirrorWindowController {
@@ -954,6 +1137,7 @@ private:
     BOOL _hasCliHost;
     std::string _lineBuf;
     std::atomic<int> _pendingPcAudioSrc;
+    std::atomic<bool> _pendingKeyReq;
 }
 
 - (instancetype)initWithCliHost:(NSString *)host port:(int)port {
@@ -962,18 +1146,24 @@ private:
         _audioPlayer = [[MacAudioPlayer alloc] init];
         _pcAudioDevices = [[NSMutableArray alloc] init];
         _pendingPcAudioSrc = -999;
+        _pendingKeyReq = false;
         _currentWidth = 1920;
         _currentHeight = 1080;
         _currentCodec = CODEC_H264;
         _currentColor = COLOR_SDR_BT709;
         _lastRttMs = 0.0;
+        _avgFrameMs = 0.0;
+        _frameJitterMs = 0.0;
+        _pcAudioRate = 48000;
         _btLinked = NO;
-        _pcHostName = @"Searching (Bluetooth / Wi-Fi / USB)...";
+        _pcHostName = @"Searching (Bluetooth / LAN / USB)...";
+        _activeTransportHost = @"Auto";
 
         if (host.length > 0) {
             _cliHost = [host UTF8String];
             _cliPort = port;
             _hasCliHost = YES;
+            _activeTransportHost = host;
         } else {
             _hasCliHost = NO;
         }
@@ -989,7 +1179,7 @@ private:
                                               styleMask:style
                                                 backing:NSBackingStoreBuffered
                                                   defer:NO];
-        [_window setTitle:@"WinMirror AirPlay — Discovering PC via Bluetooth & LAN..."];
+        [_window setTitle:@"WinMirror | Discovering PC via Bluetooth & LAN..."];
         [_window setBackgroundColor:[NSColor blackColor]];
         [_window setMinSize:NSMakeSize(800, 450)];
         [_window setDelegate:self];
@@ -1001,7 +1191,6 @@ private:
         [self setupAudioSwitchBarAndMenus];
 
         [_window makeKeyAndOrderFront:nil];
-        _lastFpsTime = [NSDate timeIntervalSinceReferenceDate];
 
         // Publish Bonjour AirPlay-style service on macOS
         _bonjourService = [[NSNetService alloc] initWithDomain:@"local."
@@ -1121,12 +1310,12 @@ private:
 }
 
 - (void)setupAudioSwitchBarAndMenus {
-    // 1. Trailing Titlebar "Switch Audio" control right on top window bar
+    // 1. Trailing Titlebar Audio Switch control
     NSView *accContainer = [[[NSView alloc] initWithFrame:NSMakeRect(0, 0, 215, 26)] autorelease];
     _audioPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(4, 2, 204, 22) pullsDown:NO];
     _audioPopup.controlSize = NSControlSizeSmall;
     _audioPopup.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
-    _audioPopup.toolTip = @"Switch PC Audio Output Device or Mute (Press M)";
+    _audioPopup.toolTip = @"Switch PC or Mac Audio Device (Press M to Mute)";
     _audioPopup.menu.delegate = self;
 
     NSTitlebarAccessoryViewController *accVC = [[[NSTitlebarAccessoryViewController alloc] init] autorelease];
@@ -1135,26 +1324,43 @@ private:
     [accContainer addSubview:_audioPopup];
     [_window addTitlebarAccessoryViewController:accVC];
 
-    // 2. Native macOS Top Menu Bar ("WinMirror AirPlay" + "Audio")
+    // 2. Native macOS Top Menu Bar ("WinMirror", "View", "Audio")
     NSMenu *mainMenu = [[[NSMenu alloc] initWithTitle:@""] autorelease];
 
-    NSMenuItem *appMenuItem = [[[NSMenuItem alloc] initWithTitle:@"WinMirror AirPlay" action:nil keyEquivalent:@""] autorelease];
-    NSMenu *appMenu = [[[NSMenu alloc] initWithTitle:@"WinMirror AirPlay"] autorelease];
-    NSMenuItem *fsItem = [[[NSMenuItem alloc] initWithTitle:@"Toggle Fullscreen"
-                                                    action:@selector(toggleFullscreenAction:)
-                                             keyEquivalent:@"f"] autorelease];
-    fsItem.target = self;
-    [appMenu addItem:fsItem];
-    [appMenu addItem:[NSMenuItem separatorItem]];
-    NSMenuItem *quitItem = [[[NSMenuItem alloc] initWithTitle:@"Quit WinMirror AirPlay"
+    NSMenuItem *appMenuItem = [[[NSMenuItem alloc] initWithTitle:@"WinMirror" action:nil keyEquivalent:@""] autorelease];
+    NSMenu *appMenu = [[[NSMenu alloc] initWithTitle:@"WinMirror"] autorelease];
+    NSMenuItem *quitItem = [[[NSMenuItem alloc] initWithTitle:@"Quit WinMirror"
                                                       action:@selector(terminate:)
                                                keyEquivalent:@"q"] autorelease];
     [appMenu addItem:quitItem];
     appMenuItem.submenu = appMenu;
     [mainMenu addItem:appMenuItem];
 
-    NSMenuItem *audioBarItem = [[[NSMenuItem alloc] initWithTitle:@"Switch Audio" action:nil keyEquivalent:@""] autorelease];
-    _topAudioMenu = [[NSMenu alloc] initWithTitle:@"Switch Audio"];
+    NSMenuItem *viewBarItem = [[[NSMenuItem alloc] initWithTitle:@"View" action:nil keyEquivalent:@""] autorelease];
+    NSMenu *viewMenu = [[[NSMenu alloc] initWithTitle:@"View"] autorelease];
+    NSMenuItem *fsItem = [[[NSMenuItem alloc] initWithTitle:@"Toggle Fullscreen"
+                                                    action:@selector(toggleFullscreenAction:)
+                                             keyEquivalent:@"f"] autorelease];
+    fsItem.target = self;
+    [viewMenu addItem:fsItem];
+
+    _hudMenuItem = [[NSMenuItem alloc] initWithTitle:@"Performance Telemetry HUD"
+                                              action:@selector(toggleTelemetryHudAction:)
+                                       keyEquivalent:@"s"];
+    _hudMenuItem.target = self;
+    _hudMenuItem.state = NSControlStateValueOff;
+    [viewMenu addItem:_hudMenuItem];
+
+    NSMenuItem *keyItem = [[[NSMenuItem alloc] initWithTitle:@"Request Keyframe (IDR)"
+                                                     action:@selector(requestKeyframeAction:)
+                                              keyEquivalent:@"r"] autorelease];
+    keyItem.target = self;
+    [viewMenu addItem:keyItem];
+    viewBarItem.submenu = viewMenu;
+    [mainMenu addItem:viewBarItem];
+
+    NSMenuItem *audioBarItem = [[[NSMenuItem alloc] initWithTitle:@"Audio" action:nil keyEquivalent:@""] autorelease];
+    _topAudioMenu = [[NSMenu alloc] initWithTitle:@"Audio"];
     _topAudioMenu.delegate = self;
     audioBarItem.submenu = _topAudioMenu;
     [mainMenu addItem:audioBarItem];
@@ -1162,7 +1368,7 @@ private:
     [NSApp setMainMenu:mainMenu];
     [self refreshAudioSwitchControls];
 
-    // 3. Window keyboard shortcuts (F = Fullscreen, M = Mute Audio)
+    // 3. Keyboard shortcuts: F = Fullscreen, M = Mute, S = Telemetry HUD, R = Request Keyframe
     __unsafe_unretained MirrorWindowController *weakSelf = self;
     [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent *(NSEvent *ev) {
         if (ev.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagOption | NSEventModifierFlagControl)) {
@@ -1177,6 +1383,14 @@ private:
             [weakSelf toggleAudioMuteAction:nil];
             return nil;
         }
+        if ([c isEqualToString:@"s"]) {
+            [weakSelf toggleTelemetryHudAction:nil];
+            return nil;
+        }
+        if ([c isEqualToString:@"r"]) {
+            [weakSelf requestKeyframeAction:nil];
+            return nil;
+        }
         return ev;
     }];
 }
@@ -1188,27 +1402,30 @@ private:
     BOOL isMuted = _audioPlayer.muted;
     std::vector<MacAudioDeviceInfo> devs = enumerateMacOutputDevices();
 
-    NSString *signalTxt = _audioPlayer.hasActiveSignal ? @"Active" : @"Idle/Silent";
-    NSString *statusTitle = [NSString stringWithFormat:@"PC Audio (%u Hz) • %@",
-                             _audioPlayer.activeSampleRate, signalTxt];
+    uint32_t rateHz = (_audioPlayer.activeSampleRate > 0 ? _audioPlayer.activeSampleRate : _pcAudioRate);
+    NSString *signalTxt = _audioPlayer.hasActiveSignal ? @"Active" : @"Idle";
+    NSString *statusTitle = [NSString stringWithFormat:@"Stream Audio: %u Hz | Signal: %@ | Buffer: %u ms",
+                             rateHz, signalTxt, _audioPlayer.bufferedMs];
     NSMenuItem *statusItem = [[[NSMenuItem alloc] initWithTitle:statusTitle action:nil keyEquivalent:@""] autorelease];
     statusItem.enabled = NO;
     [menu addItem:statusItem];
     [menu addItem:[NSMenuItem separatorItem]];
 
-    NSMenuItem *muteItem = [[[NSMenuItem alloc] initWithTitle:@"🔇 Mute PC Audio"
+    NSMenuItem *muteItem = [[[NSMenuItem alloc] initWithTitle:@"Mute Audio Output"
                                                         action:@selector(onAudioMenuAction:)
                                                  keyEquivalent:@""] autorelease];
     muteItem.target = self;
     muteItem.tag = -1;
+    muteItem.image = sfSymbol(@"speaker.slash");
     muteItem.state = isMuted ? NSControlStateValueOn : NSControlStateValueOff;
     [menu addItem:muteItem];
 
-    NSMenuItem *defItem = [[[NSMenuItem alloc] initWithTitle:@"🔊 System Default"
+    NSMenuItem *defItem = [[[NSMenuItem alloc] initWithTitle:@"System Default Output"
                                                        action:@selector(onAudioMenuAction:)
                                                 keyEquivalent:@""] autorelease];
     defItem.target = self;
     defItem.tag = 0;
+    defItem.image = sfSymbol(@"speaker.wave.2");
     defItem.state = (!isMuted && selUid.length == 0) ? NSControlStateValueOn : NSControlStateValueOff;
     [menu addItem:defItem];
 
@@ -1219,10 +1436,10 @@ private:
 
     for (size_t i = 0; i < devs.size(); ++i) {
         const auto &d = devs[i];
-        NSMutableString *label = [NSMutableString stringWithFormat:@"🔊 %@", d.name];
-        if (d.isDefault) [label appendString:@" ★"];
+        NSMutableString *label = [NSMutableString stringWithString:d.name];
+        if (d.isDefault) [label appendString:@" (Default)"];
         if (d.isMuted || (d.volume >= 0.0f && d.volume <= 0.01f)) {
-            [label appendString:@" (0% Muted)"];
+            [label appendString:@" [Muted 0%]"];
             mutedDevs.push_back({ d.deviceId, d.name });
         } else if (d.volume > 0.0f) {
             [label appendFormat:@" (%.0f%%)", d.volume * 100.0f];
@@ -1234,6 +1451,7 @@ private:
         item.target = self;
         item.tag = 100 + static_cast<NSInteger>(i);
         item.representedObject = d.uid;
+        item.image = sfSymbol(d.isMuted ? @"speaker.slash" : @"speaker.wave.2");
         BOOL match = (!isMuted && selUid.length > 0 && [selUid isEqualToString:d.uid]);
         item.state = match ? NSControlStateValueOn : NSControlStateValueOff;
         if (match) selectedIndex = menu.numberOfItems;
@@ -1261,40 +1479,42 @@ private:
                 if ([cleanName hasPrefix:@"OUT:"]) cleanName = [cleanName substringFromIndex:4];
                 else if ([cleanName hasPrefix:@"IN:"]) cleanName = [cleanName substringFromIndex:3];
 
-                NSString *pcTitle = [NSString stringWithFormat:@"%@ %@", wantInput ? @"🎤" : @"🖥️", cleanName];
-                NSMenuItem *pcItem = [[[NSMenuItem alloc] initWithTitle:pcTitle
+                NSMenuItem *pcItem = [[[NSMenuItem alloc] initWithTitle:cleanName
                                                                  action:@selector(onPcAudioSourceAction:)
                                                           keyEquivalent:@""] autorelease];
                 pcItem.target = self;
                 pcItem.tag = idx;
+                pcItem.image = sfSymbol(wantInput ? @"mic" : @"display");
                 pcItem.state = [pcDev[@"selected"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
                 [menu addItem:pcItem];
             }
         };
 
-        addPcSection(@"PC Output Source (Speakers / Loopback)", NO);
-        addPcSection(@"PC Input Source (Mic / Line / Virtual)", YES);
+        addPcSection(@"PC Output Source (Loopback)", NO);
+        addPcSection(@"PC Input Source (Microphone / Line)", YES);
     }
 
     if (!mutedDevs.empty()) {
         [menu addItem:[NSMenuItem separatorItem]];
         for (const auto &md : mutedDevs) {
-            NSString *fixTitle = [NSString stringWithFormat:@"⚡ Unmute %@ (60%%)", md.second];
+            NSString *fixTitle = [NSString stringWithFormat:@"Restore %@ Volume (60%%)", md.second];
             NSMenuItem *fixItem = [[[NSMenuItem alloc] initWithTitle:fixTitle
                                                               action:@selector(onUnmuteDeviceAction:)
                                                        keyEquivalent:@""] autorelease];
             fixItem.target = self;
             fixItem.tag = static_cast<NSInteger>(md.first);
+            fixItem.image = sfSymbol(@"speaker.wave.2.fill");
             [menu addItem:fixItem];
         }
     }
 
     [menu addItem:[NSMenuItem separatorItem]];
-    NSMenuItem *restartItem = [[[NSMenuItem alloc] initWithTitle:@"🔄 Restart Audio Output"
+    NSMenuItem *restartItem = [[[NSMenuItem alloc] initWithTitle:@"Reset Audio Engine"
                                                            action:@selector(onAudioMenuAction:)
                                                     keyEquivalent:@""] autorelease];
     restartItem.target = self;
     restartItem.tag = -2;
+    restartItem.image = sfSymbol(@"arrow.clockwise");
     [menu addItem:restartItem];
 
     if (isPopup && selectedIndex < _audioPopup.numberOfItems) {
@@ -1377,6 +1597,25 @@ private:
     [_window toggleFullScreen:nil];
 }
 
+- (void)toggleTelemetryHudAction:(id)sender {
+    BOOL next = !_videoView.hudVisible;
+    _videoView.hudVisible = next;
+    _hudMenuItem.state = next ? NSControlStateValueOn : NSControlStateValueOff;
+    [self refreshTitle];
+}
+
+- (void)requestKeyframeFromPc {
+    _pendingKeyReq.store(true);
+}
+
+- (BOOL)consumePendingKeyframeReq {
+    return _pendingKeyReq.exchange(false);
+}
+
+- (void)requestKeyframeAction:(id)sender {
+    [self requestKeyframeFromPc];
+}
+
 - (void)refreshTitle {
     NSString *codecStr = (_currentCodec == CODEC_HEVC) ? @"HEVC" : @"H.264";
     NSString *hdrStr = (_currentColor == COLOR_HDR10_PQ) ? @"HDR10" : @"SDR";
@@ -1391,18 +1630,55 @@ private:
     else if (hasHw && hasZc) gpuStr = @"GPU-ZC";
     else if (hasHw) gpuStr = @"GPU";
 
-    NSString *title = [NSString stringWithFormat:@"WinMirror AirPlay — %@ | %ux%u %@ | %@ [%@] %.0f FPS | %.1f ms | %@",
+    uint32_t rateHz = (_audioPlayer.activeSampleRate > 0 ? _audioPlayer.activeSampleRate : _pcAudioRate);
+    uint32_t khzRate = rateHz / 1000;
+
+    NSString *title = [NSString stringWithFormat:@"WinMirror | %@ | %ux%u %@ | %@ [%@] %.1f FPS | %.1f Mbps | %.1f ms | %u kHz | %@",
                        _pcHostName, _currentWidth, _currentHeight, hdrStr, codecStr,
-                       gpuStr, _currentFps, _lastRttMs, btStr];
+                       gpuStr, _currentFps, _currentMbps, _lastRttMs, khzRate, btStr];
     [_window setTitle:title];
+
+    if (_videoView.hudVisible) {
+        NSString *sigTxt = _audioPlayer.muted ? @"Muted" : (_audioPlayer.hasActiveSignal ? @"Active" : @"Idle");
+        NSString *hostAddr = _activeTransportHost.length ? _activeTransportHost : @"Auto";
+        NSString *hudText = [NSString stringWithFormat:
+            @"Host: %@ (%@) [%@]\n"
+            @"Pipeline: %ux%u %@ | %@ [%@]\n"
+            @"Rate: %.1f FPS | %.2f Mbps | Frame %.1f ms (Jitter %.1f ms)\n"
+            @"Stream: %llu Frames | Drops %u | IDR %u\n"
+            @"Audio: %u kHz | %@ | Buffer %u ms | Net RTT %.1f ms\n"
+            @"Keys: [S] Telemetry HUD  [R] Request Keyframe  [M] Mute  [F] Fullscreen",
+            _pcHostName, hostAddr, btStr,
+            _currentWidth, _currentHeight, hdrStr, codecStr, gpuStr,
+            _currentFps, _currentMbps, _avgFrameMs, _frameJitterMs,
+            (unsigned long long)_totalFrames, _dropCount, _keyframeCount,
+            khzRate, sigTxt, _audioPlayer.bufferedMs, _lastRttMs];
+        [_videoView updateTelemetryText:hudText];
+    }
 }
 
-- (void)updateRenderStats:(uint32_t)w height:(uint32_t)h codec:(VideoCodec)codec color:(ColorProfile)color fps:(double)fps {
+- (void)updateRenderStats:(uint32_t)w
+                   height:(uint32_t)h
+                    codec:(VideoCodec)codec
+                    color:(ColorProfile)color
+                      fps:(double)fps
+                     mbps:(double)mbps
+               avgFrameMs:(double)avgMs
+                 jitterMs:(double)jitterMs
+              totalFrames:(uint64_t)total
+                    drops:(uint32_t)drops
+                keyframes:(uint32_t)keyframes {
     _currentWidth = w;
     _currentHeight = h;
     _currentCodec = codec;
     _currentColor = color;
     _currentFps = fps;
+    _currentMbps = mbps;
+    _avgFrameMs = avgMs;
+    _frameJitterMs = jitterMs;
+    _totalFrames = total;
+    _dropCount = drops;
+    _keyframeCount = keyframes;
     [self refreshTitle];
 }
 
@@ -1521,9 +1797,21 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
             continue;
         }
 
+        NSString *connectedHostNs = [NSString stringWithUTF8String:host.c_str()];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            controller.activeTransportHost = connectedHostNs;
+        });
+
         auto lastPing = std::chrono::steady_clock::now();
         auto lastFpsTick = lastPing;
+        auto lastFrameTime = std::chrono::steady_clock::time_point{};
         uint32_t decodedFpsFrames = 0;
+        uint64_t videoBytesWindow = 0;
+        uint64_t totalFrames = 0;
+        uint32_t dropCount = 0;
+        uint32_t keyframeCount = 0;
+        double avgIntervalMs = 16.67;
+        double jitterMs = 0.0;
 
         while (*running) {
             int reqAudioIdx = [controller consumePendingPcAudioSource];
@@ -1533,6 +1821,13 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
                 req.type = PACKET_TYPE_SET_AUDIO_SRC;
                 req.extra1 = static_cast<uint32_t>(static_cast<int32_t>(reqAudioIdx));
                 send(sock, &req, sizeof(req), 0);
+            }
+
+            if ([controller consumePendingKeyframeReq]) {
+                PacketHeader kreq = {};
+                kreq.magic = PACKET_MAGIC;
+                kreq.type = PACKET_TYPE_KEYFRAME_REQ;
+                send(sock, &kreq, sizeof(kreq), 0);
             }
 
             // Periodic 1Hz RTT ping
@@ -1570,14 +1865,16 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
                 VideoCodec codec = static_cast<VideoCodec>(hello.codec);
                 ColorProfile color = static_cast<ColorProfile>(hello.colorProfile);
                 uint16_t hflags = hello.flags;
+                uint32_t aRate = hello.audioSampleRate > 0 ? hello.audioSampleRate : 48000;
 
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    controller.pcHostName = name.length ? name : [NSString stringWithUTF8String:host.c_str()];
+                    controller.pcHostName = name.length ? name : connectedHostNs;
                     controller.currentWidth = w;
                     controller.currentHeight = h;
                     controller.currentCodec = codec;
                     controller.currentColor = color;
                     controller.pcHelloFlags = hflags;
+                    controller.pcAudioRate = aRate;
                     [controller.videoView setVideoDimensions:w height:h hdr:(color == COLOR_HDR10_PQ)];
                     [controller refreshTitle];
                 });
@@ -1587,20 +1884,54 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
                 if (codec != CODEC_H264 && codec != CODEC_HEVC) codec = controller.currentCodec;
                 if (color != COLOR_SDR_BT709 && color != COLOR_HDR10_PQ) color = controller.currentColor;
 
+                if ((hdr.flags & 1) != 0) keyframeCount++;
+                videoBytesWindow += hdr.payloadSize;
+
+                auto frameNow = std::chrono::steady_clock::now();
+                if (lastFrameTime.time_since_epoch().count() > 0) {
+                    double dtMs = std::chrono::duration<double, std::milli>(frameNow - lastFrameTime).count();
+                    if (dtMs > 0.5 && dtMs < 500.0) {
+                        avgIntervalMs = avgIntervalMs * 0.90 + dtMs * 0.10;
+                        double dev = std::abs(dtMs - avgIntervalMs);
+                        jitterMs = jitterMs * 0.90 + dev * 0.10;
+                    }
+                }
+                lastFrameTime = frameNow;
+
                 if (decoder.decodeAndPresent(payloadBuf.data(), hdr.payloadSize, codec, color, controller.videoView.displayLayer)) {
                     decodedFpsFrames++;
-                    auto fpsNow = std::chrono::steady_clock::now();
-                    double dt = std::chrono::duration<double>(fpsNow - lastFpsTick).count();
-                    if (dt >= 0.5) {
-                        double fps = decodedFpsFrames / dt;
-                        decodedFpsFrames = 0;
-                        lastFpsTick = fpsNow;
-                        uint32_t w = controller.currentWidth;
-                        uint32_t h = controller.currentHeight;
-                        dispatch_async(dispatch_get_main_queue(), ^{
-                            [controller updateRenderStats:w height:h codec:codec color:color fps:fps];
-                        });
-                    }
+                    totalFrames++;
+                } else {
+                    dropCount++;
+                }
+
+                double dt = std::chrono::duration<double>(frameNow - lastFpsTick).count();
+                if (dt >= 0.5) {
+                    double fps = decodedFpsFrames / dt;
+                    double mbps = (static_cast<double>(videoBytesWindow) * 8.0) / (dt * 1000000.0);
+                    decodedFpsFrames = 0;
+                    videoBytesWindow = 0;
+                    lastFpsTick = frameNow;
+                    uint32_t w = controller.currentWidth;
+                    uint32_t h = controller.currentHeight;
+                    double snapAvg = avgIntervalMs;
+                    double snapJit = jitterMs;
+                    uint64_t snapTot = totalFrames;
+                    uint32_t snapDrop = dropCount;
+                    uint32_t snapIdr = keyframeCount;
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [controller updateRenderStats:w
+                                               height:h
+                                                codec:codec
+                                                color:color
+                                                  fps:fps
+                                                 mbps:mbps
+                                           avgFrameMs:snapAvg
+                                             jitterMs:snapJit
+                                          totalFrames:snapTot
+                                                drops:snapDrop
+                                            keyframes:snapIdr];
+                    });
                 }
             } else if (hdr.type == PACKET_TYPE_AUDIO && hdr.payloadSize > 0) {
                 [controller.audioPlayer playPcm:payloadBuf.data() length:hdr.payloadSize sampleRate:hdr.extra1];
