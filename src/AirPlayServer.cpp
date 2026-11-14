@@ -215,8 +215,8 @@ void AirPlayServer::broadcastVideo(std::shared_ptr<const EncodedFrame> frame) {
                         c->videoQueue.clear();
                     }
                 }
-                if (c->videoQueue.size() > 6) {
-                    // 6-frame cap preserves high-FPS burst absorption while signaling real link congestion
+                if (c->videoQueue.size() > 10) {
+                    // 10-frame cap absorbs brief 3D action bursts without triggering an IDR keyframe storm
                     congested = true;
                     c->videoQueue.clear();
                     if (!frame->isKeyframe) {
@@ -555,7 +555,7 @@ void AirPlayServer::runClient(std::shared_ptr<ClientSession> session) {
             }
             auto txMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - txStart).count();
-            if (txMs > 28) {
+            if (txMs > 18) {
                 std::function<void(bool)> congFn;
                 {
                     std::lock_guard<std::mutex> ilock(m_infoMutex);

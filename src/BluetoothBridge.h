@@ -1,4 +1,4 @@
-jab #pragma once
+#pragma once
 
 #include "Common.h"
 #include <functional>

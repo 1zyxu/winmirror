@@ -518,10 +518,11 @@ bool Encoder::initVideoProcessor(DXGI_FORMAT srcFormat, bool useP010) {
     contentDesc.OutputFrameRate.Denominator = 1;
     contentDesc.OutputWidth = m_width;
     contentDesc.OutputHeight = m_height;
+    // Optimal speed first avoids heavy VideoProcessor shader stalls behind 99%-loaded 3D games
     static const D3D11_VIDEO_USAGE kUsageOrder[] = {
-        D3D11_VIDEO_USAGE_OPTIMAL_QUALITY,
+        D3D11_VIDEO_USAGE_OPTIMAL_SPEED,
         D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
-        D3D11_VIDEO_USAGE_OPTIMAL_SPEED
+        D3D11_VIDEO_USAGE_OPTIMAL_QUALITY
     };
     hr = E_FAIL;
     for (D3D11_VIDEO_USAGE u : kUsageOrder) {
@@ -636,7 +637,7 @@ bool Encoder::configureMftTypes(const GUID& outputSubtype, bool wantP010, UINT32
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonQualityVsSpeed, 30);
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonMeanBitRate, bitrate);
-        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonBufferSize, bitrate / 3);
+        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonBufferSize, bitrate / 8);
         setCodecUint32(m_codecApi, CODECAPI_AVEncMPVDefaultBPictureCount, 0);
         UINT32 gopSize = std::min<UINT32>(600u, std::max<UINT32>(120u, m_fps * 4u));
         setCodecUint32(m_codecApi, CODECAPI_AVEncMPVGOPSize, gopSize);
@@ -1224,7 +1225,7 @@ void Encoder::notifyNetworkHealth(bool congested) {
     if (congested) {
         m_lastCongestionMs.store(nowMs);
         uint64_t prevAdj = m_lastRateAdjustMs.load();
-        if (prevAdj != 0 && nowMs - prevAdj < 1500ULL) return;
+        if (prevAdj != 0 && nowMs - prevAdj < 500ULL) return;
         m_lastRateAdjustMs.store(nowMs);
         m_bitrateScalePct.store(stepBitrateScalePct(m_bitrateScalePct.load(), true));
     } else if (m_bitrateScalePct.load() < 100) {

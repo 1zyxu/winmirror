@@ -2270,7 +2270,7 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
                                 vq.dropCount += static_cast<uint32_t>(vq.queue.size());
                                 vq.queue.clear();
                             }
-                        } else if (vq.queue.size() >= 8) {
+                        } else if (vq.queue.size() >= 10) {
                             // Emergency catch-up only on large outage; small Wi-Fi bursts catch up cleanly without IDR freeze
                             vq.dropCount += static_cast<uint32_t>(vq.queue.size()) + 1;
                             vq.queue.clear();

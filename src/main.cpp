@@ -457,6 +457,7 @@ int main(int argc, char* argv[]) {
         std::mutex mutex;
         std::condition_variable cv;
         uint64_t seq = 1; // initial frame already acquired above when ready
+        std::atomic<uint64_t> consumedSeq{0};
     } frameShare;
 
     auto notifyKeyframe = [&encoder, &frameShare]() {
@@ -502,10 +503,13 @@ int main(int argc, char* argv[]) {
 
     // Decoupled high-priority Capture + Cursor thread so NVENC/PCIe stalls never block DXGI ReleaseFrame or mouse input
     uint32_t dxgiWaitMs = (targetFps > 60 || unlimitedFps) ? 1u : 4u;
+    const auto minCapGap = std::chrono::microseconds(unlimitedFps ? 0 : (750000 / targetFps));
     std::thread captureThread([&]() {
         HANDLE hCapMmcss = rt.enterMmcss(L"Games");
         std::vector<uint8_t> curBgra;
         CursorPayload curMeta = {};
+        auto lastAcqTime = std::chrono::steady_clock::now();
+        uint64_t localSeq = 1;
         while (g_running) {
             if (capture.pollCursor(curMeta, curBgra, false)) {
                 server.broadcastCursor(curMeta, curBgra);
@@ -514,10 +518,19 @@ int main(int argc, char* argv[]) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(16));
                 continue;
             }
+            // Avoid lapping encodeThread or double-copying 200+ Hz game frames on the shared D3D11 context
+            auto capNow = std::chrono::steady_clock::now();
+            if ((localSeq > frameShare.consumedSeq.load() + 1) ||
+                (!unlimitedFps && (capNow - lastAcqTime) < minCapGap)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
             if (capture.acquireFrame(dxgiWaitMs)) {
+                lastAcqTime = std::chrono::steady_clock::now();
                 {
                     std::lock_guard<std::mutex> lock(frameShare.mutex);
                     frameShare.seq++;
+                    localSeq = frameShare.seq;
                 }
                 frameShare.cv.notify_one();
             }
@@ -609,6 +622,7 @@ int main(int argc, char* argv[]) {
             bool gotNewScreen = (curSeq != lastEncodedSeq);
             if (gotNewScreen || encoder.hasKeyframeRequest() || !encoder.hasEmittedKeyframe()) {
                 lastEncodedSeq = curSeq;
+                frameShare.consumedSeq.store(curSeq);
 
                 auto encodeNow = std::chrono::steady_clock::now();
                 uint64_t ptsUs = std::chrono::duration_cast<std::chrono::microseconds>(encodeNow - startTime).count();
