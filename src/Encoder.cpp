@@ -266,12 +266,17 @@ bool Encoder::initNvUploadTextures(bool useP010) {
     gpuDesc.Format = fmt;
     gpuDesc.SampleDesc.Count = 1;
     gpuDesc.Usage = D3D11_USAGE_DEFAULT;
-    gpuDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | kBindVideoEncoder;
+    // NVENC MFT with D3D11 manager accepts textures with RENDER_TARGET binding cleanly.
+    gpuDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | kBindVideoEncoder;
 
     for (int i = 0; i < kVpRingSize; ++i) {
         HRESULT hr = m_nvDevice->CreateTexture2D(&gpuDesc, nullptr, &m_nvGpuTex[i]);
         if (FAILED(hr) || !m_nvGpuTex[i]) {
-            gpuDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            gpuDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            hr = m_nvDevice->CreateTexture2D(&gpuDesc, nullptr, &m_nvGpuTex[i]);
+        }
+        if (FAILED(hr) || !m_nvGpuTex[i]) {
+            gpuDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
             hr = m_nvDevice->CreateTexture2D(&gpuDesc, nullptr, &m_nvGpuTex[i]);
         }
         if (FAILED(hr) || !m_nvGpuTex[i]) {
@@ -628,7 +633,7 @@ bool Encoder::configureMftTypes(const GUID& outputSubtype, bool wantP010, UINT32
         if (!m_codecApi) return;
         setCodecBool(m_codecApi, CODECAPI_AVLowLatencyMode, true);
         setCodecBool(m_codecApi, CODECAPI_AVEncCommonRealTime, true);
-        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonQualityVsSpeed, 45);
+        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonQualityVsSpeed, 30);
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonMeanBitRate, bitrate);
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonBufferSize, bitrate / 3);
@@ -1051,14 +1056,14 @@ bool Encoder::shouldRetryWithFallback(bool inputAccepted, bool asyncTimedOut) {
         return advanceFallback();
     }
     if (asyncTimedOut) {
-        if (!m_hasEmittedKeyframe && ++m_waitTimeouts >= 3) {
+        if (!m_hasEmittedKeyframe && ++m_waitTimeouts >= 6) {
             std::cerr << "[Encoder] Async MFT input timeout - switching encoder..." << std::endl;
             return advanceFallback();
         }
         return false;
     }
-    if ((!m_hasProducedOutput && m_submittedWithoutOutput >= 5) ||
-        (!m_hasEmittedKeyframe && m_submittedWithoutOutput >= 8)) {
+    if ((!m_hasProducedOutput && m_submittedWithoutOutput >= 12) ||
+        (!m_hasEmittedKeyframe && m_submittedWithoutOutput >= 16)) {
         std::cerr << "[Encoder] MFT produced 0 keyframes after " << m_submittedWithoutOutput
                   << " frames - switching encoder..." << std::endl;
         return advanceFallback();
@@ -1251,6 +1256,13 @@ bool Encoder::submitSampleToMft(IMFSample* sample, std::vector<uint8_t>& outAnne
     sample->Release();
 
     if (FAILED(hr)) {
+        // Async MFTs return MF_E_NOTACCEPTING while backpressured; drain outputs rather than falling back to CPU.
+        if (hr == MF_E_NOTACCEPTING) {
+            outInputAccepted = true;
+            if (m_isAsync) {
+                pumpAsyncEvents(true);
+            }
+        }
         return popPendingFrame(outAnnexB, outIsKeyframe);
     }
 

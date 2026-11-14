@@ -42,7 +42,7 @@ inline uint32_t computeBitrateMbps(uint32_t width, uint32_t height, uint32_t fps
 inline int stepBitrateScalePct(int currentPct, bool congested) {
     if (congested) {
         int next = currentPct - 15;
-        return next < 60 ? 60 : next;
+        return next < 30 ? 30 : next;
     }
     int next = currentPct + 10;
     return next > 100 ? 100 : next;

@@ -402,15 +402,15 @@ bool ScreenCapture::initGpuCapture() {
         m_gpuReinitFails = 0;
         return true;
     }
-    // 2) Try Windows.Graphics.Capture (reliable on static desktops, Optimus hybrid GPUs, and games)
-    if (initWgc()) {
-        m_mode = CaptureMode::Wgc;
+    // 2) Static DXGI Desktop Duplication avoids WGC DWM compositor throttling on hybrid GPUs/games
+    if (initDxgi(false)) {
+        m_mode = CaptureMode::Dxgi;
         m_gpuReinitFails = 0;
         return true;
     }
-    // 3) Fallback DXGI pass accepting initial static frame (Win <1903 or when WGC unavailable)
-    if (initDxgi(false)) {
-        m_mode = CaptureMode::Dxgi;
+    // 3) Fallback Windows.Graphics.Capture if DXGI is blocked (e.g. Optimus cross-adapter)
+    if (initWgc()) {
+        m_mode = CaptureMode::Wgc;
         m_gpuReinitFails = 0;
         return true;
     }
@@ -903,7 +903,7 @@ bool ScreenCapture::initWgcOnAdapter(IDXGIAdapter1* adapter, HMONITOR hMon, cons
         closeAndReleaseWinRt<WgcFramePool>(m_wgcPool);
 
         WgcFramePool* pool = nullptr;
-        hr = statics2->lpVtbl->Create(statics2, wgcDev, static_cast<int32_t>(candFmt), 2, itemSize, &pool);
+        hr = statics2->lpVtbl->Create(statics2, wgcDev, static_cast<int32_t>(candFmt), 3, itemSize, &pool);
         if (FAILED(hr) || !pool) continue;
         m_wgcPool = pool;
         m_wgcPoolW = itemSize.Width;

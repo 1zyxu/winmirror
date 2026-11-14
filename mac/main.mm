@@ -582,8 +582,6 @@ static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObject
         _displayLayer.backgroundColor = [NSColor blackColor].CGColor;
         _displayLayer.wantsExtendedDynamicRangeContent = NO;
         _displayLayer.contentsScale = [[NSScreen mainScreen] backingScaleFactor];
-        _displayLayer.minificationFilter = kCAFilterTrilinear;
-        _displayLayer.magnificationFilter = kCAFilterTrilinear;
         [self.layer addSublayer:_displayLayer];
 
         _cursorLayer = [CALayer layer];
@@ -1442,7 +1440,8 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
                     };
 
                     IOBluetoothSDPServiceRecord *rec = findRec(dev);
-                    if (!rec && (passCount == 0 || (passCount % 3 == 0) || [dev isConnected])) {
+                    // Rate-limit SDP sweeps on shared 2.4GHz Wi-Fi/BT combo radios to prevent Wi-Fi stalls.
+                    if (!rec && (passCount == 0 || (passCount % 6 == 0))) {
                         [dev performSDPQuery:nil];
                         usleep(400000);
                         rec = findRec(dev);
@@ -1469,7 +1468,7 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
                 }
                 passCount++;
             }
-            sleep(3);
+            sleep(5);
         }
     });
 }

@@ -1,4 +1,4 @@
-#pragma once
+jab #pragma once
 
 #include "Common.h"
 #include <functional>
@@ -33,6 +33,7 @@ private:
     std::atomic<bool> m_btConnected{false};
 
     SOCKET m_listenSock = INVALID_SOCKET;
+    bool m_wsaStarted = false;
     std::mutex m_clientMutex;
     SOCKET m_clientSock = INVALID_SOCKET;
     std::thread m_thread;

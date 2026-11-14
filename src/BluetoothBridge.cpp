@@ -37,6 +37,9 @@ void BluetoothBridge::detectPairedDevices() {
         std::lock_guard<std::mutex> lock(m_metaMutex);
         m_radioName = wideToUtf8(radioInfo.szName);
     }
+    if (!BluetoothIsConnectable(hRadio)) {
+        BluetoothEnableIncomingConnections(hRadio, TRUE);
+    }
     CloseHandle(hRadio);
     BluetoothFindRadioClose(hFindRadio);
 
@@ -74,6 +77,11 @@ bool BluetoothBridge::start(const std::string& ipsCsv, uint32_t width, uint32_t 
         return false;
     }
 
+    if (!m_wsaStarted) {
+        WSADATA wsaData = {};
+        m_wsaStarted = (WSAStartup(MAKEWORD(2, 2), &wsaData) == 0);
+    }
+
     m_listenSock = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
     if (m_listenSock == INVALID_SOCKET) {
         m_radioAvailable = false;
@@ -97,37 +105,42 @@ bool BluetoothBridge::start(const std::string& ipsCsv, uint32_t width, uint32_t 
         return false;
     }
 
+    // Publish Windows Bluetooth SDP Record before listen() (NS_BTH requires Unicode WSAQUERYSETW)
+    GUID serviceUuid = WINMIRROR_BT_SERVICE_UUID;
+    wchar_t svcName[] = L"WinMirror AirPlay BT";
+    wchar_t svcComment[] = L"WinMirror AirPlay Bluetooth Discovery & Control";
+
+    auto tryRegisterSdp = [&](bool setRemoteAddr) -> int {
+        CSADDR_INFO csAddr = {};
+        csAddr.LocalAddr.lpSockaddr = reinterpret_cast<LPSOCKADDR>(&sa);
+        csAddr.LocalAddr.iSockaddrLength = sizeof(sa);
+        if (setRemoteAddr) {
+            csAddr.RemoteAddr.lpSockaddr = reinterpret_cast<LPSOCKADDR>(&sa);
+            csAddr.RemoteAddr.iSockaddrLength = sizeof(sa);
+        }
+        csAddr.iSocketType = SOCK_STREAM;
+        csAddr.iProtocol = BTHPROTO_RFCOMM;
+
+        WSAQUERYSETW wsaq = {};
+        wsaq.dwSize = sizeof(wsaq);
+        wsaq.lpszServiceInstanceName = svcName;
+        wsaq.lpServiceClassId = &serviceUuid;
+        wsaq.lpszComment = svcComment;
+        wsaq.dwNameSpace = NS_BTH;
+        wsaq.dwNumberOfCsAddrs = 1;
+        wsaq.lpcsaBuffer = &csAddr;
+        return (WSASetServiceW(&wsaq, RNRSERVICE_REGISTER, 0) == SOCKET_ERROR) ? WSAGetLastError() : 0;
+    };
+
+    int sdpErr = tryRegisterSdp(false);
+    if (sdpErr != 0) {
+        sdpErr = tryRegisterSdp(true);
+    }
+
     if (listen(m_listenSock, 4) == SOCKET_ERROR) {
         closesocket(m_listenSock);
         m_listenSock = INVALID_SOCKET;
         return false;
-    }
-
-    // Publish Windows Bluetooth SDP Record so macOS IOBluetooth auto-discovers this RFCOMM channel
-    // NS_BTH only supports Unicode WSAQUERYSETW / WSASetServiceW (ANSI WSASetServiceA fails silently).
-    GUID serviceUuid = WINMIRROR_BT_SERVICE_UUID;
-    CSADDR_INFO csAddr = {};
-    csAddr.LocalAddr.lpSockaddr = reinterpret_cast<LPSOCKADDR>(&sa);
-    csAddr.LocalAddr.iSockaddrLength = sizeof(sa);
-    csAddr.RemoteAddr.lpSockaddr = reinterpret_cast<LPSOCKADDR>(&sa);
-    csAddr.RemoteAddr.iSockaddrLength = sizeof(sa);
-    csAddr.iSocketType = SOCK_STREAM;
-    csAddr.iProtocol = BTHPROTO_RFCOMM;
-
-    wchar_t svcName[] = L"WinMirror AirPlay BT";
-    wchar_t svcComment[] = L"WinMirror AirPlay Bluetooth Discovery & Control";
-    WSAQUERYSETW wsaq = {};
-    wsaq.dwSize = sizeof(wsaq);
-    wsaq.lpszServiceInstanceName = svcName;
-    wsaq.lpServiceClassId = &serviceUuid;
-    wsaq.lpszComment = svcComment;
-    wsaq.dwNameSpace = NS_BTH;
-    wsaq.dwNumberOfCsAddrs = 1;
-    wsaq.lpcsaBuffer = &csAddr;
-
-    int sdpErr = 0;
-    if (WSASetServiceW(&wsaq, RNRSERVICE_REGISTER, 0) == SOCKET_ERROR) {
-        sdpErr = WSAGetLastError();
     }
 
     std::cout << "[Bluetooth] Radio: " << m_radioName
@@ -160,6 +173,10 @@ void BluetoothBridge::stop() {
     }
     if (m_thread.joinable()) {
         m_thread.join();
+    }
+    if (m_wsaStarted) {
+        WSACleanup();
+        m_wsaStarted = false;
     }
 }
 

@@ -127,8 +127,8 @@ void AirPlayServer::acceptLoop() {
         int nodelay = 1;
         setsockopt(clientSock, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
 
-        // 512 KB send buffer fits full IDR keyframes without blocking sendAll() in userspace over Wi-Fi
-        int sndbuf = 512 * 1024;
+        // 256 KB send buffer fits IDR keyframes cleanly while preventing Wi-Fi TCP bufferbloat
+        int sndbuf = 256 * 1024;
         setsockopt(clientSock, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&sndbuf), sizeof(sndbuf));
 
         int tos = 0x88; // DSCP AF41 multimedia low-latency class (best-effort)
@@ -547,9 +547,22 @@ void AirPlayServer::runClient(std::shared_ptr<ClientSession> session) {
             uint32_t extra1 = (static_cast<uint32_t>(videoFrame->codec) << 24) |
                               (static_cast<uint32_t>(videoFrame->colorProfile) << 16) |
                               (videoFrame->width & 0xFFFF);
-            if (!sendPacket(session->sock, PACKET_TYPE_VIDEO, flags, extra1, videoFrame->ptsMs,
-                            videoFrame->data.data(), static_cast<uint32_t>(videoFrame->data.size()), &session->txBuf)) {
+            auto txStart = std::chrono::steady_clock::now();
+            bool sentOk = sendPacket(session->sock, PACKET_TYPE_VIDEO, flags, extra1, videoFrame->ptsMs,
+                                     videoFrame->data.data(), static_cast<uint32_t>(videoFrame->data.size()), &session->txBuf);
+            if (!sentOk) {
                 break;
+            }
+            auto txMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - txStart).count();
+            if (txMs > 28) {
+                std::function<void(bool)> congFn;
+                {
+                    std::lock_guard<std::mutex> ilock(m_infoMutex);
+                    m_cleanBroadcastCount = 0;
+                    congFn = m_onCongestion;
+                }
+                if (congFn) congFn(true);
             }
         }
     }
