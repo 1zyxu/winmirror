@@ -1,4 +1,5 @@
 #include "HttpServer.h"
+#include "Updater.h"
 #include <iostream>
 #include <sstream>
 #include <cstring>
@@ -133,8 +134,8 @@ static const char* INDEX_HTML = R"rawhtml(<!DOCTYPE html>
 </body>
 </html>)rawhtml";
 
-HttpServer::HttpServer(FrameBuffer& frameBuffer, int port)
-    : m_frameBuffer(frameBuffer), m_port(port) {}
+HttpServer::HttpServer(FrameBuffer& frameBuffer, AudioBuffer& audioBuffer, int port)
+    : m_frameBuffer(frameBuffer), m_audioBuffer(audioBuffer), m_port(port) {}
 
 HttpServer::~HttpServer() {
     stop();
@@ -255,6 +256,9 @@ void HttpServer::handleClient(SOCKET clientSock) {
     } else if (path == "/api/status") {
         handleStatus(clientSock);
         closesocket(clientSock);
+    } else if (path == "/api/update") {
+        handleTriggerUpdate(clientSock);
+        closesocket(clientSock);
     } else {
         const char* notFound = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
         send(clientSock, notFound, static_cast<int>(strlen(notFound)), 0);
@@ -275,23 +279,41 @@ void HttpServer::handleRaw(SOCKET clientSock) {
     }
 
     uint64_t lastFrame = 0;
+    std::vector<std::vector<uint8_t>> audioChunks;
+
     while (m_running) {
-        FrameData frame;
-        if (!m_frameBuffer.getLatest(frame, lastFrame)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            continue;
+        // 1. Deliver pending audio packets first with zero delay
+        if (m_audioBuffer.popAll(audioChunks)) {
+            for (const auto& chunk : audioChunks) {
+                PacketHeader ah = {};
+                ah.magic = PACKET_MAGIC;
+                ah.type = PACKET_TYPE_AUDIO;
+                ah.payloadSize = static_cast<uint32_t>(chunk.size());
+                ah.extra1 = 48000;
+                ah.extra2 = 2 | (16 << 16);
+
+                if (send(clientSock, reinterpret_cast<const char*>(&ah), sizeof(ah), 0) <= 0) return;
+                if (send(clientSock, reinterpret_cast<const char*>(chunk.data()), static_cast<int>(chunk.size()), 0) <= 0) return;
+            }
         }
 
-        lastFrame = frame.frameNumber;
+        // 2. Deliver latest video frame
+        FrameData frame;
+        if (m_frameBuffer.getLatest(frame, lastFrame)) {
+            lastFrame = frame.frameNumber;
 
-        RawFrameHeader header = {};
-        header.magic = RAW_FRAME_MAGIC;
-        header.width = frame.width;
-        header.height = frame.height;
-        header.payloadSize = static_cast<uint32_t>(frame.jpegData.size());
+            PacketHeader vh = {};
+            vh.magic = PACKET_MAGIC;
+            vh.type = PACKET_TYPE_VIDEO;
+            vh.payloadSize = static_cast<uint32_t>(frame.jpegData.size());
+            vh.extra1 = frame.width;
+            vh.extra2 = frame.height;
 
-        if (send(clientSock, reinterpret_cast<const char*>(&header), sizeof(header), 0) <= 0) break;
-        if (send(clientSock, reinterpret_cast<const char*>(frame.jpegData.data()), static_cast<int>(frame.jpegData.size()), 0) <= 0) break;
+            if (send(clientSock, reinterpret_cast<const char*>(&vh), sizeof(vh), 0) <= 0) return;
+            if (send(clientSock, reinterpret_cast<const char*>(frame.jpegData.data()), static_cast<int>(frame.jpegData.size()), 0) <= 0) return;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 }
 
@@ -385,4 +407,14 @@ void HttpServer::handleStatus(SOCKET clientSock) {
        << body;
     std::string resp = ss.str();
     send(clientSock, resp.c_str(), static_cast<int>(resp.size()), 0);
+}
+
+void HttpServer::handleTriggerUpdate(SOCKET clientSock) {
+    const char* resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"status\":\"updating\"}";
+    send(clientSock, resp, static_cast<int>(strlen(resp)), 0);
+
+    std::thread([]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        Updater::checkForUpdates(true);
+    }).detach();
 }

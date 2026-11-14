@@ -1,6 +1,7 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
 #import <ImageIO/ImageIO.h>
+#import <AudioToolbox/AudioToolbox.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -11,16 +12,93 @@
 #include <atomic>
 #include <vector>
 
-#define RAW_FRAME_MAGIC 0x52494D57 // 'WMIR'
+#define PACKET_MAGIC 0x574D4952 // 'WMIR'
+
+enum PacketType : uint16_t {
+    PACKET_TYPE_VIDEO = 0x01,
+    PACKET_TYPE_AUDIO = 0x02,
+    PACKET_TYPE_PING  = 0x03
+};
 
 #pragma pack(push, 1)
-struct RawFrameHeader {
+struct PacketHeader {
     uint32_t magic;
-    uint32_t width;
-    uint32_t height;
+    uint16_t type;
+    uint16_t flags;
     uint32_t payloadSize;
+    uint32_t extra1;
+    uint32_t extra2;
 };
 #pragma pack(pop)
+
+static void MyAudioQueueCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueBufferRef inBuffer) {
+    AudioQueueFreeBuffer(inAQ, inBuffer);
+}
+
+@interface MacAudioPlayer : NSObject
+- (void)playPcm:(const uint8_t *)data length:(size_t)len;
+- (void)stop;
+@end
+
+@implementation MacAudioPlayer {
+    AudioQueueRef _audioQueue;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        AudioStreamBasicDescription format = {};
+        format.mSampleRate = 48000.0;
+        format.mFormatID = kAudioFormatLinearPCM;
+        format.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+        format.mFramesPerPacket = 1;
+        format.mChannelsPerFrame = 2;
+        format.mBitsPerChannel = 16;
+        format.mBytesPerFrame = 4;
+        format.mBytesPerPacket = 4;
+
+        OSStatus status = AudioQueueNewOutput(
+            &format,
+            MyAudioQueueCallback,
+            (__bridge void *)self,
+            NULL,
+            kCFRunLoopCommonModes,
+            0,
+            &_audioQueue
+        );
+
+        if (status == noErr) {
+            AudioQueueStart(_audioQueue, NULL);
+        }
+    }
+    return self;
+}
+
+- (void)playPcm:(const uint8_t *)data length:(size_t)len {
+    if (!_audioQueue || len == 0) return;
+
+    AudioQueueBufferRef buf = NULL;
+    OSStatus status = AudioQueueAllocateBuffer(_audioQueue, (UInt32)len, &buf);
+    if (status == noErr && buf) {
+        memcpy(buf->mAudioData, data, len);
+        buf->mAudioDataByteSize = (UInt32)len;
+        AudioQueueEnqueueBuffer(_audioQueue, buf, 0, NULL);
+    }
+}
+
+- (void)stop {
+    if (_audioQueue) {
+        AudioQueueStop(_audioQueue, true);
+        AudioQueueDispose(_audioQueue, true);
+        _audioQueue = NULL;
+    }
+}
+
+- (void)dealloc {
+    [self stop];
+}
+
+@end
 
 @interface RenderView : NSView
 - (void)updateWithCGImage:(CGImageRef)image;
@@ -50,6 +128,7 @@ struct RawFrameHeader {
 @interface MirrorWindowController : NSObject <NSWindowDelegate>
 @property (nonatomic, strong) NSWindow *window;
 @property (nonatomic, strong) RenderView *renderView;
+@property (nonatomic, strong) MacAudioPlayer *audioPlayer;
 @property (nonatomic, assign) NSInteger frameCount;
 @property (nonatomic, assign) NSTimeInterval lastFpsTime;
 @property (nonatomic, strong) NSString *hostName;
@@ -65,9 +144,11 @@ struct RawFrameHeader {
     self = [super init];
     if (self) {
         _hostName = host;
+        _audioPlayer = [[MacAudioPlayer alloc] init];
+
         NSRect screenRect = [[NSScreen mainScreen] visibleFrame];
-        NSRect frame = NSMakeRect(screenRect.origin.x + 50, screenRect.origin.y + 50,
-                                  screenRect.size.width - 100, screenRect.size.height - 100);
+        NSRect frame = NSMakeRect(screenRect.origin.x + 40, screenRect.origin.y + 40,
+                                  screenRect.size.width - 80, screenRect.size.height - 80);
 
         NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                            NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
@@ -91,7 +172,7 @@ struct RawFrameHeader {
     return self;
 }
 
-- (void)pushFrameData:(const uint8_t *)bytes length:(size_t)len width:(uint32_t)w height:(uint32_t)h {
+- (void)pushVideoData:(const uint8_t *)bytes length:(size_t)len width:(uint32_t)w height:(uint32_t)h {
     self.currentWidth = w;
     self.currentHeight = h;
 
@@ -128,11 +209,15 @@ struct RawFrameHeader {
                 double fps = (self.frameCount) / (now - self.lastFpsTime);
                 self.frameCount = 0;
                 self.lastFpsTime = now;
-                [self.window setTitle:[NSString stringWithFormat:@"WinMirror Pro — %ux%u | %.0f FPS",
+                [self.window setTitle:[NSString stringWithFormat:@"WinMirror Pro — %ux%u | %.0f FPS (Live Audio)",
                                       self.currentWidth, self.currentHeight, fps]];
             }
         });
     }
+}
+
+- (void)pushAudioData:(const uint8_t *)bytes length:(size_t)len {
+    [self.audioPlayer playPcm:bytes length:len];
 }
 
 - (void)keyDown:(NSEvent *)event {
@@ -143,6 +228,7 @@ struct RawFrameHeader {
 }
 
 - (void)windowWillClose:(NSNotification *)notification {
+    [self.audioPlayer stop];
     exit(0);
 }
 
@@ -187,11 +273,9 @@ static void streamWorker(MirrorWindowController *controller, std::string host, i
             continue;
         }
 
-        // Request ultra-fast raw binary stream
         std::string req = "GET /raw HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n";
         send(sock, req.c_str(), req.size(), 0);
 
-        // Read until HTTP header boundary "\r\n\r\n"
         std::string headerBuf;
         char ch;
         while (headerBuf.find("\r\n\r\n") == std::string::npos) {
@@ -204,15 +288,14 @@ static void streamWorker(MirrorWindowController *controller, std::string host, i
         payloadBuf.reserve(1024 * 1024);
 
         while (*running) {
-            RawFrameHeader header = {};
+            PacketHeader header = {};
             if (!recvExact(sock, &header, sizeof(header))) break;
 
-            if (header.magic != RAW_FRAME_MAGIC) {
-                // Out of sync, reconnect
+            if (header.magic != PACKET_MAGIC) {
                 break;
             }
 
-            if (header.payloadSize == 0 || header.payloadSize > 10 * 1024 * 1024) {
+            if (header.payloadSize == 0 || header.payloadSize > 15 * 1024 * 1024) {
                 break;
             }
 
@@ -222,10 +305,15 @@ static void streamWorker(MirrorWindowController *controller, std::string host, i
 
             if (!recvExact(sock, payloadBuf.data(), header.payloadSize)) break;
 
-            [controller pushFrameData:payloadBuf.data()
-                               length:header.payloadSize
-                                width:header.width
-                               height:header.height];
+            if (header.type == PACKET_TYPE_VIDEO) {
+                [controller pushVideoData:payloadBuf.data()
+                                   length:header.payloadSize
+                                    width:header.extra1
+                                   height:header.extra2];
+            } else if (header.type == PACKET_TYPE_AUDIO) {
+                [controller pushAudioData:payloadBuf.data()
+                                   length:header.payloadSize];
+            }
         }
 
         close(sock);

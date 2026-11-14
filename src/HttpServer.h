@@ -7,7 +7,7 @@
 
 class HttpServer {
 public:
-    HttpServer(FrameBuffer& frameBuffer, int port = DEFAULT_PORT);
+    HttpServer(FrameBuffer& frameBuffer, AudioBuffer& audioBuffer, int port = DEFAULT_PORT);
     ~HttpServer();
 
     bool start();
@@ -24,8 +24,10 @@ private:
     void handleIndex(SOCKET clientSock);
     void handleSnapshot(SOCKET clientSock);
     void handleStatus(SOCKET clientSock);
+    void handleTriggerUpdate(SOCKET clientSock);
 
     FrameBuffer& m_frameBuffer;
+    AudioBuffer& m_audioBuffer;
     int m_port;
     SOCKET m_listenSock = INVALID_SOCKET;
     std::atomic<bool> m_running{false};

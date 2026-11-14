@@ -4,6 +4,7 @@
 #include "HttpServer.h"
 #include "Beacon.h"
 #include "Updater.h"
+#include "AudioCapture.h"
 
 #include <iostream>
 #include <iomanip>
@@ -61,9 +62,9 @@ static void ensureAdminPrivileges(int argc, char* argv[]) {
 
 static void printLocalIps(int port) {
     std::cout << "========================================================" << std::endl;
-    std::cout << "  WINMIRROR v" << WINMIRROR_VERSION << " -- High Performance Screen Mirror" << std::endl;
+    std::cout << "  WINMIRROR Pro v" << WINMIRROR_VERSION << " -- 4K Ultra-Low Latency & Audio" << std::endl;
     std::cout << "========================================================" << std::endl;
-    std::cout << "Endpoints (USB & LAN/Wi-Fi):" << std::endl;
+    std::cout << "Available Endpoints (USB & LAN/Wi-Fi):" << std::endl;
 
     ULONG bufLen = sizeof(IP_ADAPTER_INFO);
     std::vector<BYTE> buf(bufLen);
@@ -95,7 +96,7 @@ int main(int argc, char* argv[]) {
     timeBeginPeriod(1);
 
     int port = DEFAULT_PORT;
-    float quality = 0.55f;
+    float quality = 0.75f;
     int targetFps = 60;
     bool checkUpdate = true;
 
@@ -138,8 +139,18 @@ int main(int argc, char* argv[]) {
     }
 
     FrameBuffer frameBuffer;
+    AudioBuffer audioBuffer;
 
-    HttpServer server(frameBuffer, port);
+    AudioCapture audioCapture;
+    if (audioCapture.init([&audioBuffer](const uint8_t* pcm, size_t size) {
+        audioBuffer.push(pcm, size);
+    })) {
+        audioCapture.start();
+    } else {
+        std::cout << "[AudioCapture] Note: WASAPI loopback not available or muted." << std::endl;
+    }
+
+    HttpServer server(frameBuffer, audioBuffer, port);
     if (!server.start()) {
         std::cerr << "[Error] Failed to start HTTP server on port " << port << std::endl;
         timeEndPeriod(1);
@@ -177,10 +188,11 @@ int main(int argc, char* argv[]) {
             float elapsedSec = std::chrono::duration<float>(now - lastReport).count();
             float currentFps = capturedFrames / elapsedSec;
 
-            // In-place single-line console update using \r without scrolling
             std::cout << "\r[WinMirror] Live FPS: " << std::fixed << std::setprecision(1) << std::setw(4) << currentFps
-                      << " | Active Clients: " << server.getActiveClients()
-                      << " | Capture: " << (capture.isDxgiActive() ? "DXGI GPU" : "GDI")
+                      << " | Viewers: " << server.getActiveClients()
+                      << " | GPU: " << (capture.isDxgiActive() ? "DXGI GPU" : "GDI")
+                      << " | Res: " << capture.getWidth() << "x" << capture.getHeight()
+                      << " | Audio: " << (audioCapture.isRunning() ? "Active" : "Off")
                       << "   " << std::flush;
 
             capturedFrames = 0;
@@ -194,6 +206,7 @@ int main(int argc, char* argv[]) {
     }
 
     beacon.stop();
+    audioCapture.stop();
     server.stop();
     capture.cleanup();
     encoder.cleanup();
