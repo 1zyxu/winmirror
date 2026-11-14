@@ -126,7 +126,8 @@ void AirPlayServer::acceptLoop() {
         int nodelay = 1;
         setsockopt(clientSock, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
 
-        int sndbuf = 4 * 1024 * 1024;
+        // 256 KB send buffer prevents multi-second kernel bufferbloat over Wi-Fi so queue congestion triggers promptly
+        int sndbuf = 256 * 1024;
         setsockopt(clientSock, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&sndbuf), sizeof(sndbuf));
 
         auto session = std::make_shared<ClientSession>();
@@ -194,6 +195,9 @@ void AirPlayServer::broadcastVideo(std::shared_ptr<const EncodedFrame> frame) {
             }
             if (frame->isKeyframe) {
                 c->waitingForKeyframe = false;
+                if (!c->videoQueue.empty()) {
+                    c->videoQueue.clear();
+                }
             }
             if (c->videoQueue.size() > 4) {
                 // Tight 4-frame (~66ms) congestion cap so interactive games stay snappy

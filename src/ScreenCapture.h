@@ -6,6 +6,8 @@
 #include <dxgi1_6.h>
 #include <string>
 #include <vector>
+#include <mutex>
+#include <atomic>
 
 struct RawFrame {
     std::vector<uint8_t> bgra;
@@ -22,9 +24,13 @@ public:
     bool init();
     void cleanup();
 
-    // Captures latest desktop frame onto m_gpuCopyTexture (keeps VRAM on GPU) or GDI CPU fallback.
+    // Captures latest desktop frame onto double-buffered GPU texture or GDI fallback.
     // Returns true if a new desktop frame arrived.
-    bool acquireFrame();
+    bool acquireFrame(uint32_t timeoutMs = 0);
+
+    // Thread-safe AddRef snapshot of the newest captured GPU texture & owning device.
+    bool grabGpuFrame(ID3D11Device** outDev, ID3D11DeviceContext** outCtx, ID3D11Texture2D** outTex,
+                      uint32_t& outW, uint32_t& outH, DXGI_FORMAT& outFmt, bool& outHdr);
 
     // Polls OS hardware cursor cleanly (works even when desktop frame is static).
     // Returns true if cursor state or bitmap changed since last poll.
@@ -35,7 +41,7 @@ public:
 
     ID3D11Device* getD3DDevice() const { return m_d3dDevice; }
     ID3D11DeviceContext* getD3DContext() const { return m_d3dContext; }
-    ID3D11Texture2D* getGpuTexture() const { return m_gpuCopyTex; }
+    ID3D11Texture2D* getGpuTexture() const { return m_gpuCopyTex[m_latestSlot.load()]; }
 
     uint32_t getWidth() const { return m_width; }
     uint32_t getHeight() const { return m_height; }
@@ -50,7 +56,7 @@ private:
     bool initDxgi();
     bool initDxgiOnAdapter(IDXGIAdapter1* adapter);
     void cleanupDxgi();
-    bool acquireDxgi();
+    bool acquireDxgi(uint32_t timeoutMs);
 
     bool initGdi();
     void cleanupGdi();
@@ -78,11 +84,13 @@ private:
     int16_t m_cursorHotX = 0;
     int16_t m_cursorHotY = 0;
 
-    // DXGI GPU resources
+    // DXGI GPU resources (double-buffered texture slot for lock-free Capture -> Encode overlap)
+    std::mutex m_snapMutex;
+    std::atomic<int> m_latestSlot{0};
     ID3D11Device* m_d3dDevice = nullptr;
     ID3D11DeviceContext* m_d3dContext = nullptr;
     IDXGIOutputDuplication* m_duplication = nullptr;
-    ID3D11Texture2D* m_gpuCopyTex = nullptr;
+    ID3D11Texture2D* m_gpuCopyTex[2] = { nullptr, nullptr };
     ID3D11Texture2D* m_stagingTexture = nullptr;
     std::string m_adapterName = "Default GPU";
     bool m_isNvidiaGpu = false;

@@ -17,9 +17,11 @@
 
 #include <string>
 #include <vector>
+#include <deque>
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <chrono>
 #include <cstring>
 #include <algorithm>
@@ -1762,6 +1764,13 @@ static bool recvExact(int sock, void *buf, size_t len) {
     return true;
 }
 
+struct PendingVideoPacket {
+    std::vector<uint8_t> data;
+    VideoCodec codec;
+    ColorProfile color;
+    bool isKeyframe;
+};
+
 static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool> *running) {
     VideoToolboxDecoder decoder;
     std::vector<uint8_t> payloadBuf;
@@ -1780,7 +1789,7 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
         int nodelay = 1;
         setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
-        int rcvbuf = 4 * 1024 * 1024;
+        int rcvbuf = 512 * 1024;
         setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
         struct timeval tv = { 3, 0 };
@@ -1802,16 +1811,107 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
             controller.activeTransportHost = connectedHostNs;
         });
 
+        struct VideoDecodeQueue {
+            std::mutex mtx;
+            std::condition_variable cv;
+            std::deque<PendingVideoPacket> queue;
+            bool stop = false;
+            bool waitingKeyframe = false;
+            std::atomic<uint32_t> dropCount{0};
+            std::atomic<uint32_t> keyframeCount{0};
+            std::atomic<uint64_t> rxBytesWindow{0};
+        } vq;
+
+        std::chrono::steady_clock::time_point lastAutoKeyReq{};
+        auto triggerAutoKeyReq = [&]() {
+            auto now = std::chrono::steady_clock::now();
+            if (now - lastAutoKeyReq >= std::chrono::milliseconds(450)) {
+                lastAutoKeyReq = now;
+                [controller requestKeyframeFromPc];
+            }
+        };
+
+        std::thread decodeThread([&]() {
+            auto lastFpsTick = std::chrono::steady_clock::now();
+            auto lastFrameTime = std::chrono::steady_clock::time_point{};
+            uint32_t decodedFpsFrames = 0;
+            uint64_t totalFrames = 0;
+            double avgIntervalMs = 16.67;
+            double jitterMs = 0.0;
+            std::chrono::steady_clock::time_point lastDecodeErrKeyReq{};
+
+            for (;;) {
+                PendingVideoPacket pkt;
+                {
+                    std::unique_lock<std::mutex> lock(vq.mtx);
+                    vq.cv.wait(lock, [&]() { return vq.stop || !vq.queue.empty(); });
+                    if (vq.stop && vq.queue.empty()) break;
+                    pkt = std::move(vq.queue.front());
+                    vq.queue.pop_front();
+                }
+
+                @autoreleasepool {
+                    if (decoder.decodeAndPresent(pkt.data.data(), pkt.data.size(),
+                                                 pkt.codec, pkt.color, controller.videoView.displayLayer)) {
+                        decodedFpsFrames++;
+                        totalFrames++;
+                    } else {
+                        vq.dropCount++;
+                        if (totalFrames > 0) {
+                            auto now = std::chrono::steady_clock::now();
+                            if (now - lastDecodeErrKeyReq >= std::chrono::milliseconds(500)) {
+                                lastDecodeErrKeyReq = now;
+                                [controller requestKeyframeFromPc];
+                            }
+                        }
+                    }
+                }
+
+                auto frameNow = std::chrono::steady_clock::now();
+                if (lastFrameTime.time_since_epoch().count() > 0) {
+                    double dtMs = std::chrono::duration<double, std::milli>(frameNow - lastFrameTime).count();
+                    if (dtMs > 0.5 && dtMs < 500.0) {
+                        avgIntervalMs = avgIntervalMs * 0.90 + dtMs * 0.10;
+                        double dev = std::abs(dtMs - avgIntervalMs);
+                        jitterMs = jitterMs * 0.90 + dev * 0.10;
+                    }
+                }
+                lastFrameTime = frameNow;
+
+                double dt = std::chrono::duration<double>(frameNow - lastFpsTick).count();
+                if (dt >= 0.5) {
+                    double fps = decodedFpsFrames / dt;
+                    uint64_t bytesWin = vq.rxBytesWindow.exchange(0);
+                    double mbps = (static_cast<double>(bytesWin) * 8.0) / (dt * 1000000.0);
+                    decodedFpsFrames = 0;
+                    lastFpsTick = frameNow;
+                    uint32_t w = controller.currentWidth;
+                    uint32_t h = controller.currentHeight;
+                    double snapAvg = avgIntervalMs;
+                    double snapJit = jitterMs;
+                    uint64_t snapTot = totalFrames;
+                    uint32_t snapDrop = vq.dropCount.load();
+                    uint32_t snapIdr = vq.keyframeCount.load();
+                    VideoCodec snapCodec = pkt.codec;
+                    ColorProfile snapColor = pkt.color;
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [controller updateRenderStats:w
+                                               height:h
+                                                codec:snapCodec
+                                                color:snapColor
+                                                  fps:fps
+                                                 mbps:mbps
+                                           avgFrameMs:snapAvg
+                                             jitterMs:snapJit
+                                          totalFrames:snapTot
+                                                drops:snapDrop
+                                            keyframes:snapIdr];
+                    });
+                }
+            }
+        });
+
         auto lastPing = std::chrono::steady_clock::now();
-        auto lastFpsTick = lastPing;
-        auto lastFrameTime = std::chrono::steady_clock::time_point{};
-        uint32_t decodedFpsFrames = 0;
-        uint64_t videoBytesWindow = 0;
-        uint64_t totalFrames = 0;
-        uint32_t dropCount = 0;
-        uint32_t keyframeCount = 0;
-        double avgIntervalMs = 16.67;
-        double jitterMs = 0.0;
 
         while (*running) {
             int reqAudioIdx = [controller consumePendingPcAudioSource];
@@ -1884,54 +1984,42 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
                 if (codec != CODEC_H264 && codec != CODEC_HEVC) codec = controller.currentCodec;
                 if (color != COLOR_SDR_BT709 && color != COLOR_HDR10_PQ) color = controller.currentColor;
 
-                if ((hdr.flags & 1) != 0) keyframeCount++;
-                videoBytesWindow += hdr.payloadSize;
+                bool isKey = ((hdr.flags & 1) != 0);
+                if (isKey) vq.keyframeCount++;
+                vq.rxBytesWindow += hdr.payloadSize;
 
-                auto frameNow = std::chrono::steady_clock::now();
-                if (lastFrameTime.time_since_epoch().count() > 0) {
-                    double dtMs = std::chrono::duration<double, std::milli>(frameNow - lastFrameTime).count();
-                    if (dtMs > 0.5 && dtMs < 500.0) {
-                        avgIntervalMs = avgIntervalMs * 0.90 + dtMs * 0.10;
-                        double dev = std::abs(dtMs - avgIntervalMs);
-                        jitterMs = jitterMs * 0.90 + dev * 0.10;
+                bool reqKey = false;
+                {
+                    std::lock_guard<std::mutex> lock(vq.mtx);
+                    if (vq.waitingKeyframe && !isKey) {
+                        vq.dropCount++;
+                    } else {
+                        if (isKey) {
+                            vq.waitingKeyframe = false;
+                            if (!vq.queue.empty()) {
+                                vq.dropCount += static_cast<uint32_t>(vq.queue.size());
+                                vq.queue.clear();
+                            }
+                        } else if (vq.queue.size() >= 3) {
+                            vq.dropCount += static_cast<uint32_t>(vq.queue.size()) + 1;
+                            vq.queue.clear();
+                            vq.waitingKeyframe = true;
+                            reqKey = true;
+                        }
+                        if (!vq.waitingKeyframe) {
+                            PendingVideoPacket pkt;
+                            pkt.data.assign(payloadBuf.data(), payloadBuf.data() + hdr.payloadSize);
+                            pkt.codec = codec;
+                            pkt.color = color;
+                            pkt.isKeyframe = isKey;
+                            vq.queue.push_back(std::move(pkt));
+                        }
                     }
                 }
-                lastFrameTime = frameNow;
-
-                if (decoder.decodeAndPresent(payloadBuf.data(), hdr.payloadSize, codec, color, controller.videoView.displayLayer)) {
-                    decodedFpsFrames++;
-                    totalFrames++;
+                if (reqKey) {
+                    triggerAutoKeyReq();
                 } else {
-                    dropCount++;
-                }
-
-                double dt = std::chrono::duration<double>(frameNow - lastFpsTick).count();
-                if (dt >= 0.5) {
-                    double fps = decodedFpsFrames / dt;
-                    double mbps = (static_cast<double>(videoBytesWindow) * 8.0) / (dt * 1000000.0);
-                    decodedFpsFrames = 0;
-                    videoBytesWindow = 0;
-                    lastFpsTick = frameNow;
-                    uint32_t w = controller.currentWidth;
-                    uint32_t h = controller.currentHeight;
-                    double snapAvg = avgIntervalMs;
-                    double snapJit = jitterMs;
-                    uint64_t snapTot = totalFrames;
-                    uint32_t snapDrop = dropCount;
-                    uint32_t snapIdr = keyframeCount;
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        [controller updateRenderStats:w
-                                               height:h
-                                                codec:codec
-                                                color:color
-                                                  fps:fps
-                                                 mbps:mbps
-                                           avgFrameMs:snapAvg
-                                             jitterMs:snapJit
-                                          totalFrames:snapTot
-                                                drops:snapDrop
-                                            keyframes:snapIdr];
-                    });
+                    vq.cv.notify_one();
                 }
             } else if (hdr.type == PACKET_TYPE_AUDIO && hdr.payloadSize > 0) {
                 [controller.audioPlayer playPcm:payloadBuf.data() length:hdr.payloadSize sampleRate:hdr.extra1];
@@ -1969,6 +2057,14 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
         }
 
         close(sock);
+        {
+            std::lock_guard<std::mutex> lock(vq.mtx);
+            vq.stop = true;
+        }
+        vq.cv.notify_all();
+        if (decodeThread.joinable()) {
+            decodeThread.join();
+        }
         decoder.cleanup();
         usleep(250000);
     }

@@ -12,6 +12,7 @@
 #include <sstream>
 #include <thread>
 #include <chrono>
+#include <condition_variable>
 #include <iphlpapi.h>
 #include <mmsystem.h>
 
@@ -175,16 +176,25 @@ int main(int argc, char* argv[]) {
         std::cout << "[AudioCapture] Note: WASAPI loopback not active." << std::endl;
     }
 
-    BluetoothBridge btBridge(port, [&encoder]() {
+    struct FrameShare {
+        std::mutex mutex;
+        std::condition_variable cv;
+        uint64_t seq = 1; // initial frame already acquired above when ready
+    } frameShare;
+
+    auto notifyKeyframe = [&encoder, &frameShare]() {
         encoder.requestKeyframe();
-    });
+        frameShare.cv.notify_one();
+    };
+
+    BluetoothBridge btBridge(port, notifyKeyframe);
     bool btReady = btBridge.start(ipsCsv, encoder.getWidth(), encoder.getHeight(),
                                   encoder.isHdrActive(), encoder.getEncoderName());
 
     server.setStreamInfo(encoder.getWidth(), encoder.getHeight(), static_cast<uint16_t>(targetFps),
                          encoder.getCodec(), encoder.getColorProfile(),
                          audioCapture.getSampleRate(), buildHelloFlags(btReady, capture, encoder),
-                         [&encoder]() { encoder.requestKeyframe(); });
+                         notifyKeyframe);
 
     if (!server.start()) {
         std::cerr << "[Error] Failed to start AirPlay server on port " << port << std::endl;
@@ -205,112 +215,164 @@ int main(int argc, char* argv[]) {
                   : "Off") << std::endl;
     std::cout << "[AirPlay]  Ready    : Start WinMirror on Mac (Ctrl+C to stop)\n" << std::endl;
 
+    std::vector<uint8_t> initCursorBgra;
+    CursorPayload initCursorMeta = {};
+    if (capture.pollCursor(initCursorMeta, initCursorBgra, true)) {
+        server.broadcastCursor(initCursorMeta, initCursorBgra);
+    }
+
+    // Decoupled high-priority Capture + Cursor thread so NVENC/PCIe stalls never block DXGI ReleaseFrame or mouse input
+    std::thread captureThread([&]() {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+        std::vector<uint8_t> curBgra;
+        CursorPayload curMeta = {};
+        while (g_running) {
+            if (capture.pollCursor(curMeta, curBgra, false)) {
+                server.broadcastCursor(curMeta, curBgra);
+            }
+            if (server.getActiveClients() == 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(16));
+                continue;
+            }
+            if (capture.acquireFrame(4)) {
+                {
+                    std::lock_guard<std::mutex> lock(frameShare.mutex);
+                    frameShare.seq++;
+                }
+                frameShare.cv.notify_one();
+            }
+        }
+    });
+
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
     auto startTime = std::chrono::steady_clock::now();
     auto lastReport = startTime;
     auto nextEncodeTime = startTime;
     uint32_t encodedFrames = 0;
     uint64_t encodedBytes = 0;
     uint64_t frameSeq = 0;
+    uint64_t lastEncodedSeq = 0;
     bool lastZeroCopy = encoder.isZeroCopyActive();
 
     const auto minFrameGap = std::chrono::microseconds(1000000 / targetFps);
-    const auto idleTick = std::chrono::milliseconds(8);
-    const auto activeTick = std::chrono::milliseconds(1);
-
     RawFrame cpuFallbackFrame;
     std::vector<uint8_t> annexB;
-    std::vector<uint8_t> cursorBgra;
-    CursorPayload cursorMeta = {};
 
-    if (capture.pollCursor(cursorMeta, cursorBgra, true)) {
-        server.broadcastCursor(cursorMeta, cursorBgra);
-    }
+    auto emitEncoded = [&](std::vector<uint8_t>& pktData, bool isKey, uint64_t ptsUs) {
+        encodedBytes += pktData.size();
+        auto pkt = std::make_shared<EncodedFrame>();
+        pkt->data = std::move(pktData);
+        pkt->width = encoder.getWidth();
+        pkt->height = encoder.getHeight();
+        pkt->ptsMs = static_cast<uint32_t>(ptsUs / 1000ULL);
+        pkt->codec = static_cast<uint8_t>(encoder.getCodec());
+        pkt->colorProfile = static_cast<uint8_t>(encoder.getColorProfile());
+        pkt->isKeyframe = isKey;
+        pkt->seq = ++frameSeq;
+
+        server.broadcastVideo(std::move(pkt));
+        encodedFrames++;
+        if (encoder.isZeroCopyActive() != lastZeroCopy) {
+            lastZeroCopy = encoder.isZeroCopyActive();
+            server.setStreamInfo(encoder.getWidth(), encoder.getHeight(), static_cast<uint16_t>(targetFps),
+                                 encoder.getCodec(), encoder.getColorProfile(),
+                                 audioCapture.getSampleRate(),
+                                 buildHelloFlags(btBridge.isRadioAvailable(), capture, encoder),
+                                 notifyKeyframe);
+        }
+    };
 
     while (g_running) {
-        auto loopStart = std::chrono::steady_clock::now();
-
-        // 1. Hardware mouse cursor tracking
-        if (capture.pollCursor(cursorMeta, cursorBgra, false)) {
-            server.broadcastCursor(cursorMeta, cursorBgra);
-        }
-
-        // 2. Capture & GPU Hardware Video Encode (at up to targetFps, drift-free)
-        if (loopStart + std::chrono::microseconds(800) >= nextEncodeTime) {
-            bool gotNewScreen = capture.acquireFrame();
-            if (gotNewScreen) {
-                // Re-initialize encoder seamlessly if resolution or HDR mode switched (e.g. launching fullscreen game)
-                if ((capture.getWidth() & ~1u) != encoder.getWidth() ||
-                    (capture.getHeight() & ~1u) != encoder.getHeight() ||
-                    capture.getPixelFormat() != encoder.getSrcFormat()) {
-                    encoder.init(capture.getD3DDevice(), capture.getD3DContext(),
-                                 capture.getWidth(), capture.getHeight(),
-                                 capture.getPixelFormat(), static_cast<uint32_t>(targetFps),
-                                 capture.isHdrOutput());
-                    server.setStreamInfo(encoder.getWidth(), encoder.getHeight(), static_cast<uint16_t>(targetFps),
-                                         encoder.getCodec(), encoder.getColorProfile(),
-                                         audioCapture.getSampleRate(),
-                                         buildHelloFlags(btBridge.isRadioAvailable(), capture, encoder),
-                                         [&encoder]() { encoder.requestKeyframe(); });
-                    lastZeroCopy = encoder.isZeroCopyActive();
-                    btBridge.updateMetadata(ipsCsv, encoder.getWidth(), encoder.getHeight(),
-                                            encoder.isHdrActive(), encoder.getEncoderName());
-                }
+        bool hasClients = (server.getActiveClients() > 0);
+        if (!hasClients) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+            nextEncodeTime = std::chrono::steady_clock::now();
+        } else {
+            auto nowBefore = std::chrono::steady_clock::now();
+            if (nowBefore + std::chrono::microseconds(400) < nextEncodeTime) {
+                std::this_thread::sleep_until(nextEncodeTime);
             }
 
-            bool hasClients = (server.getActiveClients() > 0);
-            bool encodedThisSlot = false;
-            bool gpuPathUsed = false;
+            uint64_t curSeq = 0;
+            {
+                std::unique_lock<std::mutex> lock(frameShare.mutex);
+                frameShare.cv.wait_for(lock, std::chrono::milliseconds(16), [&]() {
+                    return !g_running || frameShare.seq != lastEncodedSeq || encoder.hasKeyframeRequest();
+                });
+                curSeq = frameShare.seq;
+            }
+            if (!g_running) break;
 
-            if (hasClients && (gotNewScreen || encoder.hasKeyframeRequest())) {
-                uint64_t ptsUs = std::chrono::duration_cast<std::chrono::microseconds>(loopStart - startTime).count();
+            bool gotNewScreen = (curSeq != lastEncodedSeq);
+            if (gotNewScreen || encoder.hasKeyframeRequest()) {
+                lastEncodedSeq = curSeq;
+
+                ID3D11Device* snapDev = nullptr;
+                ID3D11DeviceContext* snapCtx = nullptr;
+                ID3D11Texture2D* snapTex = nullptr;
+                uint32_t snapW = 0, snapH = 0;
+                DXGI_FORMAT snapFmt = DXGI_FORMAT_B8G8R8A8_UNORM;
+                bool snapHdr = false;
+                bool haveGpu = capture.grabGpuFrame(&snapDev, &snapCtx, &snapTex, snapW, snapH, snapFmt, snapHdr);
+
+                if (haveGpu) {
+                    if (snapDev != encoder.getCaptureDevice() ||
+                        (snapW & ~1u) != encoder.getWidth() ||
+                        (snapH & ~1u) != encoder.getHeight() ||
+                        snapFmt != encoder.getSrcFormat()) {
+                        encoder.init(snapDev, snapCtx, snapW, snapH, snapFmt,
+                                     static_cast<uint32_t>(targetFps), snapHdr);
+                        server.setStreamInfo(encoder.getWidth(), encoder.getHeight(), static_cast<uint16_t>(targetFps),
+                                             encoder.getCodec(), encoder.getColorProfile(),
+                                             audioCapture.getSampleRate(),
+                                             buildHelloFlags(btBridge.isRadioAvailable(), capture, encoder),
+                                             notifyKeyframe);
+                        lastZeroCopy = encoder.isZeroCopyActive();
+                        btBridge.updateMetadata(ipsCsv, encoder.getWidth(), encoder.getHeight(),
+                                                encoder.isHdrActive(), encoder.getEncoderName());
+                    }
+                }
+
+                auto encodeNow = std::chrono::steady_clock::now();
+                uint64_t ptsUs = std::chrono::duration_cast<std::chrono::microseconds>(encodeNow - startTime).count();
                 bool isKey = false;
                 bool encoded = false;
 
-                if (capture.isDxgiActive() && capture.getGpuTexture() && encoder.hasVideoProcessor()) {
-                    gpuPathUsed = true;
-                    encoded = encoder.encodeGpuFrame(capture.getGpuTexture(), ptsUs, annexB, isKey);
+                if (haveGpu && encoder.hasVideoProcessor()) {
+                    encoded = encoder.encodeGpuFrame(snapTex, ptsUs, annexB, isKey);
                 } else if (capture.copyCurrentFrameToBgra(cpuFallbackFrame)) {
+                    if ((cpuFallbackFrame.width & ~1u) != encoder.getWidth() ||
+                        (cpuFallbackFrame.height & ~1u) != encoder.getHeight()) {
+                        encoder.init(snapDev, snapCtx, cpuFallbackFrame.width, cpuFallbackFrame.height,
+                                     DXGI_FORMAT_B8G8R8A8_UNORM, static_cast<uint32_t>(targetFps), false);
+                    }
                     encoded = encoder.encodeBgraCpu(cpuFallbackFrame.bgra.data(),
                                                     cpuFallbackFrame.width, cpuFallbackFrame.height,
                                                     ptsUs, annexB, isKey);
                 }
 
+                if (snapTex) snapTex->Release();
+                if (snapCtx) snapCtx->Release();
+                if (snapDev) snapDev->Release();
+
                 if (encoded && !annexB.empty()) {
-                    encodedBytes += annexB.size();
-                    auto pkt = std::make_shared<EncodedFrame>();
-                    pkt->data = std::move(annexB);
-                    pkt->width = encoder.getWidth();
-                    pkt->height = encoder.getHeight();
-                    pkt->ptsMs = static_cast<uint32_t>(ptsUs / 1000ULL);
-                    pkt->codec = static_cast<uint8_t>(encoder.getCodec());
-                    pkt->colorProfile = static_cast<uint8_t>(encoder.getColorProfile());
-                    pkt->isKeyframe = isKey;
-                    pkt->seq = ++frameSeq;
-
-                    server.broadcastVideo(std::move(pkt));
-                    encodedFrames++;
-                    encodedThisSlot = true;
-                    if (encoder.isZeroCopyActive() != lastZeroCopy) {
-                        lastZeroCopy = encoder.isZeroCopyActive();
-                        server.setStreamInfo(encoder.getWidth(), encoder.getHeight(), static_cast<uint16_t>(targetFps),
-                                             encoder.getCodec(), encoder.getColorProfile(),
-                                             audioCapture.getSampleRate(),
-                                             buildHelloFlags(btBridge.isRadioAvailable(), capture, encoder),
-                                             [&encoder]() { encoder.requestKeyframe(); });
-                    }
+                    emitEncoded(annexB, isKey, ptsUs);
                 }
-            }
+                while (encoder.popPendingFrame(annexB, isKey)) {
+                    emitEncoded(annexB, isKey, ptsUs);
+                }
 
-            // Advance slot when idle, frame produced, or GPU pipeline consumed the current screen frame
-            if (!hasClients || encodedThisSlot || (gpuPathUsed && gotNewScreen)) {
+                // Drift-free fixed cadence without compounding encode latency into frame period
                 nextEncodeTime += minFrameGap;
-                if (nextEncodeTime + minFrameGap < loopStart) {
-                    nextEncodeTime = loopStart + minFrameGap;
+                auto afterEncode = std::chrono::steady_clock::now();
+                if (nextEncodeTime + minFrameGap < afterEncode) {
+                    nextEncodeTime = afterEncode;
                 }
             }
         }
 
-        // 3. Single-line live console status
+        // Single-line live console status
         auto now = std::chrono::steady_clock::now();
         if (now - lastReport >= std::chrono::milliseconds(500)) {
             float elapsedSec = std::chrono::duration<float>(now - lastReport).count();
@@ -333,14 +395,12 @@ int main(int argc, char* argv[]) {
             encodedBytes = 0;
             lastReport = now;
         }
-
-        auto targetSleep = (server.getActiveClients() > 0) ? activeTick : idleTick;
-        auto spent = std::chrono::steady_clock::now() - loopStart;
-        if (spent < targetSleep) {
-            std::this_thread::sleep_for(targetSleep - spent);
-        }
     }
 
+    frameShare.cv.notify_all();
+    if (captureThread.joinable()) {
+        captureThread.join();
+    }
     beacon.stop();
     btBridge.stop();
     audioCapture.stop();

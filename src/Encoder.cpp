@@ -254,29 +254,59 @@ void Encoder::cleanupNvUploadTextures() {
     }
 }
 
-bool Encoder::uploadYuvToNvTexture(const std::vector<uint8_t>& yuvData, ID3D11Texture2D* dstTex) {
-    if (!m_nvContext || !m_nvUploadTex || !dstTex) return false;
+bool Encoder::mapStagingRead(ID3D11Texture2D* stagingTex, D3D11_MAPPED_SUBRESOURCE& outMap) {
+    if (!stagingTex || !m_d3dContext) return false;
+    auto waitStart = std::chrono::steady_clock::now();
+    for (;;) {
+        HRESULT hr = m_d3dContext->Map(stagingTex, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &outMap);
+        if (hr != DXGI_ERROR_WAS_STILL_DRAWING) {
+            return SUCCEEDED(hr);
+        }
+        auto elapsed = std::chrono::steady_clock::now() - waitStart;
+        if (elapsed > std::chrono::milliseconds(16)) {
+            return SUCCEEDED(m_d3dContext->Map(stagingTex, 0, D3D11_MAP_READ, 0, &outMap));
+        }
+        if (elapsed < std::chrono::microseconds(500)) {
+            Sleep(0);
+        } else {
+            Sleep(1);
+        }
+    }
+}
 
-    size_t rowBytes = m_useP010 ? (static_cast<size_t>(m_width) * 2) : static_cast<size_t>(m_width);
-    size_t totalRows = static_cast<size_t>(m_height) + m_height / 2;
-    if (yuvData.size() < totalRows * rowBytes) return false;
+bool Encoder::copyStagedYuvToNvTexture(ID3D11Texture2D* gpuYuvTex, ID3D11Texture2D* dstTex) {
+    if (!gpuYuvTex || !m_vpStagingTex || !m_d3dContext || !m_nvContext || !m_nvUploadTex || !dstTex) return false;
 
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (FAILED(m_nvContext->Map(m_nvUploadTex, 0, D3D11_MAP_WRITE, 0, &mapped))) return false;
+    m_d3dContext->CopyResource(m_vpStagingTex, gpuYuvTex);
 
-    if (mapped.RowPitch < rowBytes) {
-        m_nvContext->Unmap(m_nvUploadTex, 0);
+    D3D11_MAPPED_SUBRESOURCE srcMap = {};
+    if (!mapStagingRead(m_vpStagingTex, srcMap)) return false;
+
+    D3D11_MAPPED_SUBRESOURCE dstMap = {};
+    if (FAILED(m_nvContext->Map(m_nvUploadTex, 0, D3D11_MAP_WRITE, 0, &dstMap))) {
+        m_d3dContext->Unmap(m_vpStagingTex, 0);
         return false;
     }
 
-    const uint8_t* src = yuvData.data();
-    uint8_t* dst = static_cast<uint8_t*>(mapped.pData);
-    for (size_t y = 0; y < totalRows; ++y) {
-        memcpy(dst, src, rowBytes);
-        src += rowBytes;
-        dst += mapped.RowPitch;
+    const size_t rowBytes = m_useP010 ? (static_cast<size_t>(m_width) * 2) : static_cast<size_t>(m_width);
+    const size_t totalRows = static_cast<size_t>(m_height) + m_height / 2;
+
+    if (srcMap.RowPitch >= rowBytes && dstMap.RowPitch >= rowBytes) {
+        if (srcMap.RowPitch == rowBytes && dstMap.RowPitch == rowBytes) {
+            memcpy(dstMap.pData, srcMap.pData, totalRows * rowBytes);
+        } else {
+            const uint8_t* src = static_cast<const uint8_t*>(srcMap.pData);
+            uint8_t* dst = static_cast<uint8_t*>(dstMap.pData);
+            for (size_t y = 0; y < totalRows; ++y) {
+                memcpy(dst, src, rowBytes);
+                src += srcMap.RowPitch;
+                dst += dstMap.RowPitch;
+            }
+        }
     }
+
     m_nvContext->Unmap(m_nvUploadTex, 0);
+    m_d3dContext->Unmap(m_vpStagingTex, 0);
     m_nvContext->CopyResource(dstTex, m_nvUploadTex);
     m_nvContext->Flush();
     return true;
@@ -289,6 +319,8 @@ bool Encoder::init(ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dContext,
 
     m_d3dDevice = d3dDevice;
     m_d3dContext = d3dContext;
+    if (m_d3dDevice) m_d3dDevice->AddRef();
+    if (m_d3dContext) m_d3dContext->AddRef();
     m_width = width & ~1u;   // YUV 4:2:0 requires even dimensions
     m_height = height & ~1u;
     m_fps = fps > 0 ? fps : 60;
@@ -380,6 +412,8 @@ void Encoder::cleanup() {
     cleanupMft();
     cleanupVideoProcessor();
     cleanupEncodeDevice();
+    if (m_d3dContext) { m_d3dContext->Release(); m_d3dContext = nullptr; }
+    if (m_d3dDevice) { m_d3dDevice->Release(); m_d3dDevice = nullptr; }
     if (m_mfStarted) {
         MFShutdown();
         m_mfStarted = false;
@@ -510,6 +544,8 @@ bool Encoder::configureMftTypes(const GUID& outputSubtype, bool wantP010, UINT32
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonQualityVsSpeed, 0);
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonMeanBitRate, bitrate);
+        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonMaxBitRate, bitrate + (bitrate / 4));
+        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonBufferSize, bitrate / 4);
         setCodecUint32(m_codecApi, CODECAPI_AVEncMPVDefaultBPictureCount, 0);
         setCodecUint32(m_codecApi, CODECAPI_AVEncMPVGOPSize, m_fps * 2);
     };
@@ -778,6 +814,7 @@ void Encoder::cleanupMft() {
     m_isNvidia = false;
     m_needInputCount = 0;
     m_seqHeader.clear();
+    m_readyOutputs.clear();
 }
 
 bool Encoder::copyTextureToPackedYuv(ID3D11Texture2D* gpuYuvTex, std::vector<uint8_t>& outYuv) {
@@ -786,7 +823,7 @@ bool Encoder::copyTextureToPackedYuv(ID3D11Texture2D* gpuYuvTex, std::vector<uin
     m_d3dContext->CopyResource(m_vpStagingTex, gpuYuvTex);
 
     D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (FAILED(m_d3dContext->Map(m_vpStagingTex, 0, D3D11_MAP_READ, 0, &mapped))) {
+    if (!mapStagingRead(m_vpStagingTex, mapped)) {
         return false;
     }
 
@@ -915,14 +952,13 @@ bool Encoder::encodeGpuFrame(ID3D11Texture2D* gpuSrcTex, uint64_t ptsUs,
     // Flush VideoProcessorBlt to GPU queue immediately so NVENC reads current frame without batch stall
     m_d3dContext->Flush();
 
-    bool alreadyCopiedYuv = false;
     if (m_useD3dManager) {
-        if (!waitAsyncInputReady()) return false;
+        if (!waitAsyncInputReady()) return popPendingFrame(outAnnexB, outIsKeyframe);
         ID3D11Texture2D* submitTex = outTex;
         if (m_nvDevice) {
-            if (!m_nvGpuTex[slot] || !copyTextureToPackedYuv(outTex, m_yuvBuffer)) return false;
-            alreadyCopiedYuv = true;
-            if (!uploadYuvToNvTexture(m_yuvBuffer, m_nvGpuTex[slot])) return false;
+            if (!m_nvGpuTex[slot] || !copyStagedYuvToNvTexture(outTex, m_nvGpuTex[slot])) {
+                return popPendingFrame(outAnnexB, outIsKeyframe);
+            }
             submitTex = m_nvGpuTex[slot];
         }
 
@@ -936,7 +972,7 @@ bool Encoder::encodeGpuFrame(ID3D11Texture2D* gpuSrcTex, uint64_t ptsUs,
         m_mft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
     }
 
-    if (!alreadyCopiedYuv && !copyTextureToPackedYuv(outTex, m_yuvBuffer)) return false;
+    if (!copyTextureToPackedYuv(outTex, m_yuvBuffer)) return false;
     return encodePackedYuv(m_yuvBuffer, ptsUs, outAnnexB, outIsKeyframe);
 }
 
@@ -947,23 +983,33 @@ bool Encoder::encodeBgraCpu(const uint8_t* bgra, uint32_t width, uint32_t height
     return encodePackedYuv(m_yuvBuffer, ptsUs, outAnnexB, outIsKeyframe);
 }
 
+bool Encoder::popPendingFrame(std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe) {
+    if (m_readyOutputs.empty()) {
+        outAnnexB.clear();
+        outIsKeyframe = false;
+        return false;
+    }
+    outAnnexB = std::move(m_readyOutputs.front().first);
+    outIsKeyframe = m_readyOutputs.front().second;
+    m_readyOutputs.pop_front();
+    return !outAnnexB.empty();
+}
+
 bool Encoder::waitAsyncInputReady() {
     if (!m_isAsync) return true;
 
-    std::vector<uint8_t> dummy;
-    bool dummyKey = false;
-    pumpAsyncEvents(dummy, dummyKey, false);
+    pumpAsyncEvents(false);
 
     auto waitStart = std::chrono::steady_clock::now();
     while (m_needInputCount <= 0) {
-        pumpAsyncEvents(dummy, dummyKey, false);
+        pumpAsyncEvents(false);
         if (m_needInputCount > 0) break;
         auto elapsed = std::chrono::steady_clock::now() - waitStart;
         if (elapsed > std::chrono::milliseconds(20)) {
             return false;
         }
-        if (elapsed < std::chrono::milliseconds(4)) {
-            SwitchToThread();
+        if (elapsed < std::chrono::microseconds(500)) {
+            Sleep(0);
         } else {
             Sleep(1);
         }
@@ -983,13 +1029,14 @@ bool Encoder::submitSampleToMft(IMFSample* sample, std::vector<uint8_t>& outAnne
     sample->Release();
 
     if (FAILED(hr)) {
-        return false;
+        return popPendingFrame(outAnnexB, outIsKeyframe);
     }
 
     outInputAccepted = true;
     if (m_isAsync) {
         m_needInputCount--;
-        return pumpAsyncEvents(outAnnexB, outIsKeyframe, true);
+        pumpAsyncEvents(true);
+        return popPendingFrame(outAnnexB, outIsKeyframe);
     }
     return collectSyncOutput(outAnnexB, outIsKeyframe);
 }
@@ -1113,21 +1160,20 @@ bool Encoder::collectSyncOutput(std::vector<uint8_t>& outAnnexB, bool& outIsKeyf
     return !outAnnexB.empty();
 }
 
-bool Encoder::pumpAsyncEvents(std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe, bool waitOutput) {
+bool Encoder::pumpAsyncEvents(bool waitOutput) {
     if (!m_eventGen) return false;
 
     auto start = std::chrono::steady_clock::now();
-    bool gotPacket = false;
 
     for (;;) {
         IMFMediaEvent* ev = nullptr;
         HRESULT hr = m_eventGen->GetEvent(MF_EVENT_FLAG_NO_WAIT, &ev);
         if (hr == MF_E_NO_EVENTS_AVAILABLE) {
-            if (!waitOutput || gotPacket) break;
+            if (!waitOutput || !m_readyOutputs.empty()) break;
             auto elapsed = std::chrono::steady_clock::now() - start;
-            if (elapsed > std::chrono::milliseconds(30)) break;
-            if (elapsed < std::chrono::milliseconds(4)) {
-                SwitchToThread();
+            if (elapsed > std::chrono::milliseconds(20)) break;
+            if (elapsed < std::chrono::microseconds(500)) {
+                Sleep(0);
             } else {
                 Sleep(1);
             }
@@ -1145,12 +1191,10 @@ bool Encoder::pumpAsyncEvents(std::vector<uint8_t>& outAnnexB, bool& outIsKeyfra
             std::vector<uint8_t> pkt;
             bool isKey = false;
             if (collectSyncOutput(pkt, isKey) && !pkt.empty()) {
-                outAnnexB = std::move(pkt);
-                outIsKeyframe = isKey;
-                gotPacket = true;
+                m_readyOutputs.emplace_back(std::move(pkt), isKey);
             }
         }
     }
 
-    return gotPacket;
+    return !m_readyOutputs.empty();
 }

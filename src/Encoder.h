@@ -10,6 +10,8 @@
 #include <icodecapi.h>
 #include <string>
 #include <vector>
+#include <deque>
+#include <utility>
 #include <atomic>
 
 class Encoder {
@@ -27,10 +29,12 @@ public:
                         std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe);
     bool encodeBgraCpu(const uint8_t* bgra, uint32_t width, uint32_t height, uint64_t ptsUs,
                        std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe);
+    bool popPendingFrame(std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe);
 
     void requestKeyframe() { m_forceKeyframe.store(true); }
     bool hasKeyframeRequest() const { return m_forceKeyframe.load(); }
 
+    ID3D11Device* getCaptureDevice() const { return m_d3dDevice; }
     uint32_t getWidth() const { return m_width; }
     uint32_t getHeight() const { return m_height; }
     VideoCodec getCodec() const { return m_codec; }
@@ -49,7 +53,8 @@ private:
     void cleanupEncodeDevice();
     bool initNvUploadTextures(bool useP010);
     void cleanupNvUploadTextures();
-    bool uploadYuvToNvTexture(const std::vector<uint8_t>& yuvData, ID3D11Texture2D* dstTex);
+    bool mapStagingRead(ID3D11Texture2D* stagingTex, D3D11_MAPPED_SUBRESOURCE& outMap);
+    bool copyStagedYuvToNvTexture(ID3D11Texture2D* gpuYuvTex, ID3D11Texture2D* dstTex);
 
     bool initVideoProcessor(DXGI_FORMAT srcFormat, bool useP010);
     void cleanupVideoProcessor();
@@ -68,10 +73,10 @@ private:
     bool encodePackedYuv(const std::vector<uint8_t>& yuvData, uint64_t ptsUs,
                          std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe);
     bool collectSyncOutput(std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe);
-    bool pumpAsyncEvents(std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe, bool waitOutput);
+    bool pumpAsyncEvents(bool waitOutput);
 
-    ID3D11Device* m_d3dDevice = nullptr;      // non-owning (capture GPU)
-    ID3D11DeviceContext* m_d3dContext = nullptr; // non-owning (capture GPU)
+    ID3D11Device* m_d3dDevice = nullptr;       // owning AddRef (capture GPU)
+    ID3D11DeviceContext* m_d3dContext = nullptr; // owning AddRef (capture GPU)
     ID3D11Device* m_nvDevice = nullptr;       // owning dedicated NVIDIA GPU when Optimus capture is on iGPU
     ID3D11DeviceContext* m_nvContext = nullptr;
     LUID m_encLuid = {};
@@ -125,4 +130,5 @@ private:
 
     std::vector<uint8_t> m_yuvBuffer;
     std::vector<uint8_t> m_seqHeader; // Cached SPS/PPS(/VPS) if needed
+    std::deque<std::pair<std::vector<uint8_t>, bool>> m_readyOutputs;
 };

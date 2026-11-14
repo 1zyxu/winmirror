@@ -346,16 +346,47 @@ bool ScreenCapture::initDxgiOnAdapter(IDXGIAdapter1* adapter) {
 }
 
 void ScreenCapture::cleanupDxgi() {
-    if (m_gpuCopyTex) { m_gpuCopyTex->Release(); m_gpuCopyTex = nullptr; }
+    std::lock_guard<std::mutex> lock(m_snapMutex);
+    for (int i = 0; i < 2; ++i) {
+        if (m_gpuCopyTex[i]) { m_gpuCopyTex[i]->Release(); m_gpuCopyTex[i] = nullptr; }
+    }
+    m_latestSlot.store(0);
     if (m_stagingTexture) { m_stagingTexture->Release(); m_stagingTexture = nullptr; }
     if (m_duplication) { m_duplication->Release(); m_duplication = nullptr; }
     if (m_d3dContext) { m_d3dContext->Release(); m_d3dContext = nullptr; }
     if (m_d3dDevice) { m_d3dDevice->Release(); m_d3dDevice = nullptr; }
 }
 
-bool ScreenCapture::acquireFrame() {
+bool ScreenCapture::grabGpuFrame(ID3D11Device** outDev, ID3D11DeviceContext** outCtx, ID3D11Texture2D** outTex,
+                                 uint32_t& outW, uint32_t& outH, DXGI_FORMAT& outFmt, bool& outHdr) {
+    if (!outDev || !outCtx || !outTex) return false;
+    *outDev = nullptr;
+    *outCtx = nullptr;
+    *outTex = nullptr;
+
+    std::lock_guard<std::mutex> lock(m_snapMutex);
+    int slot = m_latestSlot.load();
+    ID3D11Texture2D* tex = m_gpuCopyTex[slot];
+    if (!m_useDxgi || !m_d3dDevice || !m_d3dContext || !tex) {
+        return false;
+    }
+
+    m_d3dDevice->AddRef();
+    m_d3dContext->AddRef();
+    tex->AddRef();
+    *outDev = m_d3dDevice;
+    *outCtx = m_d3dContext;
+    *outTex = tex;
+    outW = m_width;
+    outH = m_height;
+    outFmt = m_format;
+    outHdr = isHdrOutput();
+    return true;
+}
+
+bool ScreenCapture::acquireFrame(uint32_t timeoutMs) {
     if (m_useDxgi) {
-        if (acquireDxgi()) return true;
+        if (acquireDxgi(timeoutMs)) return true;
         if (!m_duplication) {
             initDxgi();
         }
@@ -364,13 +395,13 @@ bool ScreenCapture::acquireFrame() {
     return acquireGdi();
 }
 
-bool ScreenCapture::acquireDxgi() {
+bool ScreenCapture::acquireDxgi(uint32_t timeoutMs) {
     if (!m_duplication || !m_d3dContext) return false;
 
     DXGI_OUTDUPL_FRAME_INFO frameInfo = {};
     IDXGIResource* desktopResource = nullptr;
 
-    HRESULT hr = m_duplication->AcquireNextFrame(0, &frameInfo, &desktopResource);
+    HRESULT hr = m_duplication->AcquireNextFrame(timeoutMs, &frameInfo, &desktopResource);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
         return false;
     }
@@ -380,7 +411,7 @@ bool ScreenCapture::acquireDxgi() {
     }
 
     // Check if frame contains actual screen image updates vs cursor-only update
-    if (frameInfo.LastPresentTime.QuadPart == 0 && m_gpuCopyTex != nullptr) {
+    if (frameInfo.LastPresentTime.QuadPart == 0 && m_gpuCopyTex[m_latestSlot.load()] != nullptr) {
         desktopResource->Release();
         m_duplication->ReleaseFrame();
         return false;
@@ -397,9 +428,13 @@ bool ScreenCapture::acquireDxgi() {
     D3D11_TEXTURE2D_DESC actualDesc = {};
     desktopImage->GetDesc(&actualDesc);
 
-    if (!m_gpuCopyTex || m_width != actualDesc.Width || m_height != actualDesc.Height || m_format != actualDesc.Format) {
-        if (m_gpuCopyTex) { m_gpuCopyTex->Release(); m_gpuCopyTex = nullptr; }
+    if (!m_gpuCopyTex[0] || !m_gpuCopyTex[1] || m_width != actualDesc.Width || m_height != actualDesc.Height || m_format != actualDesc.Format) {
+        std::lock_guard<std::mutex> lock(m_snapMutex);
+        for (int i = 0; i < 2; ++i) {
+            if (m_gpuCopyTex[i]) { m_gpuCopyTex[i]->Release(); m_gpuCopyTex[i] = nullptr; }
+        }
         if (m_stagingTexture) { m_stagingTexture->Release(); m_stagingTexture = nullptr; }
+        m_latestSlot.store(0);
 
         m_width = actualDesc.Width;
         m_height = actualDesc.Height;
@@ -415,17 +450,30 @@ bool ScreenCapture::acquireDxgi() {
         gpuDesc.Usage = D3D11_USAGE_DEFAULT;
         gpuDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
-        hr = m_d3dDevice->CreateTexture2D(&gpuDesc, nullptr, &m_gpuCopyTex);
-        if (FAILED(hr)) {
-            desktopImage->Release();
-            m_duplication->ReleaseFrame();
-            return false;
+        for (int i = 0; i < 2; ++i) {
+            hr = m_d3dDevice->CreateTexture2D(&gpuDesc, nullptr, &m_gpuCopyTex[i]);
+            if (FAILED(hr)) {
+                for (int j = 0; j < 2; ++j) {
+                    if (m_gpuCopyTex[j]) { m_gpuCopyTex[j]->Release(); m_gpuCopyTex[j] = nullptr; }
+                }
+                desktopImage->Release();
+                m_duplication->ReleaseFrame();
+                return false;
+            }
         }
     }
 
-    m_d3dContext->CopyResource(m_gpuCopyTex, desktopImage);
+    int writeSlot = 1 - m_latestSlot.load();
+    ID3D11Texture2D* dstTex = m_gpuCopyTex[writeSlot];
+    m_d3dContext->CopyResource(dstTex, desktopImage);
+    m_d3dContext->Flush();
     desktopImage->Release();
     m_duplication->ReleaseFrame();
+
+    {
+        std::lock_guard<std::mutex> lock(m_snapMutex);
+        m_latestSlot.store(writeSlot);
+    }
     return true;
 }
 
@@ -441,7 +489,16 @@ bool ScreenCapture::copyCurrentFrameToBgra(RawFrame& outFrame) {
         return true;
     }
 
-    if (!m_gpuCopyTex || !m_d3dContext) return false;
+    ID3D11Texture2D* copyTex = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(m_snapMutex);
+        copyTex = m_gpuCopyTex[m_latestSlot.load()];
+        if (copyTex) copyTex->AddRef();
+    }
+    if (!copyTex || !m_d3dContext) {
+        if (copyTex) copyTex->Release();
+        return false;
+    }
 
     if (!m_stagingTexture) {
         D3D11_TEXTURE2D_DESC desc = {};
@@ -454,11 +511,13 @@ bool ScreenCapture::copyCurrentFrameToBgra(RawFrame& outFrame) {
         desc.Usage = D3D11_USAGE_STAGING;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         if (FAILED(m_d3dDevice->CreateTexture2D(&desc, nullptr, &m_stagingTexture))) {
+            copyTex->Release();
             return false;
         }
     }
 
-    m_d3dContext->CopyResource(m_stagingTexture, m_gpuCopyTex);
+    m_d3dContext->CopyResource(m_stagingTexture, copyTex);
+    copyTex->Release();
 
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (FAILED(m_d3dContext->Map(m_stagingTexture, 0, D3D11_MAP_READ, 0, &mapped))) {
@@ -539,6 +598,12 @@ bool ScreenCapture::pollCursor(CursorPayload& outMeta, std::vector<uint8_t>& out
     if (!GetCursorInfo(&ci)) return false;
 
     bool visible = (ci.flags & CURSOR_SHOWING) && (ci.hCursor != nullptr);
+    if (!visible && !m_lastCursorVisible && !forceBitmap) {
+        // Ignore rapid hidden mouse warps inside fullscreen FPS games (e.g. Valorant)
+        m_lastCursorPos = ci.ptScreenPos;
+        return false;
+    }
+
     int relX = ci.ptScreenPos.x - m_screenLeft;
     int relY = ci.ptScreenPos.y - m_screenTop;
 
