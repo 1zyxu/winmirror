@@ -15,6 +15,16 @@ typedef BOOL(WINAPI* PFN_SetProcessDpiAwarenessContext)(DPI_AWARENESS_CONTEXT);
 
 namespace {
 
+uint32_t queryMonitorRefreshHz(const wchar_t* deviceName) {
+    DEVMODEW dm = {};
+    dm.dmSize = sizeof(dm);
+    const wchar_t* target = (deviceName && deviceName[0]) ? deviceName : nullptr;
+    if (EnumDisplaySettingsExW(target, ENUM_CURRENT_SETTINGS, &dm, 0) && dm.dmDisplayFrequency > 1) {
+        return static_cast<uint32_t>(dm.dmDisplayFrequency);
+    }
+    return 60u;
+}
+
 // Pure-COM WinRT WGC ABI definitions (verified against Windows SDK / Wine IDL) so builds need no cppwinrt
 struct WgcSizeInt32 {
     int32_t Width;
@@ -655,6 +665,7 @@ bool ScreenCapture::initDxgiOnAdapter(IDXGIAdapter1* adapter, bool requireLivePr
             m_screenTop = outputDesc.DesktopCoordinates.top;
             m_width = outputDesc.DesktopCoordinates.right - outputDesc.DesktopCoordinates.left;
             m_height = outputDesc.DesktopCoordinates.bottom - outputDesc.DesktopCoordinates.top;
+            m_refreshRateHz = queryMonitorRefreshHz(outputDesc.DeviceName);
 
             const DXGI_FORMAT supportedFormats[] = {
                 DXGI_FORMAT_R16G16B16A16_FLOAT,
@@ -672,6 +683,7 @@ bool ScreenCapture::initDxgiOnAdapter(IDXGIAdapter1* adapter, bool requireLivePr
                 m_screenTop = outputDesc.DesktopCoordinates.top;
                 m_width = outputDesc.DesktopCoordinates.right - outputDesc.DesktopCoordinates.left;
                 m_height = outputDesc.DesktopCoordinates.bottom - outputDesc.DesktopCoordinates.top;
+                m_refreshRateHz = queryMonitorRefreshHz(outputDesc.DeviceName);
                 hr = dxgiOutput1->DuplicateOutput(m_d3dDevice, &m_duplication);
                 dxgiOutput1->Release();
             } else {
@@ -744,6 +756,7 @@ bool ScreenCapture::initWgc() {
         mi.rcMonitor = { 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
         mi.szDevice[0] = L'\0';
     }
+    m_refreshRateHz = queryMonitorRefreshHz(mi.szDevice);
 
     IDXGIAdapter1* primaryAdapter = nullptr;
     IDXGIFactory1* factory = nullptr;
@@ -1099,7 +1112,8 @@ bool ScreenCapture::acquireFrame(uint32_t timeoutMs) {
             }
         }
         if (m_mode == CaptureMode::Gdi) {
-            if (!cooldownElapsedMs(nowMs, m_lastGdiCaptureMs, 16)) {
+            uint64_t gdiMinMs = std::max<uint64_t>(4ULL, 1000ULL / std::max<uint32_t>(30u, m_refreshRateHz));
+            if (!cooldownElapsedMs(nowMs, m_lastGdiCaptureMs, gdiMinMs)) {
                 if (timeoutMs > 0) Sleep(std::min<uint32_t>(timeoutMs, 4));
                 return false;
             }
@@ -1369,6 +1383,7 @@ bool ScreenCapture::initGdi() {
 
     m_width = GetSystemMetrics(SM_CXSCREEN);
     m_height = GetSystemMetrics(SM_CYSCREEN);
+    m_refreshRateHz = queryMonitorRefreshHz(nullptr);
     m_screenLeft = 0;
     m_screenTop = 0;
 

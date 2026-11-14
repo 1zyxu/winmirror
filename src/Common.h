@@ -24,7 +24,7 @@
 #include <chrono>
 #include <memory>
 
-#define WINMIRROR_VERSION "2.1.5"
+#define WINMIRROR_VERSION "2.1.6"
 #define WINMIRROR_REPO "1zyxu/winmirror"
 #define AIRPLAY_PORT 7001
 #define BEACON_PORT 8889
@@ -60,10 +60,11 @@ enum PacketType : uint16_t {
 };
 
 enum HelloFlags : uint16_t {
-    HELLO_FLAG_BT       = 1 << 0,
-    HELLO_FLAG_NVIDIA   = 1 << 1,
-    HELLO_FLAG_ZEROCOPY = 1 << 2,
-    HELLO_FLAG_HW_GPU   = 1 << 3
+    HELLO_FLAG_BT            = 1 << 0,
+    HELLO_FLAG_NVIDIA        = 1 << 1,
+    HELLO_FLAG_ZEROCOPY      = 1 << 2,
+    HELLO_FLAG_HW_GPU        = 1 << 3,
+    HELLO_FLAG_UNLIMITED_FPS = 1 << 4
 };
 
 #pragma pack(push, 1)

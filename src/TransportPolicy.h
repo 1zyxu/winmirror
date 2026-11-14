@@ -45,7 +45,11 @@ inline bool shouldAutoSwitchTransport(const std::string& currentIp, bool current
     return currentRttMs > 12.0 && (candRttMs + 6.0) < currentRttMs;
 }
 
-inline bool shouldPresentQueuedFrame(size_t remainingQueue, int64_t msSinceLastPresent) {
-    // Decode catch-up P-frames for DPB continuity, but only present to compositor at live edge or >= 33ms floor
-    return remainingQueue == 0 || msSinceLastPresent >= 33;
+inline bool shouldPresentQueuedFrame(size_t remainingQueue, int64_t msSinceLastPresent, uint16_t streamFps = 60) {
+    // Decode catch-up P-frames for DPB continuity, but pace compositor presentation to stream cadence
+    uint16_t effFps = (streamFps >= 30 && streamFps <= 360) ? streamFps : (streamFps > 360 ? 240 : 60);
+    int64_t minIntervalMs = 1000 / static_cast<int64_t>(effFps);
+    if (minIntervalMs < 4) minIntervalMs = 4;
+    if (minIntervalMs > 33) minIntervalMs = 33;
+    return remainingQueue == 0 || msSinceLastPresent >= minIntervalMs;
 }

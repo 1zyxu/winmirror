@@ -625,7 +625,8 @@ bool Encoder::configureMftTypes(const GUID& outputSubtype, bool wantP010, UINT32
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonMeanBitRate, bitrate);
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonBufferSize, bitrate / 10);
         setCodecUint32(m_codecApi, CODECAPI_AVEncMPVDefaultBPictureCount, 0);
-        setCodecUint32(m_codecApi, CODECAPI_AVEncMPVGOPSize, m_fps * 5);
+        UINT32 gopSize = std::min<UINT32>(600u, std::max<UINT32>(120u, m_fps * 4u));
+        setCodecUint32(m_codecApi, CODECAPI_AVEncMPVGOPSize, gopSize);
     };
     applyRtProps();
 
@@ -782,7 +783,7 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
     std::stable_sort(candidates.begin(), candidates.end(),
                      [](const auto& a, const auto& b) { return a.first < b.first; });
 
-    UINT32 bitrate = computeTargetBitrateMbps(m_width, m_height, wantP010, outputSubtype == MFVideoFormat_HEVC) * 1000000u;
+    UINT32 bitrate = computeTargetBitrateMbps(m_width, m_height, m_fps, wantP010, outputSubtype == MFVideoFormat_HEVC) * 1000000u;
 
     for (const auto& cand : candidates) {
         UINT32 idx = cand.second;

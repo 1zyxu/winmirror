@@ -10,6 +10,13 @@ if ! command -v "$ZIG" &> /dev/null && command -v zig &> /dev/null; then
 fi
 
 build_win() {
+    echo "==> Building winmirror_rt.dll (Windows x86_64 MMCSS / High-Res Timer / Driver Runtime)..."
+    "$ZIG" c++ -target x86_64-windows-gnu -shared -O3 -std=c++17 -Wl,-s \
+        src/WinMirrorRuntime.cpp \
+        -luser32 -ladvapi32 -lwinmm -lws2_32 \
+        -o winmirror_rt.dll
+    rm -f winmirror_rt.pdb
+
     echo "==> Building winmirror.exe (Windows x86_64 AirPlay HEVC/H.264 HDR + Bluetooth)..."
     "$ZIG" c++ -target x86_64-windows-gnu -O3 -std=c++17 -Wl,-s \
         src/main.cpp \
@@ -23,9 +30,9 @@ build_win() {
         -ld3d11 -ldxgi -lmfplat -lmf -lmfuuid -lwmcodecdspuuid -lole32 -loleaut32 \
         -lgdi32 -luser32 -ladvapi32 -lws2_32 -lbthprops -lwinhttp -liphlpapi -lwinmm \
         -o winmirror.exe
-    rm -f winmirror.pdb
-    echo "==> Built winmirror.exe successfully!"
-    ls -lh winmirror.exe
+    rm -f winmirror.pdb winmirror_rt.pdb WinMirrorRuntime.lib main.lib winmirror_rt.lib *.exp
+    echo "==> Built winmirror_rt.dll + winmirror.exe successfully!"
+    ls -lh winmirror_rt.dll winmirror.exe
 }
 
 build_mac() {

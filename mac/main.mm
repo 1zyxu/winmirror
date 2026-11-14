@@ -51,10 +51,11 @@ enum ColorProfile : uint8_t {
 };
 
 enum HelloFlags : uint16_t {
-    HELLO_FLAG_BT       = 1 << 0,
-    HELLO_FLAG_NVIDIA   = 1 << 1,
-    HELLO_FLAG_ZEROCOPY = 1 << 2,
-    HELLO_FLAG_HW_GPU   = 1 << 3
+    HELLO_FLAG_BT            = 1 << 0,
+    HELLO_FLAG_NVIDIA        = 1 << 1,
+    HELLO_FLAG_ZEROCOPY      = 1 << 2,
+    HELLO_FLAG_HW_GPU        = 1 << 3,
+    HELLO_FLAG_UNLIMITED_FPS = 1 << 4
 };
 
 enum PacketType : uint16_t {
@@ -1205,6 +1206,7 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
 @property (nonatomic, assign) BOOL btLinked;
 @property (nonatomic, assign) BOOL activeTransportIsUsb;
 @property (nonatomic, assign) uint16_t pcHelloFlags;
+@property (nonatomic, assign) uint16_t targetStreamFps;
 @property (nonatomic, copy) NSString *pcHostName;
 @property (nonatomic, copy) NSString *activeTransportHost;
 
@@ -1820,10 +1822,12 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
 
     uint32_t rateHz = (_audioPlayer.activeSampleRate > 0 ? _audioPlayer.activeSampleRate : _pcAudioRate);
     uint32_t khzRate = rateHz / 1000;
+    BOOL isUnlimited = (_pcHelloFlags & HELLO_FLAG_UNLIMITED_FPS) != 0;
+    NSString *fpsTargetStr = isUnlimited ? @"UNLIMITED" : [NSString stringWithFormat:@"%uHz", _targetStreamFps ? _targetStreamFps : 60];
 
-    NSString *title = [NSString stringWithFormat:@"WinMirror | %@ | %ux%u %@ | %@ [%@] %.1f FPS | %.1f Mbps | %.1f ms | %u kHz | %@",
+    NSString *title = [NSString stringWithFormat:@"WinMirror | %@ | %ux%u %@ | %@ [%@] %.1f FPS (%@) | %.1f Mbps | %.1f ms | %u kHz | %@",
                        _pcHostName, _currentWidth, _currentHeight, hdrStr, codecStr,
-                       gpuStr, _currentFps, _currentMbps, _lastRttMs, khzRate, btStr];
+                       gpuStr, _currentFps, fpsTargetStr, _currentMbps, _lastRttMs, khzRate, btStr];
     [_window setTitle:title];
 
     if (_videoView.hudVisible) {
@@ -1831,13 +1835,13 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
         NSString *hostAddr = _activeTransportHost.length ? _activeTransportHost : @"Auto";
         NSString *hudText = [NSString stringWithFormat:
             @"Host: %@ (%@) [%@]\n"
-            @"Pipeline: %ux%u %@ | %@ [%@]\n"
+            @"Pipeline: %ux%u %@ | %@ [%@] | Target %@\n"
             @"Rate: %.1f FPS | %.2f Mbps | Frame %.1f ms (Jitter %.1f ms)\n"
             @"Stream: %llu Frames | Drops %u | IDR %u\n"
             @"Audio: %u kHz | %@ | Buffer %u ms | Net RTT %.1f ms\n"
             @"Keys: [S] Telemetry HUD  [R] Request Keyframe  [M] Mute  [F] Fullscreen",
             _pcHostName, hostAddr, btStr,
-            _currentWidth, _currentHeight, hdrStr, codecStr, gpuStr,
+            _currentWidth, _currentHeight, hdrStr, codecStr, gpuStr, fpsTargetStr,
             _currentFps, _currentMbps, _avgFrameMs, _frameJitterMs,
             (unsigned long long)_totalFrames, _dropCount, _keyframeCount,
             khzRate, sigTxt, _audioPlayer.bufferedMs, _lastRttMs];
@@ -2026,6 +2030,7 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
             bool waitingKeyframe = false;
             std::atomic<uint32_t> dropCount{0};
             std::atomic<uint32_t> keyframeCount{0};
+            std::atomic<uint16_t> streamFpsHint{60};
             std::atomic<uint64_t> rxBytesWindow{0};
         } vq;
 
@@ -2063,7 +2068,7 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
 
                 auto decNow = std::chrono::steady_clock::now();
                 int64_t msSincePresent = std::chrono::duration_cast<std::chrono::milliseconds>(decNow - lastPresentTime).count();
-                bool presentFrame = shouldPresentQueuedFrame(remainingAfterPop, msSincePresent);
+                bool presentFrame = shouldPresentQueuedFrame(remainingAfterPop, msSincePresent, vq.streamFpsHint.load());
 
                 @autoreleasepool {
                     if (decoder.decodeAndPresent(pkt.data.data(), pkt.data.size(),
@@ -2213,6 +2218,8 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
                 VideoCodec codec = static_cast<VideoCodec>(hello.codec);
                 ColorProfile color = static_cast<ColorProfile>(hello.colorProfile);
                 uint16_t hflags = hello.flags;
+                uint16_t targetFpsVal = hello.fps > 0 ? hello.fps : 60;
+                vq.streamFpsHint.store((hflags & HELLO_FLAG_UNLIMITED_FPS) ? 240 : targetFpsVal);
                 uint32_t aRate = hello.audioSampleRate > 0 ? hello.audioSampleRate : 48000;
 
                 dispatch_async(dispatch_get_main_queue(), ^{
@@ -2222,6 +2229,7 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
                     controller.currentCodec = codec;
                     controller.currentColor = color;
                     controller.pcHelloFlags = hflags;
+                    controller.targetStreamFps = targetFpsVal;
                     controller.pcAudioRate = aRate;
                     [controller.videoView setVideoDimensions:w height:h hdr:(color == COLOR_HDR10_PQ)];
                     [controller refreshTitle];

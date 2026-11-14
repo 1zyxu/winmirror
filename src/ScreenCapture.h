@@ -45,6 +45,7 @@ public:
 
     uint32_t getWidth() const { return m_width; }
     uint32_t getHeight() const { return m_height; }
+    uint32_t getRefreshRateHz() const { return m_refreshRateHz; }
     bool isDxgiActive() const { return m_mode == CaptureMode::Dxgi || m_mode == CaptureMode::Wgc; }
     bool isWgcActive() const { return m_mode == CaptureMode::Wgc; }
     bool isHdrOutput() const { return m_isHdrOutput || m_format == DXGI_FORMAT_R16G16B16A16_FLOAT; }
@@ -86,6 +87,7 @@ private:
     uint64_t m_lastGdiCaptureMs = 0;
     uint32_t m_width = 0;
     uint32_t m_height = 0;
+    uint32_t m_refreshRateHz = 60;
     int32_t m_screenLeft = 0;
     int32_t m_screenTop = 0;
     DXGI_FORMAT m_format = DXGI_FORMAT_B8G8R8A8_UNORM;

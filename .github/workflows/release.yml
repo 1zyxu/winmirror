@@ -19,10 +19,15 @@ jobs:
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Build winmirror.exe
+      - name: Build winmirror_rt.dll and winmirror.exe
         run: |
           rc.exe /nologo /fo src\winmirror.res src\winmirror.rc
-          cl.exe /nologo /O2 /MD /GL /std:c++17 /EHsc `
+          cl.exe /nologo /O2 /MT /LD /GL /std:c++17 /EHsc `
+            src\WinMirrorRuntime.cpp `
+            /link /LTCG /OPT:REF /OPT:ICF `
+            user32.lib advapi32.lib winmm.lib ws2_32.lib `
+            /OUT:winmirror_rt.dll
+          cl.exe /nologo /O2 /MT /GL /std:c++17 /EHsc `
             src\main.cpp `
             src\ScreenCapture.cpp `
             src\Encoder.cpp `
@@ -36,7 +41,7 @@ jobs:
             d3d11.lib dxgi.lib dxguid.lib mfplat.lib mf.lib mfuuid.lib wmcodecdspuuid.lib `
             ole32.lib oleaut32.lib gdi32.lib user32.lib advapi32.lib ws2_32.lib bthprops.lib winhttp.lib iphlpapi.lib winmm.lib `
             /OUT:winmirror.exe
-          Compress-Archive -Path winmirror.exe -DestinationPath winmirror-windows.zip -Force
+          Compress-Archive -Path winmirror.exe, winmirror_rt.dll -DestinationPath winmirror-windows.zip -Force
 
       - name: Upload Windows Artifact
         uses: actions/upload-artifact@v4
@@ -44,6 +49,7 @@ jobs:
           name: winmirror-windows
           path: |
             winmirror.exe
+            winmirror_rt.dll
             winmirror-windows.zip
 
   build-macos:
@@ -82,6 +88,7 @@ jobs:
           name: WinMirror ${{ github.ref_name }}
           files: |
             winmirror.exe
+            winmirror_rt.dll
             winmirror-windows.zip
             winmirror_mac
           draft: false

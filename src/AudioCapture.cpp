@@ -1,4 +1,5 @@
 #include "AudioCapture.h"
+#include "WinMirrorRuntime.h"
 #include <iostream>
 #include <sstream>
 #include <vector>
@@ -374,6 +375,7 @@ void AudioCapture::stop() {
 
 void AudioCapture::captureLoop() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    HANDLE hMmcss = WinMirrorRuntimeApi::instance().enterMmcss(L"Pro Audio");
 
     std::vector<int16_t> pcmOut;
     pcmOut.reserve(48000 * 2);
@@ -521,5 +523,6 @@ void AudioCapture::captureLoop() {
         }
     }
 
+    WinMirrorRuntimeApi::instance().leaveMmcss(hMmcss);
     CoUninitialize();
 }
