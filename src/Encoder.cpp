@@ -551,9 +551,9 @@ bool Encoder::configureMftTypes(const GUID& outputSubtype, bool wantP010, UINT32
     };
     applyRtProps();
 
-    // 1. Configure Output Type FIRST (full profile+color -> minimal -> driver available type)
+    // 1. Configure Output Type FIRST (full profile+color -> color attributes -> minimal -> driver available type)
     bool outOk = false;
-    for (int mode = 0; mode < 2 && !outOk; ++mode) {
+    for (int mode = 0; mode < 3 && !outOk; ++mode) {
         IMFMediaType* outType = nullptr;
         if (FAILED(MFCreateMediaType(&outType)) || !outType) continue;
         outType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
@@ -568,6 +568,8 @@ bool Encoder::configureMftTypes(const GUID& outputSubtype, bool wantP010, UINT32
                 (outputSubtype == MFVideoFormat_HEVC)
                     ? (wantP010 ? eAVEncH265VProfile_Main_420_10 : eAVEncH265VProfile_Main_420_8)
                     : eAVEncH264VProfile_High);
+        }
+        if (mode <= 1) {
             applyColorAttributes(outType, wantP010);
         }
         outOk = SUCCEEDED(m_mft->SetOutputType(m_outStreamId, outType, 0));
@@ -584,6 +586,7 @@ bool Encoder::configureMftTypes(const GUID& outputSubtype, bool wantP010, UINT32
             MFSetAttributeRatio(availOut, MF_MT_FRAME_RATE, m_fps, 1);
             MFSetAttributeRatio(availOut, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
             availOut->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+            applyColorAttributes(availOut, wantP010);
             outOk = SUCCEEDED(m_mft->SetOutputType(m_outStreamId, availOut, 0));
         }
         availOut->Release();
@@ -592,10 +595,10 @@ bool Encoder::configureMftTypes(const GUID& outputSubtype, bool wantP010, UINT32
 
     applyRtProps();
 
-    // 2. Configure Input Type SECOND (with stride+color -> minimal -> driver available type)
+    // 2. Configure Input Type SECOND (stride+color -> color attributes -> minimal -> driver available type)
     const GUID inSubtype = wantP010 ? MFVideoFormat_P010 : MFVideoFormat_NV12;
     bool inOk = false;
-    for (int mode = 0; mode < 2 && !inOk; ++mode) {
+    for (int mode = 0; mode < 3 && !inOk; ++mode) {
         IMFMediaType* inType = nullptr;
         if (FAILED(MFCreateMediaType(&inType)) || !inType) continue;
         inType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
@@ -606,6 +609,8 @@ bool Encoder::configureMftTypes(const GUID& outputSubtype, bool wantP010, UINT32
         inType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
         if (mode == 0) {
             inType->SetUINT32(MF_MT_DEFAULT_STRIDE, wantP010 ? (m_width * 2) : m_width);
+        }
+        if (mode <= 1) {
             applyColorAttributes(inType, wantP010);
         }
         inOk = SUCCEEDED(m_mft->SetInputType(m_inStreamId, inType, 0));
@@ -621,6 +626,7 @@ bool Encoder::configureMftTypes(const GUID& outputSubtype, bool wantP010, UINT32
             MFSetAttributeRatio(availIn, MF_MT_FRAME_RATE, m_fps, 1);
             MFSetAttributeRatio(availIn, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
             availIn->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+            applyColorAttributes(availIn, wantP010);
             inOk = SUCCEEDED(m_mft->SetInputType(m_inStreamId, availIn, 0));
         }
         availIn->Release();
@@ -695,7 +701,9 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
                      [](const auto& a, const auto& b) { return a.first < b.first; });
 
     uint64_t pixels = static_cast<uint64_t>(m_width) * m_height;
-    UINT32 bitrate = (pixels > 3000000ULL) ? 28000000u : 14000000u;
+    UINT32 bitrate = wantP010
+        ? ((pixels > 3000000ULL) ? 32000000u : 18000000u)
+        : ((pixels > 3000000ULL) ? 28000000u : 14000000u);
 
     for (const auto& cand : candidates) {
         UINT32 idx = cand.second;

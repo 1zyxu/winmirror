@@ -294,7 +294,7 @@ bool ScreenCapture::initDxgiOnAdapter(IDXGIAdapter1* adapter) {
         if (SUCCEEDED(dxgiOutput6->GetDesc1(&desc1))) {
             m_isHdrOutput = (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
         }
-        dxgiOutput6->Release();
+        m_dxgiOutput6 = dxgiOutput6; // kept for live Auto-HDR / Win+Alt+B re-checks
     }
 
     // Prefer DuplicateOutput1 so Windows hands us native HDR scRGB R16G16B16A16_FLOAT when Windows HDR is ON
@@ -353,6 +353,7 @@ void ScreenCapture::cleanupDxgi() {
     m_latestSlot.store(0);
     if (m_stagingTexture) { m_stagingTexture->Release(); m_stagingTexture = nullptr; }
     if (m_duplication) { m_duplication->Release(); m_duplication = nullptr; }
+    if (m_dxgiOutput6) { m_dxgiOutput6->Release(); m_dxgiOutput6 = nullptr; }
     if (m_d3dContext) { m_d3dContext->Release(); m_d3dContext = nullptr; }
     if (m_d3dDevice) { m_d3dDevice->Release(); m_d3dDevice = nullptr; }
 }
@@ -439,6 +440,12 @@ bool ScreenCapture::acquireDxgi(uint32_t timeoutMs) {
         m_width = actualDesc.Width;
         m_height = actualDesc.Height;
         m_format = actualDesc.Format;
+        if (m_dxgiOutput6) {
+            DXGI_OUTPUT_DESC1 desc1 = {};
+            if (SUCCEEDED(m_dxgiOutput6->GetDesc1(&desc1))) {
+                m_isHdrOutput = (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+            }
+        }
 
         D3D11_TEXTURE2D_DESC gpuDesc = {};
         gpuDesc.Width = m_width;

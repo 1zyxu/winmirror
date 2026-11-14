@@ -89,6 +89,7 @@ private:
     std::atomic<int> m_latestSlot{0};
     ID3D11Device* m_d3dDevice = nullptr;
     ID3D11DeviceContext* m_d3dContext = nullptr;
+    IDXGIOutput6* m_dxgiOutput6 = nullptr;
     IDXGIOutputDuplication* m_duplication = nullptr;
     ID3D11Texture2D* m_gpuCopyTex[2] = { nullptr, nullptr };
     ID3D11Texture2D* m_stagingTexture = nullptr;

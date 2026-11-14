@@ -570,7 +570,7 @@ static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObject
         _displayLayer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
         _displayLayer.videoGravity = AVLayerVideoGravityResizeAspect;
         _displayLayer.backgroundColor = [NSColor blackColor].CGColor;
-        _displayLayer.wantsExtendedDynamicRangeContent = YES;
+        _displayLayer.wantsExtendedDynamicRangeContent = NO;
         [self.layer addSublayer:_displayLayer];
 
         _cursorLayer = [CALayer layer];
@@ -652,7 +652,7 @@ static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObject
         _videoW = w;
         _videoH = h;
     }
-    _displayLayer.wantsExtendedDynamicRangeContent = YES;
+    _displayLayer.wantsExtendedDynamicRangeContent = isHdr;
     [self repositionCursor];
 }
 
