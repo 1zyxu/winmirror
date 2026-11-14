@@ -165,19 +165,11 @@ void ScreenCapture::cleanup() {
 bool ScreenCapture::initDxgi() {
     cleanupDxgi();
 
-    D3D_FEATURE_LEVEL featureLevels[] = {
-        D3D_FEATURE_LEVEL_11_1,
-        D3D_FEATURE_LEVEL_11_0,
-        D3D_FEATURE_LEVEL_10_1,
-        D3D_FEATURE_LEVEL_10_0
-    };
-    D3D_FEATURE_LEVEL chosenLevel;
-
-    // Prefer NVIDIA adapter (0x10DE) that owns an active desktop output; fallback to primary GPU
-    IDXGIAdapter1* preferredAdapter = nullptr;
+    // Enumerate adapters owning a desktop output, trying NVIDIA (0x10DE) first before iGPU fallback
+    std::vector<IDXGIAdapter1*> nvidiaAdapters;
+    std::vector<IDXGIAdapter1*> otherAdapters;
     IDXGIFactory1* factory = nullptr;
     if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) && factory) {
-        IDXGIAdapter1* fallbackAdapter = nullptr;
         for (UINT idx = 0; ; ++idx) {
             IDXGIAdapter1* cand = nullptr;
             if (factory->EnumAdapters1(idx, &cand) == DXGI_ERROR_NOT_FOUND || !cand) break;
@@ -194,29 +186,45 @@ bool ScreenCapture::initDxgi() {
             if (out) out->Release();
 
             if (hasOutput) {
-                if (ad.VendorId == 0x10DE && !preferredAdapter) {
-                    preferredAdapter = cand;
-                    break;
-                }
-                if (!fallbackAdapter) {
-                    fallbackAdapter = cand;
-                    continue;
-                }
+                if (ad.VendorId == 0x10DE) nvidiaAdapters.push_back(cand);
+                else otherAdapters.push_back(cand);
+                continue;
             }
             cand->Release();
-        }
-        if (!preferredAdapter) {
-            preferredAdapter = fallbackAdapter;
-        } else if (fallbackAdapter) {
-            fallbackAdapter->Release();
         }
         factory->Release();
     }
 
-    auto tryCreateOnAdapter = [&](IDXGIAdapter* adp, UINT flags) -> HRESULT {
+    bool ok = false;
+    for (IDXGIAdapter1* cand : nvidiaAdapters) {
+        if (!ok) ok = initDxgiOnAdapter(cand);
+        cand->Release();
+    }
+    for (IDXGIAdapter1* cand : otherAdapters) {
+        if (!ok) ok = initDxgiOnAdapter(cand);
+        cand->Release();
+    }
+    if (!ok) {
+        ok = initDxgiOnAdapter(nullptr);
+    }
+    return ok;
+}
+
+bool ScreenCapture::initDxgiOnAdapter(IDXGIAdapter1* adapter) {
+    cleanupDxgi();
+
+    D3D_FEATURE_LEVEL featureLevels[] = {
+        D3D_FEATURE_LEVEL_11_1,
+        D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0
+    };
+    D3D_FEATURE_LEVEL chosenLevel;
+
+    auto tryCreate = [&](UINT flags) -> HRESULT {
         return D3D11CreateDevice(
-            adp,
-            adp ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
+            adapter,
+            adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
             nullptr,
             flags,
             featureLevels,
@@ -228,19 +236,14 @@ bool ScreenCapture::initDxgi() {
         );
     };
 
-    HRESULT hr = tryCreateOnAdapter(preferredAdapter, D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT);
+    HRESULT hr = tryCreate(D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT);
     if (FAILED(hr)) {
-        hr = tryCreateOnAdapter(preferredAdapter, D3D11_CREATE_DEVICE_BGRA_SUPPORT);
+        hr = tryCreate(D3D11_CREATE_DEVICE_BGRA_SUPPORT);
     }
-    if (FAILED(hr) && preferredAdapter) {
-        hr = tryCreateOnAdapter(nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT);
+    if (FAILED(hr) || !m_d3dDevice || !m_d3dContext) {
+        cleanupDxgi();
+        return false;
     }
-    if (preferredAdapter) {
-        preferredAdapter->Release();
-        preferredAdapter = nullptr;
-    }
-
-    if (FAILED(hr) || !m_d3dDevice || !m_d3dContext) return false;
 
     ID3D10Multithread* mt = nullptr;
     if (SUCCEEDED(m_d3dDevice->QueryInterface(__uuidof(ID3D10Multithread), reinterpret_cast<void**>(&mt)))) {
@@ -267,8 +270,6 @@ bool ScreenCapture::initDxgi() {
             WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, &name[0], utf8Len, nullptr, nullptr);
             m_adapterName = std::move(name);
         }
-        std::cout << "[ScreenCapture] GPU Adapter: " << m_adapterName
-                  << (m_isNvidiaGpu ? " (NVIDIA Dedicated)" : "") << std::endl;
     }
 
     IDXGIOutput* dxgiOutput = nullptr;
@@ -304,6 +305,8 @@ bool ScreenCapture::initDxgi() {
         dxgiOutput5->Release();
         dxgiOutput->Release();
         if (SUCCEEDED(hr) && m_duplication) {
+            std::cout << "[ScreenCapture] GPU Adapter: " << m_adapterName
+                      << (m_isNvidiaGpu ? " (NVIDIA Dedicated)" : " (Display Owner)") << std::endl;
             return true;
         }
         cleanupDxgi();
@@ -326,6 +329,8 @@ bool ScreenCapture::initDxgi() {
     dxgiOutput1->Release();
     if (FAILED(hr)) { cleanupDxgi(); return false; }
 
+    std::cout << "[ScreenCapture] GPU Adapter: " << m_adapterName
+              << (m_isNvidiaGpu ? " (NVIDIA Dedicated)" : " (Display Owner)") << std::endl;
     return true;
 }
 

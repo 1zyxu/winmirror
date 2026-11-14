@@ -38,15 +38,22 @@ public:
     bool isHdrActive() const { return m_colorProfile == COLOR_HDR10_PQ; }
     bool isHardwareGpu() const { return m_isHardware; }
     bool isNvidiaEncoder() const { return m_isNvidia; }
-    bool isZeroCopyActive() const { return m_useD3dManager; }
+    bool isZeroCopyActive() const { return m_useD3dManager && !m_nvDevice; }
     const std::string& getEncoderName() const { return m_encoderName; }
     DXGI_FORMAT getSrcFormat() const { return m_srcFormat; }
 
 private:
+    bool initEncodeDevice();
+    void cleanupEncodeDevice();
+    bool initNvUploadTextures(bool useP010);
+    void cleanupNvUploadTextures();
+    bool uploadYuvToNvTexture(const std::vector<uint8_t>& yuvData, ID3D11Texture2D* dstTex);
+
     bool initVideoProcessor(DXGI_FORMAT srcFormat, bool useP010);
     void cleanupVideoProcessor();
 
-    bool tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwareOnly, const char* label);
+    bool tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwareOnly, bool nvidiaOnly, const char* label);
+    bool configureMftTypes(const GUID& outputSubtype, bool wantP010, UINT32 bitrate);
     void cleanupMft();
 
     bool copyTextureToPackedYuv(ID3D11Texture2D* gpuYuvTex, std::vector<uint8_t>& outYuv);
@@ -54,13 +61,20 @@ private:
 
     bool waitAsyncInputReady();
     bool submitSampleToMft(IMFSample* sample, std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe, bool& outInputAccepted);
+    bool submitDxgiSurface(ID3D11Texture2D* tex, uint64_t ptsUs,
+                           std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe, bool& outInputAccepted);
     bool encodePackedYuv(const std::vector<uint8_t>& yuvData, uint64_t ptsUs,
                          std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe);
     bool collectSyncOutput(std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe);
     bool pumpAsyncEvents(std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe, bool waitOutput);
 
-    ID3D11Device* m_d3dDevice = nullptr;      // non-owning
-    ID3D11DeviceContext* m_d3dContext = nullptr; // non-owning
+    ID3D11Device* m_d3dDevice = nullptr;      // non-owning (capture GPU)
+    ID3D11DeviceContext* m_d3dContext = nullptr; // non-owning (capture GPU)
+    ID3D11Device* m_nvDevice = nullptr;       // owning dedicated NVIDIA GPU when Optimus capture is on iGPU
+    ID3D11DeviceContext* m_nvContext = nullptr;
+    LUID m_encLuid = {};
+    bool m_hasEncLuid = false;
+    bool m_encIsNvidia = false;
 
     uint32_t m_width = 0;
     uint32_t m_height = 0;
@@ -87,6 +101,8 @@ private:
     ID3D11VideoProcessorOutputView* m_vpOutView[kVpRingSize] = {};
     int m_vpRingIdx = 0;
     ID3D11Texture2D* m_vpStagingTex = nullptr;
+    ID3D11Texture2D* m_nvGpuTex[kVpRingSize] = {};
+    ID3D11Texture2D* m_nvUploadTex = nullptr;
     bool m_hasVideoProcessor = false;
 
     // Zero-Copy D3D11 Media Foundation Manager

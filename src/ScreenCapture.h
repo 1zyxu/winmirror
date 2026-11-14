@@ -47,6 +47,7 @@ public:
 
 private:
     bool initDxgi();
+    bool initDxgiOnAdapter(IDXGIAdapter1* adapter);
     void cleanupDxgi();
     bool acquireDxgi();
 

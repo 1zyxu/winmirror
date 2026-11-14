@@ -6,18 +6,32 @@
 #include <cctype>
 #include <cstring>
 
-static std::string readMftFriendlyName(IMFActivate* act) {
+// Adapter LUID attribute for MFTEnum2 (defined locally for MinGW + Windows SDK portability)
+static const GUID kMFT_ENUM_ADAPTER_LUID = {
+    0x1d39518c, 0xe220, 0x4da8, { 0xa0, 0x7f, 0xba, 0x17, 0x25, 0x52, 0xd6, 0xb1 }
+};
+
+using PFN_MFTEnum2 = HRESULT(WINAPI*)(GUID, UINT32, const MFT_REGISTER_TYPE_INFO*,
+                                     const MFT_REGISTER_TYPE_INFO*, IMFAttributes*,
+                                     IMFActivate***, UINT32*);
+
+static std::string wideToUtf8(const WCHAR* w) {
+    if (!w || !*w) return {};
+    int utf8Len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    if (utf8Len <= 1) return {};
+    std::string out(utf8Len - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, &out[0], utf8Len, nullptr, nullptr);
+    return out;
+}
+
+static std::string readMftAttrString(IMFActivate* act, const GUID& key) {
     if (!act) return {};
-    WCHAR* friendlyName = nullptr;
-    UINT32 nameLen = 0;
+    WCHAR* str = nullptr;
+    UINT32 len = 0;
     std::string out;
-    if (SUCCEEDED(act->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute, &friendlyName, &nameLen)) && friendlyName) {
-        int utf8Len = WideCharToMultiByte(CP_UTF8, 0, friendlyName, -1, nullptr, 0, nullptr, nullptr);
-        if (utf8Len > 1) {
-            out.assign(utf8Len - 1, '\0');
-            WideCharToMultiByte(CP_UTF8, 0, friendlyName, -1, &out[0], utf8Len, nullptr, nullptr);
-        }
-        CoTaskMemFree(friendlyName);
+    if (SUCCEEDED(act->GetAllocatedString(key, &str, &len)) && str) {
+        out = wideToUtf8(str);
+        CoTaskMemFree(str);
     }
     return out;
 }
@@ -28,6 +42,12 @@ static bool containsInsensitive(const std::string& haystack, const char* needle)
     for (char& c : h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     for (char& c : n) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return h.find(n) != std::string::npos;
+}
+
+static bool isNvidiaMftCandidate(IMFActivate* act, std::string& outFriendlyName) {
+    outFriendlyName = readMftAttrString(act, MFT_FRIENDLY_NAME_Attribute);
+    std::string vendorId = readMftAttrString(act, MFT_ENUM_HARDWARE_VENDOR_ID_Attribute);
+    return containsInsensitive(vendorId, "10de") || containsInsensitive(outFriendlyName, "nvidia");
 }
 
 static const DXGI_FORMAT kTryVideoProcInFormats[] = {
@@ -80,6 +100,188 @@ Encoder::~Encoder() {
     cleanup();
 }
 
+bool Encoder::initEncodeDevice() {
+    cleanupEncodeDevice();
+
+    bool capIsNvidia = false;
+    if (m_d3dDevice) {
+        IDXGIDevice* dxgiDev = nullptr;
+        if (SUCCEEDED(m_d3dDevice->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgiDev))) && dxgiDev) {
+            IDXGIAdapter* adp = nullptr;
+            if (SUCCEEDED(dxgiDev->GetParent(__uuidof(IDXGIAdapter), reinterpret_cast<void**>(&adp))) && adp) {
+                DXGI_ADAPTER_DESC desc = {};
+                if (SUCCEEDED(adp->GetDesc(&desc))) {
+                    m_encLuid = desc.AdapterLuid;
+                    m_hasEncLuid = true;
+                    capIsNvidia = (desc.VendorId == 0x10DE);
+                    m_encIsNvidia = capIsNvidia;
+                }
+                adp->Release();
+            }
+            dxgiDev->Release();
+        }
+    }
+
+    // Optimus / hybrid PC: capture runs on display-owning iGPU, so spin up a dedicated NVIDIA device for NVENC
+    if (!capIsNvidia) {
+        IDXGIFactory1* factory = nullptr;
+        if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) && factory) {
+            for (UINT idx = 0; ; ++idx) {
+                IDXGIAdapter1* cand = nullptr;
+                if (factory->EnumAdapters1(idx, &cand) == DXGI_ERROR_NOT_FOUND || !cand) break;
+
+                DXGI_ADAPTER_DESC1 ad = {};
+                cand->GetDesc1(&ad);
+                if (!(ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && ad.VendorId == 0x10DE) {
+                    D3D_FEATURE_LEVEL levels[] = {
+                        D3D_FEATURE_LEVEL_11_1,
+                        D3D_FEATURE_LEVEL_11_0,
+                        D3D_FEATURE_LEVEL_10_1,
+                        D3D_FEATURE_LEVEL_10_0
+                    };
+                    D3D_FEATURE_LEVEL chosen;
+                    HRESULT hr = D3D11CreateDevice(
+                        cand, D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                        levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
+                        &m_nvDevice, &chosen, &m_nvContext);
+                    if (FAILED(hr)) {
+                        hr = D3D11CreateDevice(
+                            cand, D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                            levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
+                            &m_nvDevice, &chosen, &m_nvContext);
+                    }
+                    if (SUCCEEDED(hr) && m_nvDevice && m_nvContext) {
+                        ID3D10Multithread* mt = nullptr;
+                        if (SUCCEEDED(m_nvDevice->QueryInterface(__uuidof(ID3D10Multithread), reinterpret_cast<void**>(&mt)))) {
+                            mt->SetMultithreadProtected(TRUE);
+                            mt->Release();
+                        }
+                        IDXGIDevice* nvDxgi = nullptr;
+                        if (SUCCEEDED(m_nvDevice->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&nvDxgi))) && nvDxgi) {
+                            nvDxgi->SetGPUThreadPriority(7);
+                            nvDxgi->Release();
+                        }
+                        m_encLuid = ad.AdapterLuid;
+                        m_hasEncLuid = true;
+                        m_encIsNvidia = true;
+                        std::cout << "[Encoder] Dedicated NVIDIA Encode GPU: " << wideToUtf8(ad.Description)
+                                  << " (Optimus bridge active)" << std::endl;
+                        cand->Release();
+                        break;
+                    }
+                }
+                cand->Release();
+            }
+            factory->Release();
+        }
+    }
+
+    ID3D11Device* activeEncDev = m_nvDevice ? m_nvDevice : m_d3dDevice;
+    if (activeEncDev) {
+        if (SUCCEEDED(MFCreateDXGIDeviceManager(&m_dxgiResetToken, &m_dxgiManager)) && m_dxgiManager) {
+            if (FAILED(m_dxgiManager->ResetDevice(activeEncDev, m_dxgiResetToken))) {
+                m_dxgiManager->Release();
+                m_dxgiManager = nullptr;
+            }
+        }
+    }
+    return true;
+}
+
+void Encoder::cleanupEncodeDevice() {
+    cleanupNvUploadTextures();
+    if (m_dxgiManager) {
+        m_dxgiManager->Release();
+        m_dxgiManager = nullptr;
+    }
+    if (m_nvContext) {
+        m_nvContext->Release();
+        m_nvContext = nullptr;
+    }
+    if (m_nvDevice) {
+        m_nvDevice->Release();
+        m_nvDevice = nullptr;
+    }
+    m_encLuid = {};
+    m_hasEncLuid = false;
+    m_encIsNvidia = false;
+}
+
+bool Encoder::initNvUploadTextures(bool useP010) {
+    cleanupNvUploadTextures();
+    if (!m_nvDevice) return true;
+
+    DXGI_FORMAT fmt = useP010 ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12;
+    D3D11_TEXTURE2D_DESC gpuDesc = {};
+    gpuDesc.Width = m_width;
+    gpuDesc.Height = m_height;
+    gpuDesc.MipLevels = 1;
+    gpuDesc.ArraySize = 1;
+    gpuDesc.Format = fmt;
+    gpuDesc.SampleDesc.Count = 1;
+    gpuDesc.Usage = D3D11_USAGE_DEFAULT;
+    gpuDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    for (int i = 0; i < kVpRingSize; ++i) {
+        HRESULT hr = m_nvDevice->CreateTexture2D(&gpuDesc, nullptr, &m_nvGpuTex[i]);
+        if (FAILED(hr) || !m_nvGpuTex[i]) {
+            gpuDesc.BindFlags = 0;
+            hr = m_nvDevice->CreateTexture2D(&gpuDesc, nullptr, &m_nvGpuTex[i]);
+        }
+        if (FAILED(hr) || !m_nvGpuTex[i]) {
+            cleanupNvUploadTextures();
+            return false;
+        }
+    }
+
+    D3D11_TEXTURE2D_DESC stDesc = gpuDesc;
+    stDesc.Usage = D3D11_USAGE_STAGING;
+    stDesc.BindFlags = 0;
+    stDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(m_nvDevice->CreateTexture2D(&stDesc, nullptr, &m_nvUploadTex)) || !m_nvUploadTex) {
+        cleanupNvUploadTextures();
+        return false;
+    }
+    return true;
+}
+
+void Encoder::cleanupNvUploadTextures() {
+    if (m_nvUploadTex) { m_nvUploadTex->Release(); m_nvUploadTex = nullptr; }
+    for (int i = 0; i < kVpRingSize; ++i) {
+        if (m_nvGpuTex[i]) { m_nvGpuTex[i]->Release(); m_nvGpuTex[i] = nullptr; }
+    }
+}
+
+bool Encoder::uploadYuvToNvTexture(const std::vector<uint8_t>& yuvData, ID3D11Texture2D* dstTex) {
+    if (!m_nvContext || !m_nvUploadTex || !dstTex) return false;
+
+    size_t rowBytes = m_useP010 ? (static_cast<size_t>(m_width) * 2) : static_cast<size_t>(m_width);
+    size_t totalRows = static_cast<size_t>(m_height) + m_height / 2;
+    if (yuvData.size() < totalRows * rowBytes) return false;
+
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(m_nvContext->Map(m_nvUploadTex, 0, D3D11_MAP_WRITE, 0, &mapped))) return false;
+
+    if (mapped.RowPitch < rowBytes) {
+        m_nvContext->Unmap(m_nvUploadTex, 0);
+        return false;
+    }
+
+    const uint8_t* src = yuvData.data();
+    uint8_t* dst = static_cast<uint8_t*>(mapped.pData);
+    for (size_t y = 0; y < totalRows; ++y) {
+        memcpy(dst, src, rowBytes);
+        src += rowBytes;
+        dst += mapped.RowPitch;
+    }
+    m_nvContext->Unmap(m_nvUploadTex, 0);
+    m_nvContext->CopyResource(dstTex, m_nvUploadTex);
+    m_nvContext->Flush();
+    return true;
+}
+
 bool Encoder::init(ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dContext,
                    uint32_t width, uint32_t height, DXGI_FORMAT srcFormat,
                    uint32_t fps, bool isHdrDisplay) {
@@ -103,53 +305,71 @@ bool Encoder::init(ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dContext,
         return false;
     }
 
-    if (m_d3dDevice) {
-        if (SUCCEEDED(MFCreateDXGIDeviceManager(&m_dxgiResetToken, &m_dxgiManager)) && m_dxgiManager) {
-            if (FAILED(m_dxgiManager->ResetDevice(m_d3dDevice, m_dxgiResetToken))) {
-                m_dxgiManager->Release();
-                m_dxgiManager = nullptr;
+    initEncodeDevice();
+
+    struct EncodeAttempt {
+        GUID subtype;
+        bool p010;
+        bool hw;
+        bool nvidiaOnly;
+        const char* label;
+    };
+    std::vector<EncodeAttempt> plan;
+    if (m_encIsNvidia) {
+        if (m_isHdrSource) {
+            plan.push_back({ MFVideoFormat_HEVC, true,  true, true, "NVENC HEVC 10-bit HDR10 (GPU)" });
+        }
+        plan.push_back({ MFVideoFormat_HEVC, false, true, true, "NVENC HEVC 8-bit (GPU)" });
+        plan.push_back({ MFVideoFormat_H264, false, true, true, "NVENC H.264 (GPU)" });
+    }
+    if (m_isHdrSource) {
+        plan.push_back({ MFVideoFormat_HEVC, true,  true, false, "HEVC 10-bit HDR10 (GPU)" });
+    }
+    plan.push_back({ MFVideoFormat_HEVC, false, true,  false, "HEVC 8-bit (GPU)" });
+    plan.push_back({ MFVideoFormat_H264, false, true,  false, "H.264 (GPU Hardware)" });
+    plan.push_back({ MFVideoFormat_H264, false, false, false, "H.264 (Windows MFT)" });
+
+    int vpMode = -1; // -1 = none, 0 = 8-bit NV12, 1 = 10-bit P010
+    for (const auto& step : plan) {
+        if (step.p010 && !m_d3dDevice) continue;
+
+        if (!step.nvidiaOnly && m_nvDevice) {
+            // Dedicated NVIDIA GPU had no working NVENC MFT; revert DXGI manager to capture GPU for iGPU/SW fallback
+            cleanupNvUploadTextures();
+            if (m_nvContext) { m_nvContext->Release(); m_nvContext = nullptr; }
+            if (m_nvDevice) { m_nvDevice->Release(); m_nvDevice = nullptr; }
+            m_encIsNvidia = false;
+            m_hasEncLuid = false;
+            if (m_dxgiManager && m_d3dDevice) {
+                if (FAILED(m_dxgiManager->ResetDevice(m_d3dDevice, m_dxgiResetToken))) {
+                    m_dxgiManager->Release();
+                    m_dxgiManager = nullptr;
+                }
             }
         }
-    }
 
-    // 1. If HDR monitor/game active, try 10-bit HEVC HDR10 (P010 + BT.2020 ST2084 PQ) on GPU
-    if (m_isHdrSource && m_d3dDevice && initVideoProcessor(srcFormat, true)) {
-        if (tryCreateMft(MFVideoFormat_HEVC, true, true, "HEVC 10-bit HDR10 (GPU)")) {
-            m_useP010 = true;
-            m_codec = CODEC_HEVC;
-            m_colorProfile = COLOR_HDR10_PQ;
+        int targetMode = step.p010 ? 1 : 0;
+        if (vpMode != targetMode) {
+            cleanupVideoProcessor();
+            cleanupNvUploadTextures();
+            vpMode = -1;
+            if (m_d3dDevice) {
+                bool vpOk = initVideoProcessor(srcFormat, step.p010);
+                if (step.p010 && !vpOk) continue;
+                if (vpOk && !initNvUploadTextures(step.p010)) {
+                    if (step.p010) { cleanupVideoProcessor(); continue; }
+                }
+            }
+            vpMode = targetMode;
+        }
+
+        m_useP010 = step.p010;
+        m_colorProfile = step.p010 ? COLOR_HDR10_PQ : COLOR_SDR_BT709;
+        if (tryCreateMft(step.subtype, step.p010, step.hw, step.nvidiaOnly, step.label)) {
+            m_codec = (step.subtype == MFVideoFormat_HEVC) ? CODEC_HEVC : CODEC_H264;
             std::cout << "[Encoder] Initialized: " << m_encoderName << " " << m_width << "x" << m_height << std::endl;
             return true;
         }
-        cleanupVideoProcessor();
-    }
-
-    // 2. Try 8-bit BT.709 Studio (GPU VideoProcessor -> NV12, or CPU fallback -> NV12)
-    if (m_d3dDevice) {
-        m_hasVideoProcessor = initVideoProcessor(srcFormat, false);
-    }
-    m_useP010 = false;
-    m_colorProfile = COLOR_SDR_BT709;
-
-    // 2a. Hardware HEVC 8-bit
-    if (tryCreateMft(MFVideoFormat_HEVC, false, true, "HEVC 8-bit (GPU)")) {
-        m_codec = CODEC_HEVC;
-        std::cout << "[Encoder] Initialized: " << m_encoderName << " " << m_width << "x" << m_height << std::endl;
-        return true;
-    }
-
-    // 2b. Hardware H.264 8-bit
-    if (tryCreateMft(MFVideoFormat_H264, false, true, "H.264 (GPU Hardware)")) {
-        m_codec = CODEC_H264;
-        std::cout << "[Encoder] Initialized: " << m_encoderName << " " << m_width << "x" << m_height << std::endl;
-        return true;
-    }
-
-    // 2c. Guaranteed Windows built-in H.264 MFT fallback
-    if (tryCreateMft(MFVideoFormat_H264, false, false, "H.264 (Windows MFT)")) {
-        m_codec = CODEC_H264;
-        std::cout << "[Encoder] Initialized: " << m_encoderName << " " << m_width << "x" << m_height << std::endl;
-        return true;
     }
 
     cleanup();
@@ -159,10 +379,7 @@ bool Encoder::init(ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dContext,
 void Encoder::cleanup() {
     cleanupMft();
     cleanupVideoProcessor();
-    if (m_dxgiManager) {
-        m_dxgiManager->Release();
-        m_dxgiManager = nullptr;
-    }
+    cleanupEncodeDevice();
     if (m_mfStarted) {
         MFShutdown();
         m_mfStarted = false;
@@ -285,18 +502,145 @@ void Encoder::cleanupVideoProcessor() {
     if (m_videoDevice) { m_videoDevice->Release(); m_videoDevice = nullptr; }
 }
 
-bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwareOnly, const char* label) {
+bool Encoder::configureMftTypes(const GUID& outputSubtype, bool wantP010, UINT32 bitrate) {
+    auto applyRtProps = [&]() {
+        if (!m_codecApi) return;
+        setCodecBool(m_codecApi, CODECAPI_AVLowLatencyMode, true);
+        setCodecBool(m_codecApi, CODECAPI_AVEncCommonRealTime, true);
+        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonQualityVsSpeed, 0);
+        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
+        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonMeanBitRate, bitrate);
+        setCodecUint32(m_codecApi, CODECAPI_AVEncMPVDefaultBPictureCount, 0);
+        setCodecUint32(m_codecApi, CODECAPI_AVEncMPVGOPSize, m_fps * 2);
+    };
+    applyRtProps();
+
+    // 1. Configure Output Type FIRST (full profile+color -> minimal -> driver available type)
+    bool outOk = false;
+    for (int mode = 0; mode < 2 && !outOk; ++mode) {
+        IMFMediaType* outType = nullptr;
+        if (FAILED(MFCreateMediaType(&outType)) || !outType) continue;
+        outType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        outType->SetGUID(MF_MT_SUBTYPE, outputSubtype);
+        outType->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
+        MFSetAttributeSize(outType, MF_MT_FRAME_SIZE, m_width, m_height);
+        MFSetAttributeRatio(outType, MF_MT_FRAME_RATE, m_fps, 1);
+        MFSetAttributeRatio(outType, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+        outType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        if (mode == 0) {
+            outType->SetUINT32(MF_MT_MPEG2_PROFILE,
+                (outputSubtype == MFVideoFormat_HEVC)
+                    ? (wantP010 ? eAVEncH265VProfile_Main_420_10 : eAVEncH265VProfile_Main_420_8)
+                    : eAVEncH264VProfile_High);
+            applyColorAttributes(outType, wantP010);
+        }
+        outOk = SUCCEEDED(m_mft->SetOutputType(m_outStreamId, outType, 0));
+        outType->Release();
+    }
+    for (DWORD k = 0; !outOk; ++k) {
+        IMFMediaType* availOut = nullptr;
+        if (FAILED(m_mft->GetOutputAvailableType(m_outStreamId, k, &availOut)) || !availOut) break;
+        GUID st = GUID_NULL;
+        availOut->GetGUID(MF_MT_SUBTYPE, &st);
+        if (st == outputSubtype) {
+            availOut->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
+            MFSetAttributeSize(availOut, MF_MT_FRAME_SIZE, m_width, m_height);
+            MFSetAttributeRatio(availOut, MF_MT_FRAME_RATE, m_fps, 1);
+            MFSetAttributeRatio(availOut, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+            availOut->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+            outOk = SUCCEEDED(m_mft->SetOutputType(m_outStreamId, availOut, 0));
+        }
+        availOut->Release();
+    }
+    if (!outOk) return false;
+
+    applyRtProps();
+
+    // 2. Configure Input Type SECOND (with stride+color -> minimal -> driver available type)
+    const GUID inSubtype = wantP010 ? MFVideoFormat_P010 : MFVideoFormat_NV12;
+    bool inOk = false;
+    for (int mode = 0; mode < 2 && !inOk; ++mode) {
+        IMFMediaType* inType = nullptr;
+        if (FAILED(MFCreateMediaType(&inType)) || !inType) continue;
+        inType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        inType->SetGUID(MF_MT_SUBTYPE, inSubtype);
+        MFSetAttributeSize(inType, MF_MT_FRAME_SIZE, m_width, m_height);
+        MFSetAttributeRatio(inType, MF_MT_FRAME_RATE, m_fps, 1);
+        MFSetAttributeRatio(inType, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+        inType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        if (mode == 0) {
+            inType->SetUINT32(MF_MT_DEFAULT_STRIDE, wantP010 ? (m_width * 2) : m_width);
+            applyColorAttributes(inType, wantP010);
+        }
+        inOk = SUCCEEDED(m_mft->SetInputType(m_inStreamId, inType, 0));
+        inType->Release();
+    }
+    for (DWORD k = 0; !inOk; ++k) {
+        IMFMediaType* availIn = nullptr;
+        if (FAILED(m_mft->GetInputAvailableType(m_inStreamId, k, &availIn)) || !availIn) break;
+        GUID st = GUID_NULL;
+        availIn->GetGUID(MF_MT_SUBTYPE, &st);
+        if (st == inSubtype) {
+            MFSetAttributeSize(availIn, MF_MT_FRAME_SIZE, m_width, m_height);
+            MFSetAttributeRatio(availIn, MF_MT_FRAME_RATE, m_fps, 1);
+            MFSetAttributeRatio(availIn, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+            availIn->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+            inOk = SUCCEEDED(m_mft->SetInputType(m_inStreamId, availIn, 0));
+        }
+        availIn->Release();
+    }
+    return inOk;
+}
+
+bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwareOnly, bool nvidiaOnly, const char* label) {
     cleanupMft();
+    if (nvidiaOnly && !hardwareOnly) return false;
 
     MFT_REGISTER_TYPE_INFO outInfo = { MFMediaType_Video, outputSubtype };
-    UINT32 enumFlags = hardwareOnly
-        ? (MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER)
-        : (MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER);
-
     IMFActivate** ppActivate = nullptr;
     UINT32 count = 0;
-    HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, enumFlags, nullptr, &outInfo, &ppActivate, &count);
-    if (FAILED(hr) || count == 0 || !ppActivate) {
+
+    if (hardwareOnly) {
+        // On multi-GPU/Optimus systems, target the exact NVIDIA LUID via MFTEnum2 first
+        if (m_hasEncLuid) {
+            auto pEnum2 = reinterpret_cast<PFN_MFTEnum2>(GetProcAddress(GetModuleHandleW(L"mfplat.dll"), "MFTEnum2"));
+            IMFAttributes* enumAttr = nullptr;
+            if (pEnum2 && SUCCEEDED(MFCreateAttributes(&enumAttr, 1)) && enumAttr) {
+                enumAttr->SetBlob(kMFT_ENUM_ADAPTER_LUID, reinterpret_cast<const BYTE*>(&m_encLuid), sizeof(LUID));
+                pEnum2(MFT_CATEGORY_VIDEO_ENCODER,
+                       MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
+                       nullptr, &outInfo, enumAttr, &ppActivate, &count);
+                enumAttr->Release();
+            }
+        }
+        auto hasNvidiaInList = [&](IMFActivate** list, UINT32 n) {
+            std::string dummy;
+            for (UINT32 i = 0; i < n; ++i) {
+                if (isNvidiaMftCandidate(list[i], dummy)) return true;
+            }
+            return false;
+        };
+        if (count == 0 || (nvidiaOnly && !hasNvidiaInList(ppActivate, count))) {
+            for (UINT32 j = 0; j < count; ++j) ppActivate[j]->Release();
+            if (ppActivate) { CoTaskMemFree(ppActivate); ppActivate = nullptr; }
+            count = 0;
+            // Enumerate all hardware MFTs without SORTANDFILTER so primary-adapter merit cannot hide NVIDIA
+            MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
+                      MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT,
+                      nullptr, &outInfo, &ppActivate, &count);
+            if (count == 0) {
+                MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
+                          MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
+                          nullptr, &outInfo, &ppActivate, &count);
+            }
+        }
+    } else {
+        MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
+                  MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
+                  nullptr, &outInfo, &ppActivate, &count);
+    }
+
+    if (count == 0 || !ppActivate) {
         if (ppActivate) CoTaskMemFree(ppActivate);
         return false;
     }
@@ -305,19 +649,22 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
     std::vector<std::pair<int, UINT32>> candidates;
     candidates.reserve(count);
     for (UINT32 idx = 0; idx < count; ++idx) {
-        std::string name = readMftFriendlyName(ppActivate[idx]);
-        int rank = 2;
-        if (containsInsensitive(name, "nvidia")) rank = 0;
-        else if (containsInsensitive(name, "amd") || containsInsensitive(name, "intel")) rank = 1;
+        std::string name;
+        bool isNv = isNvidiaMftCandidate(ppActivate[idx], name);
+        if (nvidiaOnly && !isNv) continue;
+        int rank = isNv ? 0 : ((containsInsensitive(name, "amd") || containsInsensitive(name, "intel")) ? 1 : 2);
         candidates.push_back({ rank, idx });
     }
     std::stable_sort(candidates.begin(), candidates.end(),
                      [](const auto& a, const auto& b) { return a.first < b.first; });
 
+    uint64_t pixels = static_cast<uint64_t>(m_width) * m_height;
+    UINT32 bitrate = (pixels > 3000000ULL) ? 28000000u : 14000000u;
+
     for (const auto& cand : candidates) {
         UINT32 idx = cand.second;
-        std::string rawFriendly = readMftFriendlyName(ppActivate[idx]);
-        bool isNvidiaName = containsInsensitive(rawFriendly, "nvidia");
+        std::string rawFriendly;
+        bool isNvidiaCand = isNvidiaMftCandidate(ppActivate[idx], rawFriendly);
 
         cleanupMft();
         if (FAILED(ppActivate[idx]->ActivateObject(__uuidof(IMFTransform), reinterpret_cast<void**>(&m_mft))) || !m_mft) {
@@ -360,76 +707,21 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
             }
         }
 
-        if (hardwareOnly && (d3d11Aware || d3dAware) && m_dxgiManager && m_hasVideoProcessor) {
+        bool hasValidSurf = m_nvDevice ? (m_nvGpuTex[0] != nullptr) : m_hasVideoProcessor;
+        if (hardwareOnly && (d3d11Aware || d3dAware) && m_dxgiManager && hasValidSurf) {
             if (SUCCEEDED(m_mft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, reinterpret_cast<ULONG_PTR>(m_dxgiManager)))) {
                 m_useD3dManager = true;
             }
         }
 
-        // Optimal streaming bitrate: ~14 Mbps for 1080p60, ~28 Mbps for 4K60
-        uint64_t pixels = static_cast<uint64_t>(m_width) * m_height;
-        UINT32 bitrate = (pixels > 3000000ULL) ? 28000000u : 14000000u;
-
         m_mft->QueryInterface(__uuidof(ICodecAPI), reinterpret_cast<void**>(&m_codecApi));
 
-        // Low-latency real-time NVENC/GPU tuning (apply before stream type negotiation as well)
-        if (m_codecApi) {
-            setCodecBool(m_codecApi, CODECAPI_AVLowLatencyMode, true);
-            setCodecBool(m_codecApi, CODECAPI_AVEncCommonRealTime, true);
-            setCodecUint32(m_codecApi, CODECAPI_AVEncCommonQualityVsSpeed, 0);
-            setCodecUint32(m_codecApi, CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
-            setCodecUint32(m_codecApi, CODECAPI_AVEncCommonMeanBitRate, bitrate);
-            setCodecUint32(m_codecApi, CODECAPI_AVEncMPVDefaultBPictureCount, 0);
-            setCodecUint32(m_codecApi, CODECAPI_AVEncMPVGOPSize, m_fps * 2);
+        if (!configureMftTypes(outputSubtype, wantP010, bitrate)) {
+            if (isNvidiaCand) {
+                std::cerr << "[Encoder] Skipped candidate '" << rawFriendly << "' (media type negotiation failed)" << std::endl;
+            }
+            continue;
         }
-
-        // Configure Output Type FIRST
-        IMFMediaType* outType = nullptr;
-        if (FAILED(MFCreateMediaType(&outType))) continue;
-        outType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        outType->SetGUID(MF_MT_SUBTYPE, outputSubtype);
-        outType->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
-        MFSetAttributeSize(outType, MF_MT_FRAME_SIZE, m_width, m_height);
-        MFSetAttributeRatio(outType, MF_MT_FRAME_RATE, m_fps, 1);
-        MFSetAttributeRatio(outType, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-        outType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-
-        if (outputSubtype == MFVideoFormat_HEVC) {
-            outType->SetUINT32(MF_MT_MPEG2_PROFILE, wantP010 ? eAVEncH265VProfile_Main_420_10 : eAVEncH265VProfile_Main_420_8);
-        } else {
-            outType->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High);
-        }
-        applyColorAttributes(outType, wantP010);
-
-        hr = m_mft->SetOutputType(m_outStreamId, outType, 0);
-        outType->Release();
-        if (FAILED(hr)) continue;
-
-        if (m_codecApi) {
-            setCodecBool(m_codecApi, CODECAPI_AVLowLatencyMode, true);
-            setCodecBool(m_codecApi, CODECAPI_AVEncCommonRealTime, true);
-            setCodecUint32(m_codecApi, CODECAPI_AVEncCommonQualityVsSpeed, 0);
-            setCodecUint32(m_codecApi, CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
-            setCodecUint32(m_codecApi, CODECAPI_AVEncCommonMeanBitRate, bitrate);
-            setCodecUint32(m_codecApi, CODECAPI_AVEncMPVDefaultBPictureCount, 0);
-            setCodecUint32(m_codecApi, CODECAPI_AVEncMPVGOPSize, m_fps * 2);
-        }
-
-        // Configure Input Type SECOND
-        IMFMediaType* inType = nullptr;
-        if (FAILED(MFCreateMediaType(&inType))) continue;
-        inType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        inType->SetGUID(MF_MT_SUBTYPE, wantP010 ? MFVideoFormat_P010 : MFVideoFormat_NV12);
-        MFSetAttributeSize(inType, MF_MT_FRAME_SIZE, m_width, m_height);
-        MFSetAttributeRatio(inType, MF_MT_FRAME_RATE, m_fps, 1);
-        MFSetAttributeRatio(inType, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-        inType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-        inType->SetUINT32(MF_MT_DEFAULT_STRIDE, wantP010 ? (m_width * 2) : m_width);
-        applyColorAttributes(inType, wantP010);
-
-        hr = m_mft->SetInputType(m_inStreamId, inType, 0);
-        inType->Release();
-        if (FAILED(hr)) continue;
 
         MFT_OUTPUT_STREAM_INFO outStreamInfo = {};
         if (SUCCEEDED(m_mft->GetOutputStreamInfo(m_outStreamId, &outStreamInfo))) {
@@ -453,10 +745,10 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
         m_mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
 
         m_isHardware = hardwareOnly;
-        m_isNvidia = isNvidiaName;
+        m_isNvidia = isNvidiaCand;
         std::string hwName = !rawFriendly.empty() ? (std::string(label) + " [" + rawFriendly + "]") : label;
         if (m_useD3dManager) {
-            hwName += " (D3D11 Zero-Copy)";
+            hwName += m_nvDevice ? " (Optimus NVIDIA VRAM)" : " (D3D11 Zero-Copy)";
         }
         m_encoderName = hwName;
         m_forceKeyframe.store(true);
@@ -562,6 +854,37 @@ void Encoder::convertBgraToNv12Studio(const uint8_t* bgra, uint32_t width, uint3
     }
 }
 
+bool Encoder::submitDxgiSurface(ID3D11Texture2D* tex, uint64_t ptsUs,
+                                std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe, bool& outInputAccepted) {
+    outInputAccepted = false;
+    if (!tex) return false;
+
+    IMFMediaBuffer* mfBuf = nullptr;
+    if (FAILED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), tex, 0, FALSE, &mfBuf)) || !mfBuf) {
+        return false;
+    }
+
+    IMF2DBuffer* buf2d = nullptr;
+    if (SUCCEEDED(mfBuf->QueryInterface(__uuidof(IMF2DBuffer), reinterpret_cast<void**>(&buf2d))) && buf2d) {
+        DWORD contigLen = 0;
+        if (SUCCEEDED(buf2d->GetContiguousLength(&contigLen))) {
+            mfBuf->SetCurrentLength(contigLen);
+        }
+        buf2d->Release();
+    }
+
+    IMFSample* sample = nullptr;
+    if (FAILED(MFCreateSample(&sample)) || !sample) {
+        mfBuf->Release();
+        return false;
+    }
+    sample->AddBuffer(mfBuf);
+    mfBuf->Release();
+    sample->SetSampleTime(static_cast<LONGLONG>(ptsUs) * 10);
+    sample->SetSampleDuration(10000000LL / m_fps);
+    return submitSampleToMft(sample, outAnnexB, outIsKeyframe, outInputAccepted);
+}
+
 bool Encoder::encodeGpuFrame(ID3D11Texture2D* gpuSrcTex, uint64_t ptsUs,
                              std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe) {
     if (!m_mft || !m_hasVideoProcessor || !gpuSrcTex || !m_videoDevice || !m_videoContext) return false;
@@ -589,47 +912,31 @@ bool Encoder::encodeGpuFrame(ID3D11Texture2D* gpuSrcTex, uint64_t ptsUs,
     inView->Release();
     if (FAILED(hr)) return false;
 
+    // Flush VideoProcessorBlt to GPU queue immediately so NVENC reads current frame without batch stall
+    m_d3dContext->Flush();
+
+    bool alreadyCopiedYuv = false;
     if (m_useD3dManager) {
-        // Flush VideoProcessorBlt to GPU queue immediately so NVENC reads current NV12/P010 frame without batch stall
-        m_d3dContext->Flush();
-
         if (!waitAsyncInputReady()) return false;
-
-        IMFMediaBuffer* mfBuf = nullptr;
-        if (SUCCEEDED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), outTex, 0, FALSE, &mfBuf)) && mfBuf) {
-            IMF2DBuffer* buf2d = nullptr;
-            if (SUCCEEDED(mfBuf->QueryInterface(__uuidof(IMF2DBuffer), reinterpret_cast<void**>(&buf2d))) && buf2d) {
-                DWORD contigLen = 0;
-                if (SUCCEEDED(buf2d->GetContiguousLength(&contigLen))) {
-                    mfBuf->SetCurrentLength(contigLen);
-                }
-                buf2d->Release();
-            }
-
-            IMFSample* sample = nullptr;
-            if (SUCCEEDED(MFCreateSample(&sample)) && sample) {
-                sample->AddBuffer(mfBuf);
-                mfBuf->Release();
-                sample->SetSampleTime(static_cast<LONGLONG>(ptsUs) * 10);
-                sample->SetSampleDuration(10000000LL / m_fps);
-
-                bool inputAccepted = false;
-                bool gotOut = submitSampleToMft(sample, outAnnexB, outIsKeyframe, inputAccepted);
-                if (inputAccepted) {
-                    // NEVER downgrade out of GPU Zero-Copy once ProcessInput succeeded on the DXGI surface!
-                    return gotOut;
-                }
-            } else {
-                mfBuf->Release();
-            }
+        ID3D11Texture2D* submitTex = outTex;
+        if (m_nvDevice) {
+            if (!m_nvGpuTex[slot] || !copyTextureToPackedYuv(outTex, m_yuvBuffer)) return false;
+            alreadyCopiedYuv = true;
+            if (!uploadYuvToNvTexture(m_yuvBuffer, m_nvGpuTex[slot])) return false;
+            submitTex = m_nvGpuTex[slot];
         }
 
-        // Only reach here if ProcessInput actually rejected DXGI surface input; cleanly fall back once
+        bool inputAccepted = false;
+        bool gotOut = submitDxgiSurface(submitTex, ptsUs, outAnnexB, outIsKeyframe, inputAccepted);
+        if (inputAccepted) {
+            return gotOut;
+        }
+        // Only disable DXGI manager if ProcessInput actually rejected the D3D11 surface
         m_useD3dManager = false;
         m_mft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
     }
 
-    if (!copyTextureToPackedYuv(outTex, m_yuvBuffer)) return false;
+    if (!alreadyCopiedYuv && !copyTextureToPackedYuv(outTex, m_yuvBuffer)) return false;
     return encodePackedYuv(m_yuvBuffer, ptsUs, outAnnexB, outIsKeyframe);
 }
 

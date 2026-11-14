@@ -45,9 +45,9 @@ static void cleanupPreviousUpdateBinary() {
     }
 }
 
-static uint16_t buildHelloFlags(bool btReady, const ScreenCapture& cap, const Encoder& enc) {
+static uint16_t buildHelloFlags(bool btReady, const ScreenCapture& /*cap*/, const Encoder& enc) {
     uint16_t f = btReady ? HELLO_FLAG_BT : 0;
-    if (cap.isNvidiaGpu() || enc.isNvidiaEncoder()) f |= HELLO_FLAG_NVIDIA;
+    if (enc.isNvidiaEncoder()) f |= HELLO_FLAG_NVIDIA;
     if (enc.isZeroCopyActive()) f |= HELLO_FLAG_ZEROCOPY;
     if (enc.isHardwareGpu()) f |= HELLO_FLAG_HW_GPU;
     return f;
