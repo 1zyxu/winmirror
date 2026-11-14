@@ -1,0 +1,13 @@
+# Binaries
+*.exe
+*.obj
+*.o
+*.dylib
+winmirror_mac
+winmirror_update.exe
+
+# OS / Editor
+.DS_Store
+*.swp
+.vscode/
+.idea/
