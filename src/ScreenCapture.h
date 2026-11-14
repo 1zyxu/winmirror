@@ -68,6 +68,8 @@ private:
     bool m_useDxgi = true;
     bool m_isHdrOutput = false;
     bool m_hasNewGdiFrame = false;
+    bool m_hasValidGpuFrame = false;
+    uint32_t m_dxgiReinitFails = 0;
     uint32_t m_width = 0;
     uint32_t m_height = 0;
     int32_t m_screenLeft = 0;

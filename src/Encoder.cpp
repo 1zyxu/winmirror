@@ -5,6 +5,10 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <thread>
+
+// D3D11_BIND_VIDEO_ENCODER (0x400) defined explicitly for MinGW/MSVC portability
+static constexpr UINT kBindVideoEncoder = 0x400u;
 
 // Adapter LUID attribute for MFTEnum2 (defined locally for MinGW + Windows SDK portability)
 static const GUID kMFT_ENUM_ADAPTER_LUID = {
@@ -222,10 +226,14 @@ bool Encoder::initNvUploadTextures(bool useP010) {
     gpuDesc.Format = fmt;
     gpuDesc.SampleDesc.Count = 1;
     gpuDesc.Usage = D3D11_USAGE_DEFAULT;
-    gpuDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    gpuDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | kBindVideoEncoder;
 
     for (int i = 0; i < kVpRingSize; ++i) {
         HRESULT hr = m_nvDevice->CreateTexture2D(&gpuDesc, nullptr, &m_nvGpuTex[i]);
+        if (FAILED(hr) || !m_nvGpuTex[i]) {
+            gpuDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            hr = m_nvDevice->CreateTexture2D(&gpuDesc, nullptr, &m_nvGpuTex[i]);
+        }
         if (FAILED(hr) || !m_nvGpuTex[i]) {
             gpuDesc.BindFlags = 0;
             hr = m_nvDevice->CreateTexture2D(&gpuDesc, nullptr, &m_nvGpuTex[i]);
@@ -278,6 +286,7 @@ bool Encoder::copyStagedYuvToNvTexture(ID3D11Texture2D* gpuYuvTex, ID3D11Texture
     if (!gpuYuvTex || !m_vpStagingTex || !m_d3dContext || !m_nvContext || !m_nvUploadTex || !dstTex) return false;
 
     m_d3dContext->CopyResource(m_vpStagingTex, gpuYuvTex);
+    m_d3dContext->Flush();
 
     D3D11_MAPPED_SUBRESOURCE srcMap = {};
     if (!mapStagingRead(m_vpStagingTex, srcMap)) return false;
@@ -312,57 +321,32 @@ bool Encoder::copyStagedYuvToNvTexture(ID3D11Texture2D* gpuYuvTex, ID3D11Texture
     return true;
 }
 
-bool Encoder::init(ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dContext,
-                   uint32_t width, uint32_t height, DXGI_FORMAT srcFormat,
-                   uint32_t fps, bool isHdrDisplay) {
-    cleanup();
-
-    m_d3dDevice = d3dDevice;
-    m_d3dContext = d3dContext;
-    if (m_d3dDevice) m_d3dDevice->AddRef();
-    if (m_d3dContext) m_d3dContext->AddRef();
-    m_width = width & ~1u;   // YUV 4:2:0 requires even dimensions
-    m_height = height & ~1u;
-    m_fps = fps > 0 ? fps : 60;
-    m_srcFormat = srcFormat;
-    m_isHdrSource = isHdrDisplay || (srcFormat == DXGI_FORMAT_R16G16B16A16_FLOAT);
-
-    if (m_width == 0 || m_height == 0) return false;
-
-    HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
-    if (SUCCEEDED(hr)) {
-        m_mfStarted = true;
-    } else {
-        std::cerr << "[Encoder] MFStartup failed: 0x" << std::hex << hr << std::dec << std::endl;
-        return false;
-    }
-
-    initEncodeDevice();
-
-    struct EncodeAttempt {
-        GUID subtype;
-        bool p010;
-        bool hw;
-        bool nvidiaOnly;
-        const char* label;
-    };
-    std::vector<EncodeAttempt> plan;
+void Encoder::buildPlan() {
+    m_plan.clear();
     if (m_encIsNvidia) {
         if (m_isHdrSource) {
-            plan.push_back({ MFVideoFormat_HEVC, true,  true, true, "NVENC HEVC 10-bit HDR10 (GPU)" });
+            m_plan.push_back({ MFVideoFormat_HEVC, true,  true, true, true,  "NVENC HEVC 10-bit HDR10 (GPU ZC)" });
+            m_plan.push_back({ MFVideoFormat_HEVC, true,  true, true, false, "NVENC HEVC 10-bit HDR10 (GPU)" });
         }
-        plan.push_back({ MFVideoFormat_HEVC, false, true, true, "NVENC HEVC 8-bit (GPU)" });
-        plan.push_back({ MFVideoFormat_H264, false, true, true, "NVENC H.264 (GPU)" });
+        m_plan.push_back({ MFVideoFormat_HEVC, false, true, true, true,  "NVENC HEVC 8-bit (GPU ZC)" });
+        m_plan.push_back({ MFVideoFormat_HEVC, false, true, true, false, "NVENC HEVC 8-bit (GPU)" });
+        m_plan.push_back({ MFVideoFormat_H264, false, true, true, true,  "NVENC H.264 (GPU ZC)" });
+        m_plan.push_back({ MFVideoFormat_H264, false, true, true, false, "NVENC H.264 (GPU)" });
     }
     if (m_isHdrSource) {
-        plan.push_back({ MFVideoFormat_HEVC, true,  true, false, "HEVC 10-bit HDR10 (GPU)" });
+        m_plan.push_back({ MFVideoFormat_HEVC, true,  true, false, true,  "HEVC 10-bit HDR10 (GPU ZC)" });
+        m_plan.push_back({ MFVideoFormat_HEVC, true,  true, false, false, "HEVC 10-bit HDR10 (GPU)" });
     }
-    plan.push_back({ MFVideoFormat_HEVC, false, true,  false, "HEVC 8-bit (GPU)" });
-    plan.push_back({ MFVideoFormat_H264, false, true,  false, "H.264 (GPU Hardware)" });
-    plan.push_back({ MFVideoFormat_H264, false, false, false, "H.264 (Windows MFT)" });
+    m_plan.push_back({ MFVideoFormat_HEVC, false, true,  false, true,  "HEVC 8-bit (GPU ZC)" });
+    m_plan.push_back({ MFVideoFormat_HEVC, false, true,  false, false, "HEVC 8-bit (GPU)" });
+    m_plan.push_back({ MFVideoFormat_H264, false, true,  false, true,  "H.264 (GPU ZC)" });
+    m_plan.push_back({ MFVideoFormat_H264, false, true,  false, false, "H.264 (GPU)" });
+    m_plan.push_back({ MFVideoFormat_H264, false, false, false, false, "H.264 (Windows MFT)" });
+}
 
-    int vpMode = -1; // -1 = none, 0 = 8-bit NV12, 1 = 10-bit P010
-    for (const auto& step : plan) {
+bool Encoder::startPlanFrom(size_t startIdx) {
+    for (size_t i = startIdx; i < m_plan.size(); ++i) {
+        const auto& step = m_plan[i];
         if (step.p010 && !m_d3dDevice) continue;
 
         if (!step.nvidiaOnly && m_nvDevice) {
@@ -381,27 +365,69 @@ bool Encoder::init(ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dContext,
         }
 
         int targetMode = step.p010 ? 1 : 0;
-        if (vpMode != targetMode) {
+        if (m_vpMode != targetMode) {
             cleanupVideoProcessor();
             cleanupNvUploadTextures();
-            vpMode = -1;
+            m_vpMode = -1;
             if (m_d3dDevice) {
-                bool vpOk = initVideoProcessor(srcFormat, step.p010);
+                bool vpOk = initVideoProcessor(m_srcFormat, step.p010);
                 if (step.p010 && !vpOk) continue;
                 if (vpOk && !initNvUploadTextures(step.p010)) {
                     if (step.p010) { cleanupVideoProcessor(); continue; }
                 }
             }
-            vpMode = targetMode;
+            m_vpMode = targetMode;
         }
 
         m_useP010 = step.p010;
         m_colorProfile = step.p010 ? COLOR_HDR10_PQ : COLOR_SDR_BT709;
-        if (tryCreateMft(step.subtype, step.p010, step.hw, step.nvidiaOnly, step.label)) {
+        if (tryCreateMft(step.subtype, step.p010, step.hw, step.nvidiaOnly, step.allowD3dManager, step.label.c_str())) {
             m_codec = (step.subtype == MFVideoFormat_HEVC) ? CODEC_HEVC : CODEC_H264;
+            m_planIndex = i;
             std::cout << "[Encoder] Initialized: " << m_encoderName << " " << m_width << "x" << m_height << std::endl;
             return true;
         }
+    }
+    return false;
+}
+
+bool Encoder::advanceFallback() {
+    if (m_planIndex + 1 >= m_plan.size()) return false;
+    cleanupMft();
+    return startPlanFrom(m_planIndex + 1);
+}
+
+bool Encoder::init(ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dContext,
+                   uint32_t width, uint32_t height, DXGI_FORMAT srcFormat,
+                   uint32_t fps, bool isHdrDisplay) {
+    cleanup();
+
+    m_d3dDevice = d3dDevice;
+    m_d3dContext = d3dContext;
+    if (m_d3dDevice) m_d3dDevice->AddRef();
+    if (m_d3dContext) m_d3dContext->AddRef();
+    m_width = width & ~1u;   // YUV 4:2:0 requires even dimensions
+    m_height = height & ~1u;
+    m_fps = fps > 0 ? fps : 60;
+    m_srcFormat = srcFormat;
+    m_isHdrSource = isHdrDisplay || (srcFormat == DXGI_FORMAT_R16G16B16A16_FLOAT);
+    m_planIndex = 0;
+    m_vpMode = -1;
+
+    if (m_width == 0 || m_height == 0) return false;
+
+    HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+    if (SUCCEEDED(hr)) {
+        m_mfStarted = true;
+    } else {
+        std::cerr << "[Encoder] MFStartup failed: 0x" << std::hex << hr << std::dec << std::endl;
+        return false;
+    }
+
+    initEncodeDevice();
+    buildPlan();
+    if (startPlanFrom(0)) {
+        return true;
     }
 
     cleanup();
@@ -471,11 +497,15 @@ bool Encoder::initVideoProcessor(DXGI_FORMAT srcFormat, bool useP010) {
     outDesc.Format = outFmt;
     outDesc.SampleDesc.Count = 1;
     outDesc.Usage = D3D11_USAGE_DEFAULT;
-    outDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    outDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE | kBindVideoEncoder;
 
     m_vpRingIdx = 0;
     for (int i = 0; i < kVpRingSize; ++i) {
         hr = m_d3dDevice->CreateTexture2D(&outDesc, nullptr, &m_vpOutTex[i]);
+        if (FAILED(hr) || !m_vpOutTex[i]) {
+            outDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+            hr = m_d3dDevice->CreateTexture2D(&outDesc, nullptr, &m_vpOutTex[i]);
+        }
         if (FAILED(hr) || !m_vpOutTex[i]) {
             outDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
             hr = m_d3dDevice->CreateTexture2D(&outDesc, nullptr, &m_vpOutTex[i]);
@@ -544,7 +574,6 @@ bool Encoder::configureMftTypes(const GUID& outputSubtype, bool wantP010, UINT32
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonQualityVsSpeed, 0);
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonMeanBitRate, bitrate);
-        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonMaxBitRate, bitrate + (bitrate / 4));
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonBufferSize, bitrate / 4);
         setCodecUint32(m_codecApi, CODECAPI_AVEncMPVDefaultBPictureCount, 0);
         setCodecUint32(m_codecApi, CODECAPI_AVEncMPVGOPSize, m_fps * 2);
@@ -575,21 +604,23 @@ bool Encoder::configureMftTypes(const GUID& outputSubtype, bool wantP010, UINT32
         outOk = SUCCEEDED(m_mft->SetOutputType(m_outStreamId, outType, 0));
         outType->Release();
     }
-    for (DWORD k = 0; !outOk; ++k) {
-        IMFMediaType* availOut = nullptr;
-        if (FAILED(m_mft->GetOutputAvailableType(m_outStreamId, k, &availOut)) || !availOut) break;
-        GUID st = GUID_NULL;
-        availOut->GetGUID(MF_MT_SUBTYPE, &st);
-        if (st == outputSubtype) {
-            availOut->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
-            MFSetAttributeSize(availOut, MF_MT_FRAME_SIZE, m_width, m_height);
-            MFSetAttributeRatio(availOut, MF_MT_FRAME_RATE, m_fps, 1);
-            MFSetAttributeRatio(availOut, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-            availOut->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-            applyColorAttributes(availOut, wantP010);
-            outOk = SUCCEEDED(m_mft->SetOutputType(m_outStreamId, availOut, 0));
+    for (int tryColor = 0; tryColor < 2 && !outOk; ++tryColor) {
+        for (DWORD k = 0; !outOk; ++k) {
+            IMFMediaType* availOut = nullptr;
+            if (FAILED(m_mft->GetOutputAvailableType(m_outStreamId, k, &availOut)) || !availOut) break;
+            GUID st = GUID_NULL;
+            availOut->GetGUID(MF_MT_SUBTYPE, &st);
+            if (st == outputSubtype) {
+                availOut->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
+                MFSetAttributeSize(availOut, MF_MT_FRAME_SIZE, m_width, m_height);
+                MFSetAttributeRatio(availOut, MF_MT_FRAME_RATE, m_fps, 1);
+                MFSetAttributeRatio(availOut, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+                availOut->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+                if (tryColor == 0) applyColorAttributes(availOut, wantP010);
+                outOk = SUCCEEDED(m_mft->SetOutputType(m_outStreamId, availOut, 0));
+            }
+            availOut->Release();
         }
-        availOut->Release();
     }
     if (!outOk) return false;
 
@@ -616,25 +647,27 @@ bool Encoder::configureMftTypes(const GUID& outputSubtype, bool wantP010, UINT32
         inOk = SUCCEEDED(m_mft->SetInputType(m_inStreamId, inType, 0));
         inType->Release();
     }
-    for (DWORD k = 0; !inOk; ++k) {
-        IMFMediaType* availIn = nullptr;
-        if (FAILED(m_mft->GetInputAvailableType(m_inStreamId, k, &availIn)) || !availIn) break;
-        GUID st = GUID_NULL;
-        availIn->GetGUID(MF_MT_SUBTYPE, &st);
-        if (st == inSubtype) {
-            MFSetAttributeSize(availIn, MF_MT_FRAME_SIZE, m_width, m_height);
-            MFSetAttributeRatio(availIn, MF_MT_FRAME_RATE, m_fps, 1);
-            MFSetAttributeRatio(availIn, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-            availIn->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-            applyColorAttributes(availIn, wantP010);
-            inOk = SUCCEEDED(m_mft->SetInputType(m_inStreamId, availIn, 0));
+    for (int tryColor = 0; tryColor < 2 && !inOk; ++tryColor) {
+        for (DWORD k = 0; !inOk; ++k) {
+            IMFMediaType* availIn = nullptr;
+            if (FAILED(m_mft->GetInputAvailableType(m_inStreamId, k, &availIn)) || !availIn) break;
+            GUID st = GUID_NULL;
+            availIn->GetGUID(MF_MT_SUBTYPE, &st);
+            if (st == inSubtype) {
+                MFSetAttributeSize(availIn, MF_MT_FRAME_SIZE, m_width, m_height);
+                MFSetAttributeRatio(availIn, MF_MT_FRAME_RATE, m_fps, 1);
+                MFSetAttributeRatio(availIn, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+                availIn->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+                if (tryColor == 0) applyColorAttributes(availIn, wantP010);
+                inOk = SUCCEEDED(m_mft->SetInputType(m_inStreamId, availIn, 0));
+            }
+            availIn->Release();
         }
-        availIn->Release();
     }
     return inOk;
 }
 
-bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwareOnly, bool nvidiaOnly, const char* label) {
+bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwareOnly, bool nvidiaOnly, bool allowD3dManager, const char* label) {
     cleanupMft();
     if (nvidiaOnly && !hardwareOnly) return false;
 
@@ -752,7 +785,7 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
         }
 
         bool hasValidSurf = m_nvDevice ? (m_nvGpuTex[0] != nullptr) : m_hasVideoProcessor;
-        if (hardwareOnly && (d3d11Aware || d3dAware) && m_dxgiManager && hasValidSurf) {
+        if (allowD3dManager && hardwareOnly && (d3d11Aware || d3dAware) && m_dxgiManager && hasValidSurf) {
             if (SUCCEEDED(m_mft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, reinterpret_cast<ULONG_PTR>(m_dxgiManager)))) {
                 m_useD3dManager = true;
             }
@@ -821,6 +854,9 @@ void Encoder::cleanupMft() {
     m_isHardware = false;
     m_isNvidia = false;
     m_needInputCount = 0;
+    m_hasProducedOutput = false;
+    m_submittedWithoutOutput = 0;
+    m_waitTimeouts = 0;
     m_seqHeader.clear();
     m_readyOutputs.clear();
 }
@@ -829,6 +865,7 @@ bool Encoder::copyTextureToPackedYuv(ID3D11Texture2D* gpuYuvTex, std::vector<uin
     if (!gpuYuvTex || !m_vpStagingTex || !m_d3dContext) return false;
 
     m_d3dContext->CopyResource(m_vpStagingTex, gpuYuvTex);
+    m_d3dContext->Flush();
 
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     if (!mapStagingRead(m_vpStagingTex, mapped)) {
@@ -865,38 +902,57 @@ void Encoder::convertBgraToNv12Studio(const uint8_t* bgra, uint32_t width, uint3
     uint8_t* uvPlane = yPlane + ySize;
     size_t bgraStride = static_cast<size_t>(width) * 4;
 
-    for (uint32_t y = 0; y < height; y += 2) {
-        const uint8_t* row0 = bgra + y * bgraStride;
-        const uint8_t* row1 = row0 + bgraStride;
-        uint8_t* y0 = yPlane + static_cast<size_t>(y) * width;
-        uint8_t* y1 = y0 + width;
-        uint8_t* uv = uvPlane + static_cast<size_t>(y / 2) * width;
+    auto convertRows = [&](uint32_t yStart, uint32_t yEnd) {
+        for (uint32_t y = yStart; y < yEnd; y += 2) {
+            const uint8_t* row0 = bgra + y * bgraStride;
+            const uint8_t* row1 = row0 + bgraStride;
+            uint8_t* y0 = yPlane + static_cast<size_t>(y) * width;
+            uint8_t* y1 = y0 + width;
+            uint8_t* uv = uvPlane + static_cast<size_t>(y / 2) * width;
 
-        for (uint32_t x = 0; x < width; x += 2) {
-            int b00 = row0[0], g00 = row0[1], r00 = row0[2];
-            int b01 = row0[4], g01 = row0[5], r01 = row0[6];
-            int b10 = row1[0], g10 = row1[1], r10 = row1[2];
-            int b11 = row1[4], g11 = row1[5], r11 = row1[6];
+            for (uint32_t x = 0; x < width; x += 2) {
+                int b00 = row0[0], g00 = row0[1], r00 = row0[2];
+                int b01 = row0[4], g01 = row0[5], r01 = row0[6];
+                int b10 = row1[0], g10 = row1[1], r10 = row1[2];
+                int b11 = row1[4], g11 = row1[5], r11 = row1[6];
 
-            y0[0] = static_cast<uint8_t>(((47 * r00 + 157 * g00 + 16 * b00 + 128) >> 8) + 16);
-            y0[1] = static_cast<uint8_t>(((47 * r01 + 157 * g01 + 16 * b01 + 128) >> 8) + 16);
-            y1[0] = static_cast<uint8_t>(((47 * r10 + 157 * g10 + 16 * b10 + 128) >> 8) + 16);
-            y1[1] = static_cast<uint8_t>(((47 * r11 + 157 * g11 + 16 * b11 + 128) >> 8) + 16);
+                y0[0] = static_cast<uint8_t>(((47 * r00 + 157 * g00 + 16 * b00 + 128) >> 8) + 16);
+                y0[1] = static_cast<uint8_t>(((47 * r01 + 157 * g01 + 16 * b01 + 128) >> 8) + 16);
+                y1[0] = static_cast<uint8_t>(((47 * r10 + 157 * g10 + 16 * b10 + 128) >> 8) + 16);
+                y1[1] = static_cast<uint8_t>(((47 * r11 + 157 * g11 + 16 * b11 + 128) >> 8) + 16);
 
-            int rAvg = (r00 + r01 + r10 + r11 + 2) >> 2;
-            int gAvg = (g00 + g01 + g10 + g11 + 2) >> 2;
-            int bAvg = (b00 + b01 + b10 + b11 + 2) >> 2;
+                int rAvg = (r00 + r01 + r10 + r11 + 2) >> 2;
+                int gAvg = (g00 + g01 + g10 + g11 + 2) >> 2;
+                int bAvg = (b00 + b01 + b10 + b11 + 2) >> 2;
 
-            uv[0] = static_cast<uint8_t>(((-26 * rAvg - 87 * gAvg + 112 * bAvg + 128) >> 8) + 128);
-            uv[1] = static_cast<uint8_t>(((112 * rAvg - 102 * gAvg - 10 * bAvg + 128) >> 8) + 128);
+                uv[0] = static_cast<uint8_t>(((-26 * rAvg - 87 * gAvg + 112 * bAvg + 128) >> 8) + 128);
+                uv[1] = static_cast<uint8_t>(((112 * rAvg - 102 * gAvg - 10 * bAvg + 128) >> 8) + 128);
 
-            row0 += 8;
-            row1 += 8;
-            y0 += 2;
-            y1 += 2;
-            uv += 2;
+                row0 += 8;
+                row1 += 8;
+                y0 += 2;
+                y1 += 2;
+                uv += 2;
+            }
         }
+    };
+
+    uint32_t nThreads = std::min(4u, std::max(1u, std::thread::hardware_concurrency()));
+    if (height < 240 || nThreads <= 1) {
+        convertRows(0, height);
+        return;
     }
+
+    std::vector<std::thread> workers;
+    workers.reserve(nThreads - 1);
+    for (uint32_t t = 0; t + 1 < nThreads; ++t) {
+        uint32_t y0 = ((height * t) / nThreads) & ~1u;
+        uint32_t y1 = ((height * (t + 1)) / nThreads) & ~1u;
+        workers.emplace_back(convertRows, y0, y1);
+    }
+    uint32_t lastY0 = ((height * (nThreads - 1)) / nThreads) & ~1u;
+    convertRows(lastY0, height);
+    for (auto& w : workers) w.join();
 }
 
 bool Encoder::submitDxgiSurface(ID3D11Texture2D* tex, uint64_t ptsUs,
@@ -932,66 +988,104 @@ bool Encoder::submitDxgiSurface(ID3D11Texture2D* tex, uint64_t ptsUs,
 
 bool Encoder::encodeGpuFrame(ID3D11Texture2D* gpuSrcTex, uint64_t ptsUs,
                              std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe) {
-    if (!m_mft || !m_hasVideoProcessor || !gpuSrcTex || !m_videoDevice || !m_videoContext) return false;
+    if (!gpuSrcTex) return false;
 
-    int slot = m_vpRingIdx;
-    m_vpRingIdx = (m_vpRingIdx + 1) % kVpRingSize;
-    ID3D11Texture2D* outTex = m_vpOutTex[slot];
-    ID3D11VideoProcessorOutputView* outView = m_vpOutView[slot];
-    if (!outTex || !outView) return false;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        if (!m_mft || !m_hasVideoProcessor || !m_videoDevice || !m_videoContext) return false;
 
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivDesc = {};
-    ivDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-    ivDesc.Texture2D.MipSlice = 0;
-    ivDesc.Texture2D.ArraySlice = 0;
+        int slot = m_vpRingIdx;
+        m_vpRingIdx = (m_vpRingIdx + 1) % kVpRingSize;
+        ID3D11Texture2D* outTex = m_vpOutTex[slot];
+        ID3D11VideoProcessorOutputView* outView = m_vpOutView[slot];
+        if (!outTex || !outView) return false;
 
-    ID3D11VideoProcessorInputView* inView = nullptr;
-    HRESULT hr = m_videoDevice->CreateVideoProcessorInputView(gpuSrcTex, m_vpEnum, &ivDesc, &inView);
-    if (FAILED(hr) || !inView) return false;
+        D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivDesc = {};
+        ivDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+        ivDesc.Texture2D.MipSlice = 0;
+        ivDesc.Texture2D.ArraySlice = 0;
 
-    D3D11_VIDEO_PROCESSOR_STREAM stream = {};
-    stream.Enable = TRUE;
-    stream.pInputSurface = inView;
+        ID3D11VideoProcessorInputView* inView = nullptr;
+        HRESULT hr = m_videoDevice->CreateVideoProcessorInputView(gpuSrcTex, m_vpEnum, &ivDesc, &inView);
+        if (FAILED(hr) || !inView) {
+            std::cerr << "[Encoder] CreateVideoProcessorInputView failed (0x" << std::hex << hr << std::dec
+                      << ") - falling back to CPU path." << std::endl;
+            cleanupVideoProcessor();
+            return false;
+        }
 
-    hr = m_videoContext->VideoProcessorBlt(m_vp, outView, 0, 1, &stream);
-    inView->Release();
-    if (FAILED(hr)) return false;
+        D3D11_VIDEO_PROCESSOR_STREAM stream = {};
+        stream.Enable = TRUE;
+        stream.pInputSurface = inView;
 
-    // Flush VideoProcessorBlt to GPU queue immediately so NVENC reads current frame without batch stall
-    m_d3dContext->Flush();
+        hr = m_videoContext->VideoProcessorBlt(m_vp, outView, 0, 1, &stream);
+        inView->Release();
+        if (FAILED(hr)) {
+            std::cerr << "[Encoder] VideoProcessorBlt failed (0x" << std::hex << hr << std::dec
+                      << ") - falling back to CPU path." << std::endl;
+            cleanupVideoProcessor();
+            return false;
+        }
 
-    if (m_useD3dManager) {
-        if (!waitAsyncInputReady()) return popPendingFrame(outAnnexB, outIsKeyframe);
-        ID3D11Texture2D* submitTex = outTex;
-        if (m_nvDevice) {
-            if (!m_nvGpuTex[slot] || !copyStagedYuvToNvTexture(outTex, m_nvGpuTex[slot])) {
-                return popPendingFrame(outAnnexB, outIsKeyframe);
+        // Flush VideoProcessorBlt to GPU queue immediately so NVENC reads current frame without batch stall
+        m_d3dContext->Flush();
+
+        if (m_useD3dManager) {
+            if (!waitAsyncInputReady()) {
+                if (popPendingFrame(outAnnexB, outIsKeyframe)) return true;
+                if (!m_hasProducedOutput && ++m_waitTimeouts >= 3 && advanceFallback()) continue;
+                return false;
             }
-            submitTex = m_nvGpuTex[slot];
+            ID3D11Texture2D* submitTex = outTex;
+            if (m_nvDevice) {
+                if (!m_nvGpuTex[slot] || !copyStagedYuvToNvTexture(outTex, m_nvGpuTex[slot])) {
+                    if (advanceFallback()) continue;
+                    return popPendingFrame(outAnnexB, outIsKeyframe);
+                }
+                submitTex = m_nvGpuTex[slot];
+            }
+
+            bool inputAccepted = false;
+            bool gotOut = submitDxgiSurface(submitTex, ptsUs, outAnnexB, outIsKeyframe, inputAccepted);
+            if (gotOut) return true;
+            if (!inputAccepted) {
+                std::cerr << "[Encoder] DXGI zero-copy rejected by MFT - switching encoder..." << std::endl;
+                if (advanceFallback()) continue;
+                return false;
+            }
+            if (!m_hasProducedOutput && m_submittedWithoutOutput >= 5) {
+                std::cerr << "[Encoder] Zero-copy MFT produced 0 packets after 5 frames - switching encoder..." << std::endl;
+                if (advanceFallback()) continue;
+            }
+            return false;
         }
 
-        bool inputAccepted = false;
-        bool gotOut = submitDxgiSurface(submitTex, ptsUs, outAnnexB, outIsKeyframe, inputAccepted);
-        if (inputAccepted) {
-            return gotOut;
+        if (!copyTextureToPackedYuv(outTex, m_yuvBuffer)) return false;
+        bool gotOut = encodePackedYuv(m_yuvBuffer, ptsUs, outAnnexB, outIsKeyframe);
+        if (gotOut) return true;
+        if (!m_hasProducedOutput && m_submittedWithoutOutput >= 5) {
+            std::cerr << "[Encoder] GPU MFT produced 0 packets after 5 frames - switching encoder..." << std::endl;
+            if (advanceFallback()) continue;
         }
-        // Only disable DXGI manager if ProcessInput actually rejected the D3D11 surface
-        m_useD3dManager = false;
-        m_mft->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
+        return false;
     }
-
-    if (!copyTextureToPackedYuv(outTex, m_yuvBuffer)) return false;
-    return encodePackedYuv(m_yuvBuffer, ptsUs, outAnnexB, outIsKeyframe);
+    return false;
 }
 
 bool Encoder::encodeBgraCpu(const uint8_t* bgra, uint32_t width, uint32_t height, uint64_t ptsUs,
                             std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe) {
     if (!m_mft || !bgra || width != m_width || height != m_height || m_useP010) return false;
     convertBgraToNv12Studio(bgra, width, height, m_yuvBuffer);
-    return encodePackedYuv(m_yuvBuffer, ptsUs, outAnnexB, outIsKeyframe);
+    if (encodePackedYuv(m_yuvBuffer, ptsUs, outAnnexB, outIsKeyframe)) return true;
+    if (!m_hasProducedOutput && m_submittedWithoutOutput >= 5 && advanceFallback()) {
+        return encodePackedYuv(m_yuvBuffer, ptsUs, outAnnexB, outIsKeyframe);
+    }
+    return false;
 }
 
 bool Encoder::popPendingFrame(std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe) {
+    if (m_isAsync && m_readyOutputs.empty()) {
+        pumpAsyncEvents(false);
+    }
     if (m_readyOutputs.empty()) {
         outAnnexB.clear();
         outIsKeyframe = false;
@@ -1000,7 +1094,12 @@ bool Encoder::popPendingFrame(std::vector<uint8_t>& outAnnexB, bool& outIsKeyfra
     outAnnexB = std::move(m_readyOutputs.front().first);
     outIsKeyframe = m_readyOutputs.front().second;
     m_readyOutputs.pop_front();
-    return !outAnnexB.empty();
+    if (!outAnnexB.empty()) {
+        m_hasProducedOutput = true;
+        m_submittedWithoutOutput = 0;
+        return true;
+    }
+    return false;
 }
 
 bool Encoder::waitAsyncInputReady() {
@@ -1041,6 +1140,9 @@ bool Encoder::submitSampleToMft(IMFSample* sample, std::vector<uint8_t>& outAnne
     }
 
     outInputAccepted = true;
+    if (!m_hasProducedOutput) {
+        m_submittedWithoutOutput++;
+    }
     if (m_isAsync) {
         m_needInputCount--;
         pumpAsyncEvents(true);
@@ -1082,6 +1184,7 @@ bool Encoder::encodePackedYuv(const std::vector<uint8_t>& yuvData, uint64_t ptsU
 bool Encoder::collectSyncOutput(std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe) {
     outAnnexB.clear();
     outIsKeyframe = false;
+    int streamChanges = 0;
 
     for (;;) {
         MFT_OUTPUT_STREAM_INFO info = {};
@@ -1110,15 +1213,33 @@ bool Encoder::collectSyncOutput(std::vector<uint8_t>& outAnnexB, bool& outIsKeyf
 
         if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
             if (outBuf.pSample) outBuf.pSample->Release();
-            IMFMediaType* newOutType = nullptr;
-            if (SUCCEEDED(m_mft->GetOutputAvailableType(m_outStreamId, 0, &newOutType)) && newOutType) {
-                m_mft->SetOutputType(m_outStreamId, newOutType, 0);
-                UINT32 hdrLen = 0;
-                if (SUCCEEDED(newOutType->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &hdrLen)) && hdrLen > 0) {
-                    m_seqHeader.resize(hdrLen);
-                    newOutType->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, m_seqHeader.data(), hdrLen, &hdrLen);
+            if (++streamChanges > 4) break;
+
+            const GUID wantSub = (m_codec == CODEC_HEVC) ? MFVideoFormat_HEVC : MFVideoFormat_H264;
+            bool setOk = false;
+            for (DWORD k = 0; !setOk; ++k) {
+                IMFMediaType* availOut = nullptr;
+                if (FAILED(m_mft->GetOutputAvailableType(m_outStreamId, k, &availOut)) || !availOut) break;
+                GUID st = GUID_NULL;
+                availOut->GetGUID(MF_MT_SUBTYPE, &st);
+                if (st == wantSub || k == 0) {
+                    UINT32 cw = 0, ch = 0;
+                    if (FAILED(MFGetAttributeSize(availOut, MF_MT_FRAME_SIZE, &cw, &ch)) || cw == 0 || ch == 0) {
+                        MFSetAttributeSize(availOut, MF_MT_FRAME_SIZE, m_width, m_height);
+                        MFSetAttributeRatio(availOut, MF_MT_FRAME_RATE, m_fps, 1);
+                        MFSetAttributeRatio(availOut, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+                        availOut->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+                    }
+                    if (SUCCEEDED(m_mft->SetOutputType(m_outStreamId, availOut, 0))) {
+                        UINT32 hdrLen = 0;
+                        if (SUCCEEDED(availOut->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &hdrLen)) && hdrLen > 0) {
+                            m_seqHeader.resize(hdrLen);
+                            availOut->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, m_seqHeader.data(), hdrLen, &hdrLen);
+                        }
+                        setOk = true;
+                    }
                 }
-                newOutType->Release();
+                availOut->Release();
             }
             continue;
         }
@@ -1162,7 +1283,11 @@ bool Encoder::collectSyncOutput(std::vector<uint8_t>& outAnnexB, bool& outIsKeyf
             outBuf.pSample->Release();
         }
 
-        if (!outAnnexB.empty()) return true;
+        if (!outAnnexB.empty()) {
+            m_hasProducedOutput = true;
+            m_submittedWithoutOutput = 0;
+            return true;
+        }
     }
 
     return !outAnnexB.empty();
@@ -1172,6 +1297,9 @@ bool Encoder::pumpAsyncEvents(bool waitOutput) {
     if (!m_eventGen) return false;
 
     auto start = std::chrono::steady_clock::now();
+    const auto waitBudget = m_hasProducedOutput
+        ? std::chrono::milliseconds(15)
+        : std::chrono::milliseconds(80);
 
     for (;;) {
         IMFMediaEvent* ev = nullptr;
@@ -1179,7 +1307,7 @@ bool Encoder::pumpAsyncEvents(bool waitOutput) {
         if (hr == MF_E_NO_EVENTS_AVAILABLE) {
             if (!waitOutput || !m_readyOutputs.empty()) break;
             auto elapsed = std::chrono::steady_clock::now() - start;
-            if (elapsed > std::chrono::milliseconds(20)) break;
+            if (elapsed > waitBudget) break;
             if (elapsed < std::chrono::microseconds(500)) {
                 Sleep(0);
             } else {

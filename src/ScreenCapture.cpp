@@ -192,9 +192,17 @@ bool ScreenCapture::initDxgi() {
                 continue;
             }
 
-            IDXGIOutput* out = nullptr;
-            bool hasOutput = SUCCEEDED(cand->EnumOutputs(0, &out)) && out;
-            if (out) out->Release();
+            bool hasOutput = false;
+            for (UINT oi = 0; ; ++oi) {
+                IDXGIOutput* out = nullptr;
+                if (cand->EnumOutputs(oi, &out) == DXGI_ERROR_NOT_FOUND || !out) break;
+                DXGI_OUTPUT_DESC od = {};
+                if (SUCCEEDED(out->GetDesc(&od)) && od.AttachedToDesktop) {
+                    hasOutput = true;
+                }
+                out->Release();
+                if (hasOutput) break;
+            }
 
             if (hasOutput) {
                 if (ad.VendorId == 0x10DE) nvidiaAdapters.push_back(cand);
@@ -283,62 +291,89 @@ bool ScreenCapture::initDxgiOnAdapter(IDXGIAdapter1* adapter) {
         }
     }
 
-    IDXGIOutput* dxgiOutput = nullptr;
-    hr = dxgiAdapter->EnumOutputs(0, &dxgiOutput);
-    dxgiAdapter->Release();
-    if (FAILED(hr)) { cleanupDxgi(); return false; }
-
-    IDXGIOutput6* dxgiOutput6 = nullptr;
-    if (SUCCEEDED(dxgiOutput->QueryInterface(__uuidof(IDXGIOutput6), reinterpret_cast<void**>(&dxgiOutput6)))) {
-        DXGI_OUTPUT_DESC1 desc1 = {};
-        if (SUCCEEDED(dxgiOutput6->GetDesc1(&desc1))) {
-            m_isHdrOutput = (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+    std::vector<IDXGIOutput*> attachedOutputs;
+    for (UINT oi = 0; ; ++oi) {
+        IDXGIOutput* out = nullptr;
+        if (dxgiAdapter->EnumOutputs(oi, &out) == DXGI_ERROR_NOT_FOUND || !out) break;
+        DXGI_OUTPUT_DESC od = {};
+        if (SUCCEEDED(out->GetDesc(&od)) && od.AttachedToDesktop &&
+            od.DesktopCoordinates.right > od.DesktopCoordinates.left &&
+            od.DesktopCoordinates.bottom > od.DesktopCoordinates.top) {
+            attachedOutputs.push_back(out);
+        } else {
+            out->Release();
         }
-        m_dxgiOutput6 = dxgiOutput6; // kept for live Auto-HDR / Win+Alt+B re-checks
+    }
+    dxgiAdapter->Release();
+    if (attachedOutputs.empty()) { cleanupDxgi(); return false; }
+
+    bool duplicated = false;
+    for (size_t oi = 0; oi < attachedOutputs.size(); ++oi) {
+        IDXGIOutput* dxgiOutput = attachedOutputs[oi];
+        if (duplicated) {
+            dxgiOutput->Release();
+            continue;
+        }
+
+        IDXGIOutput6* dxgiOutput6 = nullptr;
+        if (SUCCEEDED(dxgiOutput->QueryInterface(__uuidof(IDXGIOutput6), reinterpret_cast<void**>(&dxgiOutput6)))) {
+            DXGI_OUTPUT_DESC1 desc1 = {};
+            if (SUCCEEDED(dxgiOutput6->GetDesc1(&desc1))) {
+                m_isHdrOutput = (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+            }
+            if (m_dxgiOutput6) m_dxgiOutput6->Release();
+            m_dxgiOutput6 = dxgiOutput6; // kept for live Auto-HDR / Win+Alt+B re-checks
+        }
+
+        // Prefer DuplicateOutput1 so Windows hands us native HDR scRGB R16G16B16A16_FLOAT when Windows HDR is ON
+        IDXGIOutput5* dxgiOutput5 = nullptr;
+        if (SUCCEEDED(dxgiOutput->QueryInterface(__uuidof(IDXGIOutput5), reinterpret_cast<void**>(&dxgiOutput5)))) {
+            DXGI_OUTPUT_DESC outputDesc = {};
+            dxgiOutput5->GetDesc(&outputDesc);
+            m_screenLeft = outputDesc.DesktopCoordinates.left;
+            m_screenTop = outputDesc.DesktopCoordinates.top;
+            m_width = outputDesc.DesktopCoordinates.right - outputDesc.DesktopCoordinates.left;
+            m_height = outputDesc.DesktopCoordinates.bottom - outputDesc.DesktopCoordinates.top;
+
+            const DXGI_FORMAT supportedFormats[] = {
+                DXGI_FORMAT_R16G16B16A16_FLOAT,
+                DXGI_FORMAT_R10G10B10A2_UNORM,
+                DXGI_FORMAT_B8G8R8A8_UNORM
+            };
+            hr = dxgiOutput5->DuplicateOutput1(m_d3dDevice, 0, ARRAYSIZE(supportedFormats), supportedFormats, &m_duplication);
+            dxgiOutput5->Release();
+        } else {
+            IDXGIOutput1* dxgiOutput1 = nullptr;
+            if (SUCCEEDED(dxgiOutput->QueryInterface(__uuidof(IDXGIOutput1), reinterpret_cast<void**>(&dxgiOutput1)))) {
+                DXGI_OUTPUT_DESC outputDesc = {};
+                dxgiOutput1->GetDesc(&outputDesc);
+                m_screenLeft = outputDesc.DesktopCoordinates.left;
+                m_screenTop = outputDesc.DesktopCoordinates.top;
+                m_width = outputDesc.DesktopCoordinates.right - outputDesc.DesktopCoordinates.left;
+                m_height = outputDesc.DesktopCoordinates.bottom - outputDesc.DesktopCoordinates.top;
+                hr = dxgiOutput1->DuplicateOutput(m_d3dDevice, &m_duplication);
+                dxgiOutput1->Release();
+            } else {
+                hr = E_FAIL;
+            }
+        }
+        dxgiOutput->Release();
+
+        if (SUCCEEDED(hr) && m_duplication) {
+            for (int a = 0; a < 5 && !acquireDxgi(20); ++a) {}
+            if (m_duplication && m_hasValidGpuFrame) {
+                duplicated = true;
+            } else {
+                if (m_duplication) { m_duplication->Release(); m_duplication = nullptr; }
+                if (m_dxgiOutput6) { m_dxgiOutput6->Release(); m_dxgiOutput6 = nullptr; }
+            }
+        }
     }
 
-    // Prefer DuplicateOutput1 so Windows hands us native HDR scRGB R16G16B16A16_FLOAT when Windows HDR is ON
-    IDXGIOutput5* dxgiOutput5 = nullptr;
-    if (SUCCEEDED(dxgiOutput->QueryInterface(__uuidof(IDXGIOutput5), reinterpret_cast<void**>(&dxgiOutput5)))) {
-        DXGI_OUTPUT_DESC outputDesc = {};
-        dxgiOutput5->GetDesc(&outputDesc);
-        m_screenLeft = outputDesc.DesktopCoordinates.left;
-        m_screenTop = outputDesc.DesktopCoordinates.top;
-        m_width = outputDesc.DesktopCoordinates.right - outputDesc.DesktopCoordinates.left;
-        m_height = outputDesc.DesktopCoordinates.bottom - outputDesc.DesktopCoordinates.top;
-
-        const DXGI_FORMAT supportedFormats[] = {
-            DXGI_FORMAT_R16G16B16A16_FLOAT,
-            DXGI_FORMAT_R10G10B10A2_UNORM,
-            DXGI_FORMAT_B8G8R8A8_UNORM
-        };
-        hr = dxgiOutput5->DuplicateOutput1(m_d3dDevice, 0, ARRAYSIZE(supportedFormats), supportedFormats, &m_duplication);
-        dxgiOutput5->Release();
-        dxgiOutput->Release();
-        if (SUCCEEDED(hr) && m_duplication) {
-            std::cout << "[ScreenCapture] GPU Adapter: " << m_adapterName
-                      << (m_isNvidiaGpu ? " (NVIDIA Dedicated)" : " (Display Owner)") << std::endl;
-            return true;
-        }
+    if (!duplicated) {
         cleanupDxgi();
         return false;
     }
-
-    IDXGIOutput1* dxgiOutput1 = nullptr;
-    hr = dxgiOutput->QueryInterface(__uuidof(IDXGIOutput1), reinterpret_cast<void**>(&dxgiOutput1));
-    dxgiOutput->Release();
-    if (FAILED(hr)) { cleanupDxgi(); return false; }
-
-    DXGI_OUTPUT_DESC outputDesc = {};
-    dxgiOutput1->GetDesc(&outputDesc);
-    m_screenLeft = outputDesc.DesktopCoordinates.left;
-    m_screenTop = outputDesc.DesktopCoordinates.top;
-    m_width = outputDesc.DesktopCoordinates.right - outputDesc.DesktopCoordinates.left;
-    m_height = outputDesc.DesktopCoordinates.bottom - outputDesc.DesktopCoordinates.top;
-
-    hr = dxgiOutput1->DuplicateOutput(m_d3dDevice, &m_duplication);
-    dxgiOutput1->Release();
-    if (FAILED(hr)) { cleanupDxgi(); return false; }
 
     std::cout << "[ScreenCapture] GPU Adapter: " << m_adapterName
               << (m_isNvidiaGpu ? " (NVIDIA Dedicated)" : " (Display Owner)") << std::endl;
@@ -351,6 +386,7 @@ void ScreenCapture::cleanupDxgi() {
         if (m_gpuCopyTex[i]) { m_gpuCopyTex[i]->Release(); m_gpuCopyTex[i] = nullptr; }
     }
     m_latestSlot.store(0);
+    m_hasValidGpuFrame = false;
     if (m_stagingTexture) { m_stagingTexture->Release(); m_stagingTexture = nullptr; }
     if (m_duplication) { m_duplication->Release(); m_duplication = nullptr; }
     if (m_dxgiOutput6) { m_dxgiOutput6->Release(); m_dxgiOutput6 = nullptr; }
@@ -368,7 +404,7 @@ bool ScreenCapture::grabGpuFrame(ID3D11Device** outDev, ID3D11DeviceContext** ou
     std::lock_guard<std::mutex> lock(m_snapMutex);
     int slot = m_latestSlot.load();
     ID3D11Texture2D* tex = m_gpuCopyTex[slot];
-    if (!m_useDxgi || !m_d3dDevice || !m_d3dContext || !tex) {
+    if (!m_useDxgi || !m_hasValidGpuFrame || !m_d3dDevice || !m_d3dContext || !tex) {
         return false;
     }
 
@@ -387,9 +423,18 @@ bool ScreenCapture::grabGpuFrame(ID3D11Device** outDev, ID3D11DeviceContext** ou
 
 bool ScreenCapture::acquireFrame(uint32_t timeoutMs) {
     if (m_useDxgi) {
-        if (acquireDxgi(timeoutMs)) return true;
+        if (acquireDxgi(timeoutMs)) {
+            m_dxgiReinitFails = 0;
+            return true;
+        }
         if (!m_duplication) {
-            initDxgi();
+            if (!initDxgi()) {
+                if (++m_dxgiReinitFails >= 5 && initGdi()) {
+                    std::cout << "[ScreenCapture] DXGI unavailable - switched to GDI fallback." << std::endl;
+                    m_useDxgi = false;
+                    return acquireGdi();
+                }
+            }
         }
         return false;
     }
@@ -412,7 +457,7 @@ bool ScreenCapture::acquireDxgi(uint32_t timeoutMs) {
     }
 
     // Check if frame contains actual screen image updates vs cursor-only update
-    if (frameInfo.LastPresentTime.QuadPart == 0 && m_gpuCopyTex[m_latestSlot.load()] != nullptr) {
+    if (frameInfo.LastPresentTime.QuadPart == 0 && m_hasValidGpuFrame) {
         desktopResource->Release();
         m_duplication->ReleaseFrame();
         return false;
@@ -480,6 +525,7 @@ bool ScreenCapture::acquireDxgi(uint32_t timeoutMs) {
     {
         std::lock_guard<std::mutex> lock(m_snapMutex);
         m_latestSlot.store(writeSlot);
+        m_hasValidGpuFrame = true;
     }
     return true;
 }

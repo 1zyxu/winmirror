@@ -40,6 +40,8 @@ public:
     VideoCodec getCodec() const { return m_codec; }
     ColorProfile getColorProfile() const { return m_colorProfile; }
     bool isHdrActive() const { return m_colorProfile == COLOR_HDR10_PQ; }
+    bool isHdrSource() const { return m_isHdrSource; }
+    bool advanceFallback();
     bool isHardwareGpu() const { return m_isHardware; }
     bool isNvidiaEncoder() const { return m_isNvidia; }
     bool hasVideoProcessor() const { return m_hasVideoProcessor; }
@@ -62,7 +64,18 @@ private:
     bool initVideoProcessor(DXGI_FORMAT srcFormat, bool useP010);
     void cleanupVideoProcessor();
 
-    bool tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwareOnly, bool nvidiaOnly, const char* label);
+    struct EncodeAttempt {
+        GUID subtype;
+        bool p010;
+        bool hw;
+        bool nvidiaOnly;
+        bool allowD3dManager;
+        std::string label;
+    };
+    void buildPlan();
+    bool startPlanFrom(size_t startIdx);
+
+    bool tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwareOnly, bool nvidiaOnly, bool allowD3dManager, const char* label);
     bool configureMftTypes(const GUID& outputSubtype, bool wantP010, UINT32 bitrate);
     void cleanupMft();
 
@@ -130,6 +143,13 @@ private:
     DWORD m_inStreamId = 0;
     DWORD m_outStreamId = 0;
     DWORD m_outBufSize = 0;
+
+    std::vector<EncodeAttempt> m_plan;
+    size_t m_planIndex = 0;
+    int m_vpMode = -1;
+    bool m_hasProducedOutput = false;
+    uint32_t m_submittedWithoutOutput = 0;
+    uint32_t m_waitTimeouts = 0;
 
     std::vector<uint8_t> m_yuvBuffer;
     std::vector<uint8_t> m_seqHeader; // Cached SPS/PPS(/VPS) if needed

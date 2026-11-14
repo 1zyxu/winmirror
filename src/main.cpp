@@ -143,9 +143,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Acquire initial frame cleanly so exact pixel format (HDR float16 / RGB10 / BGRA8) is settled
-    for (int attempt = 0; attempt < 20 && !capture.acquireFrame(); ++attempt) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(16));
-    }
+    for (int attempt = 0; attempt < 15 && !capture.acquireFrame(16); ++attempt) {}
 
     Encoder encoder;
     if (!encoder.init(capture.getD3DDevice(), capture.getD3DContext(),
@@ -253,11 +251,36 @@ int main(int argc, char* argv[]) {
     uint64_t encodedBytes = 0;
     uint64_t frameSeq = 0;
     uint64_t lastEncodedSeq = 0;
-    bool lastZeroCopy = encoder.isZeroCopyActive();
+    uint32_t lastSentW = encoder.getWidth();
+    uint32_t lastSentH = encoder.getHeight();
+    VideoCodec lastSentCodec = encoder.getCodec();
+    ColorProfile lastSentColor = encoder.getColorProfile();
+    uint16_t lastSentFlags = buildHelloFlags(btReady, capture, encoder);
 
     const auto minFrameGap = std::chrono::microseconds(1000000 / targetFps);
     RawFrame cpuFallbackFrame;
     std::vector<uint8_t> annexB;
+
+    auto syncStreamMetadata = [&]() {
+        uint16_t flagsNow = buildHelloFlags(btBridge.isRadioAvailable(), capture, encoder);
+        if (encoder.getWidth() != lastSentW ||
+            encoder.getHeight() != lastSentH ||
+            encoder.getCodec() != lastSentCodec ||
+            encoder.getColorProfile() != lastSentColor ||
+            flagsNow != lastSentFlags) {
+            lastSentW = encoder.getWidth();
+            lastSentH = encoder.getHeight();
+            lastSentCodec = encoder.getCodec();
+            lastSentColor = encoder.getColorProfile();
+            lastSentFlags = flagsNow;
+            server.setStreamInfo(lastSentW, lastSentH, static_cast<uint16_t>(targetFps),
+                                 lastSentCodec, lastSentColor,
+                                 audioCapture.getSampleRate(), flagsNow,
+                                 notifyKeyframe);
+            btBridge.updateMetadata(ipsCsv, lastSentW, lastSentH,
+                                    encoder.isHdrActive(), encoder.getEncoderName());
+        }
+    };
 
     auto emitEncoded = [&](std::vector<uint8_t>& pktData, bool isKey, uint64_t ptsUs) {
         encodedBytes += pktData.size();
@@ -273,14 +296,7 @@ int main(int argc, char* argv[]) {
 
         server.broadcastVideo(std::move(pkt));
         encodedFrames++;
-        if (encoder.isZeroCopyActive() != lastZeroCopy) {
-            lastZeroCopy = encoder.isZeroCopyActive();
-            server.setStreamInfo(encoder.getWidth(), encoder.getHeight(), static_cast<uint16_t>(targetFps),
-                                 encoder.getCodec(), encoder.getColorProfile(),
-                                 audioCapture.getSampleRate(),
-                                 buildHelloFlags(btBridge.isRadioAvailable(), capture, encoder),
-                                 notifyKeyframe);
-        }
+        syncStreamMetadata();
     };
 
     while (g_running) {
@@ -320,17 +336,11 @@ int main(int argc, char* argv[]) {
                     if (snapDev != encoder.getCaptureDevice() ||
                         (snapW & ~1u) != encoder.getWidth() ||
                         (snapH & ~1u) != encoder.getHeight() ||
-                        snapFmt != encoder.getSrcFormat()) {
+                        snapFmt != encoder.getSrcFormat() ||
+                        snapHdr != encoder.isHdrSource()) {
                         encoder.init(snapDev, snapCtx, snapW, snapH, snapFmt,
                                      static_cast<uint32_t>(targetFps), snapHdr);
-                        server.setStreamInfo(encoder.getWidth(), encoder.getHeight(), static_cast<uint16_t>(targetFps),
-                                             encoder.getCodec(), encoder.getColorProfile(),
-                                             audioCapture.getSampleRate(),
-                                             buildHelloFlags(btBridge.isRadioAvailable(), capture, encoder),
-                                             notifyKeyframe);
-                        lastZeroCopy = encoder.isZeroCopyActive();
-                        btBridge.updateMetadata(ipsCsv, encoder.getWidth(), encoder.getHeight(),
-                                                encoder.isHdrActive(), encoder.getEncoderName());
+                        syncStreamMetadata();
                     }
                 }
 
@@ -341,7 +351,8 @@ int main(int argc, char* argv[]) {
 
                 if (haveGpu && encoder.hasVideoProcessor()) {
                     encoded = encoder.encodeGpuFrame(snapTex, ptsUs, annexB, isKey);
-                } else if (capture.copyCurrentFrameToBgra(cpuFallbackFrame)) {
+                }
+                if (!encoded && !encoder.hasVideoProcessor() && capture.copyCurrentFrameToBgra(cpuFallbackFrame)) {
                     if ((cpuFallbackFrame.width & ~1u) != encoder.getWidth() ||
                         (cpuFallbackFrame.height & ~1u) != encoder.getHeight()) {
                         encoder.init(snapDev, snapCtx, cpuFallbackFrame.width, cpuFallbackFrame.height,
@@ -359,9 +370,7 @@ int main(int argc, char* argv[]) {
                 if (encoded && !annexB.empty()) {
                     emitEncoded(annexB, isKey, ptsUs);
                 }
-                while (encoder.popPendingFrame(annexB, isKey)) {
-                    emitEncoded(annexB, isKey, ptsUs);
-                }
+                syncStreamMetadata();
 
                 // Drift-free fixed cadence without compounding encode latency into frame period
                 nextEncodeTime += minFrameGap;
@@ -370,6 +379,15 @@ int main(int argc, char* argv[]) {
                     nextEncodeTime = afterEncode;
                 }
             }
+
+            // Always drain async MFT output queue even while desktop is idle so first/queued frames never strand
+            bool isKeyPending = false;
+            while (encoder.popPendingFrame(annexB, isKeyPending)) {
+                uint64_t drainPtsUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - startTime).count();
+                emitEncoded(annexB, isKeyPending, drainPtsUs);
+            }
+            syncStreamMetadata();
         }
 
         // Single-line live console status
