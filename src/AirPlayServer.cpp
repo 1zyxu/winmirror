@@ -127,8 +127,8 @@ void AirPlayServer::acceptLoop() {
         int nodelay = 1;
         setsockopt(clientSock, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
 
-        // 128 KB send buffer prevents kernel bufferbloat over Wi-Fi/USB so congestion drops trigger promptly
-        int sndbuf = 128 * 1024;
+        // 512 KB send buffer fits full IDR keyframes without blocking sendAll() in userspace over Wi-Fi
+        int sndbuf = 512 * 1024;
         setsockopt(clientSock, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&sndbuf), sizeof(sndbuf));
 
         int tos = 0x88; // DSCP AF41 multimedia low-latency class (best-effort)
@@ -209,8 +209,8 @@ void AirPlayServer::broadcastVideo(std::shared_ptr<const EncodedFrame> frame) {
                     c->videoQueue.clear();
                 }
             }
-            if (c->videoQueue.size() > 2) {
-                // Tight 2-frame (~33ms) congestion cap so interactive games stay snappy
+            if (c->videoQueue.size() > 4) {
+                // 4-frame (~66ms) congestion cap avoids Wi-Fi micro-burst IDR storms while staying bounded
                 c->videoQueue.clear();
                 if (!frame->isKeyframe) {
                     c->waitingForKeyframe = true;

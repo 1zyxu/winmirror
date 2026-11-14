@@ -19,6 +19,7 @@
 #include <netinet/tcp.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <cerrno>
 
 #include "../src/TransportPolicy.h"
@@ -799,7 +800,8 @@ public:
     }
 
     bool decodeAndPresent(const uint8_t *annexB, size_t len, VideoCodec codec,
-                          ColorProfile colorProfile, AVSampleBufferDisplayLayer *layer) {
+                          ColorProfile colorProfile, AVSampleBufferDisplayLayer *layer,
+                          bool presentFrame = true) {
         if (!annexB || len < 4 || !layer) return false;
 
         _vclNals.clear();
@@ -946,61 +948,63 @@ public:
             return false;
         }
 
-        // Stamp exact color profile on GPU CVPixelBuffer so Mac XDR renders true RGB / BT.2020 PQ HDR
-        if (colorProfile == COLOR_HDR10_PQ) {
-            CVBufferSetAttachment(decodedPixelBuf, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, kCVAttachmentMode_ShouldPropagate);
-            CVBufferSetAttachment(decodedPixelBuf, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, kCVAttachmentMode_ShouldPropagate);
-            CVBufferSetAttachment(decodedPixelBuf, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, kCVAttachmentMode_ShouldPropagate);
-        } else {
-            CVBufferSetAttachment(decodedPixelBuf, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
-            CVBufferSetAttachment(decodedPixelBuf, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
-            CVBufferSetAttachment(decodedPixelBuf, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
-        }
+        if (presentFrame) {
+            // Stamp exact color profile on GPU CVPixelBuffer so Mac XDR renders true RGB / BT.2020 PQ HDR
+            if (colorProfile == COLOR_HDR10_PQ) {
+                CVBufferSetAttachment(decodedPixelBuf, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020, kCVAttachmentMode_ShouldPropagate);
+                CVBufferSetAttachment(decodedPixelBuf, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, kCVAttachmentMode_ShouldPropagate);
+                CVBufferSetAttachment(decodedPixelBuf, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020, kCVAttachmentMode_ShouldPropagate);
+            } else {
+                CVBufferSetAttachment(decodedPixelBuf, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+                CVBufferSetAttachment(decodedPixelBuf, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+                CVBufferSetAttachment(decodedPixelBuf, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+            }
 
-        const size_t pbW = CVPixelBufferGetWidth(decodedPixelBuf);
-        const size_t pbH = CVPixelBufferGetHeight(decodedPixelBuf);
-        const OSType pbFmt = CVPixelBufferGetPixelFormatType(decodedPixelBuf);
-        if (!_cachedPixDesc || _cachedW != pbW || _cachedH != pbH || _cachedPixFmt != pbFmt || _cachedColor != colorProfile) {
+            const size_t pbW = CVPixelBufferGetWidth(decodedPixelBuf);
+            const size_t pbH = CVPixelBufferGetHeight(decodedPixelBuf);
+            const OSType pbFmt = CVPixelBufferGetPixelFormatType(decodedPixelBuf);
+            if (!_cachedPixDesc || _cachedW != pbW || _cachedH != pbH || _cachedPixFmt != pbFmt || _cachedColor != colorProfile) {
+                if (_cachedPixDesc) {
+                    CFRelease(_cachedPixDesc);
+                    _cachedPixDesc = nullptr;
+                }
+                status = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, decodedPixelBuf, &_cachedPixDesc);
+                if (status == noErr && _cachedPixDesc) {
+                    _cachedW = pbW;
+                    _cachedH = pbH;
+                    _cachedPixFmt = pbFmt;
+                    _cachedColor = colorProfile;
+                }
+            }
+
             if (_cachedPixDesc) {
-                CFRelease(_cachedPixDesc);
-                _cachedPixDesc = nullptr;
-            }
-            status = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, decodedPixelBuf, &_cachedPixDesc);
-            if (status == noErr && _cachedPixDesc) {
-                _cachedW = pbW;
-                _cachedH = pbH;
-                _cachedPixFmt = pbFmt;
-                _cachedColor = colorProfile;
-            }
-        }
+                CMSampleTimingInfo timing = kCMTimingInfoInvalid;
+                CMSampleBufferRef displaySample = nullptr;
+                status = CMSampleBufferCreateForImageBuffer(
+                    kCFAllocatorDefault,
+                    decodedPixelBuf,
+                    true,
+                    nullptr,
+                    nullptr,
+                    _cachedPixDesc,
+                    &timing,
+                    &displaySample
+                );
 
-        if (_cachedPixDesc) {
-            CMSampleTimingInfo timing = kCMTimingInfoInvalid;
-            CMSampleBufferRef displaySample = nullptr;
-            status = CMSampleBufferCreateForImageBuffer(
-                kCFAllocatorDefault,
-                decodedPixelBuf,
-                true,
-                nullptr,
-                nullptr,
-                _cachedPixDesc,
-                &timing,
-                &displaySample
-            );
+                if (status == noErr && displaySample) {
+                    CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(displaySample, YES);
+                    if (attachments && CFArrayGetCount(attachments) > 0) {
+                        CFMutableDictionaryRef dict = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
+                        CFDictionarySetValue(dict, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
+                    }
 
-            if (status == noErr && displaySample) {
-                CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(displaySample, YES);
-                if (attachments && CFArrayGetCount(attachments) > 0) {
-                    CFMutableDictionaryRef dict = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
-                    CFDictionarySetValue(dict, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
+                    AVSampleBufferVideoRenderer *renderer = layer.sampleBufferRenderer;
+                    if (renderer.requiresFlushToResumeDecoding || renderer.status == AVQueuedSampleBufferRenderingStatusFailed) {
+                        [renderer flush];
+                    }
+                    [renderer enqueueSampleBuffer:displaySample];
+                    CFRelease(displaySample);
                 }
-
-                AVSampleBufferVideoRenderer *renderer = layer.sampleBufferRenderer;
-                if (renderer.requiresFlushToResumeDecoding || renderer.status == AVQueuedSampleBufferRenderingStatusFailed) {
-                    [renderer flush];
-                }
-                [renderer enqueueSampleBuffer:displaySample];
-                CFRelease(displaySample);
             }
         }
 
@@ -1955,6 +1959,7 @@ struct PendingVideoPacket {
 };
 
 static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool> *running) {
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     VideoToolboxDecoder decoder;
     std::vector<uint8_t> payloadBuf;
     payloadBuf.reserve(4 * 1024 * 1024);
@@ -1982,7 +1987,7 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
         int nodelay = 1;
         setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
-        int rcvbuf = 256 * 1024;
+        int rcvbuf = 512 * 1024;
         setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
         int svcType = NET_SERVICE_TYPE_VI;
@@ -2034,8 +2039,10 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
         };
 
         std::thread decodeThread([&]() {
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
             auto lastFpsTick = std::chrono::steady_clock::now();
             auto lastFrameTime = std::chrono::steady_clock::time_point{};
+            auto lastPresentTime = std::chrono::steady_clock::now();
             uint32_t decodedFpsFrames = 0;
             uint64_t totalFrames = 0;
             double avgIntervalMs = 16.67;
@@ -2044,19 +2051,29 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
 
             for (;;) {
                 PendingVideoPacket pkt;
+                size_t remainingAfterPop = 0;
                 {
                     std::unique_lock<std::mutex> lock(vq.mtx);
                     vq.cv.wait(lock, [&]() { return vq.stop || !vq.queue.empty(); });
                     if (vq.stop && vq.queue.empty()) break;
                     pkt = std::move(vq.queue.front());
                     vq.queue.pop_front();
+                    remainingAfterPop = vq.queue.size();
                 }
+
+                auto decNow = std::chrono::steady_clock::now();
+                int64_t msSincePresent = std::chrono::duration_cast<std::chrono::milliseconds>(decNow - lastPresentTime).count();
+                bool presentFrame = shouldPresentQueuedFrame(remainingAfterPop, msSincePresent);
 
                 @autoreleasepool {
                     if (decoder.decodeAndPresent(pkt.data.data(), pkt.data.size(),
-                                                 pkt.codec, pkt.color, controller.videoView.displayLayer)) {
+                                                 pkt.codec, pkt.color, controller.videoView.displayLayer,
+                                                 presentFrame)) {
                         decodedFpsFrames++;
                         totalFrames++;
+                        if (presentFrame) {
+                            lastPresentTime = std::chrono::steady_clock::now();
+                        }
                     } else {
                         vq.dropCount++;
                         if (totalFrames > 0) {
@@ -2231,7 +2248,8 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
                                 vq.dropCount += static_cast<uint32_t>(vq.queue.size());
                                 vq.queue.clear();
                             }
-                        } else if (vq.queue.size() >= 2) {
+                        } else if (vq.queue.size() >= 8) {
+                            // Emergency catch-up only on large outage; small Wi-Fi bursts catch up cleanly without IDR freeze
                             vq.dropCount += static_cast<uint32_t>(vq.queue.size()) + 1;
                             vq.queue.clear();
                             vq.waitingKeyframe = true;
@@ -2304,6 +2322,10 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
 int main(int argc, const char *argv[]) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     @autoreleasepool {
+        id<NSObject> latencyActivity = [[NSProcessInfo processInfo]
+            beginActivityWithOptions:(NSActivityUserInitiated | NSActivityLatencyCritical)
+                              reason:@"Low-latency WinMirror display & audio streaming"];
+        (void)latencyActivity;
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 

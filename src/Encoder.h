@@ -47,9 +47,14 @@ public:
     bool isNvidiaEncoder() const { return m_isNvidia; }
     bool hasVideoProcessor() const { return m_hasVideoProcessor; }
     bool isZeroCopyActive() const { return m_useD3dManager && !m_nvDevice; }
+    static uint32_t computeTargetBitrateMbps(uint32_t width, uint32_t height, bool p010, bool hevc) {
+        bool highRes = ((static_cast<uint64_t>(width) * height) > 3000000ULL);
+        if (p010) return highRes ? 28u : 15u;
+        if (hevc) return highRes ? 22u : 10u;
+        return highRes ? 26u : 13u;
+    }
     uint32_t getTargetBitrateMbps() const {
-        bool highRes = ((static_cast<uint64_t>(m_width) * m_height) > 3000000ULL);
-        return m_useP010 ? (highRes ? 32u : 18u) : (highRes ? 28u : 14u);
+        return computeTargetBitrateMbps(m_width, m_height, m_useP010, m_codec == CODEC_HEVC);
     }
     const std::string& getEncoderName() const { return m_encoderName; }
     DXGI_FORMAT getSrcFormat() const { return m_srcFormat; }

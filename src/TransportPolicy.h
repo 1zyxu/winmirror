@@ -44,3 +44,8 @@ inline bool shouldAutoSwitchTransport(const std::string& currentIp, bool current
     if (currentIsUsb && !candIsUsb) return false;
     return currentRttMs > 12.0 && (candRttMs + 6.0) < currentRttMs;
 }
+
+inline bool shouldPresentQueuedFrame(size_t remainingQueue, int64_t msSinceLastPresent) {
+    // Decode catch-up P-frames for DPB continuity, but only present to compositor at live edge or >= 33ms floor
+    return remainingQueue == 0 || msSinceLastPresent >= 33;
+}

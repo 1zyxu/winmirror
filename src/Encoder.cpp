@@ -623,9 +623,9 @@ bool Encoder::configureMftTypes(const GUID& outputSubtype, bool wantP010, UINT32
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonQualityVsSpeed, 0);
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonMeanBitRate, bitrate);
-        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonBufferSize, bitrate / 4);
+        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonBufferSize, bitrate / 10);
         setCodecUint32(m_codecApi, CODECAPI_AVEncMPVDefaultBPictureCount, 0);
-        setCodecUint32(m_codecApi, CODECAPI_AVEncMPVGOPSize, m_fps * 2);
+        setCodecUint32(m_codecApi, CODECAPI_AVEncMPVGOPSize, m_fps * 5);
     };
     applyRtProps();
 
@@ -782,10 +782,7 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
     std::stable_sort(candidates.begin(), candidates.end(),
                      [](const auto& a, const auto& b) { return a.first < b.first; });
 
-    uint64_t pixels = static_cast<uint64_t>(m_width) * m_height;
-    UINT32 bitrate = wantP010
-        ? ((pixels > 3000000ULL) ? 32000000u : 18000000u)
-        : ((pixels > 3000000ULL) ? 28000000u : 14000000u);
+    UINT32 bitrate = computeTargetBitrateMbps(m_width, m_height, wantP010, outputSubtype == MFVideoFormat_HEVC) * 1000000u;
 
     for (const auto& cand : candidates) {
         UINT32 idx = cand.second;
