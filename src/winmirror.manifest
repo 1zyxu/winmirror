@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="2.1.6.0" processorArchitecture="amd64" name="WinMirror.AirPlay" type="win32"/>
+  <assemblyIdentity version="2.1.7.0" processorArchitecture="amd64" name="WinMirror.AirPlay" type="win32"/>
   <description>WinMirror AirPlay Display and Audio Streamer</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>

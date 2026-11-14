@@ -581,6 +581,9 @@ static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObject
         _displayLayer.videoGravity = AVLayerVideoGravityResizeAspect;
         _displayLayer.backgroundColor = [NSColor blackColor].CGColor;
         _displayLayer.wantsExtendedDynamicRangeContent = NO;
+        _displayLayer.contentsScale = [[NSScreen mainScreen] backingScaleFactor];
+        _displayLayer.minificationFilter = kCAFilterTrilinear;
+        _displayLayer.magnificationFilter = kCAFilterTrilinear;
         [self.layer addSublayer:_displayLayer];
 
         _cursorLayer = [CALayer layer];
@@ -1418,7 +1421,7 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
     IOBluetoothSDPUUID *targetUuid = [IOBluetoothSDPUUID uuidWithBytes:uuidBytes length:16];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        bool firstPass = true;
+        int passCount = 0;
         while (!self->_shuttingDown.load()) {
             if (!self.btLinked) {
                 NSArray *paired = [IOBluetoothDevice pairedDevices];
@@ -1426,11 +1429,23 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
                     if (self->_shuttingDown.load() || self.btLinked) break;
                     if (!dev) continue;
 
-                    IOBluetoothSDPServiceRecord *rec = [dev getServiceRecordForUUID:targetUuid];
-                    if (!rec && (firstPass || [dev isConnected])) {
+                    auto findRec = [&](IOBluetoothDevice *d) -> IOBluetoothSDPServiceRecord * {
+                        IOBluetoothSDPServiceRecord *r = [d getServiceRecordForUUID:targetUuid];
+                        if (r) return r;
+                        for (IOBluetoothSDPServiceRecord *svc in [d services]) {
+                            NSString *svcName = [svc getServiceName];
+                            if (svcName && [svcName containsString:@"WinMirror"]) {
+                                return svc;
+                            }
+                        }
+                        return nil;
+                    };
+
+                    IOBluetoothSDPServiceRecord *rec = findRec(dev);
+                    if (!rec && (passCount == 0 || (passCount % 3 == 0) || [dev isConnected])) {
                         [dev performSDPQuery:nil];
                         usleep(400000);
-                        rec = [dev getServiceRecordForUUID:targetUuid];
+                        rec = findRec(dev);
                     }
                     if (!rec) continue;
 
@@ -1452,9 +1467,9 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
                         if (opened) break;
                     }
                 }
-                firstPass = false;
+                passCount++;
             }
-            sleep(5);
+            sleep(3);
         }
     });
 }
@@ -2000,7 +2015,7 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
         int tos = 0x88; // DSCP AF41 multimedia low-latency class (best-effort)
         setsockopt(sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
 
-        struct timeval tv = { 3, 0 };
+        struct timeval tv = { 2, 0 };
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         sockaddr_in saddr = {};
@@ -2170,7 +2185,7 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
             }
 
             // Auto-upgrade from Wi-Fi to wired USB when plugged in mid-session
-            if (!currentIsUsb && (now - lastUsbUpgradeCheck >= std::chrono::seconds(5))) {
+            if (!currentIsUsb && (now - lastUsbUpgradeCheck >= std::chrono::seconds(2))) {
                 lastUsbUpgradeCheck = now;
                 std::string betterHost;
                 int betterPort = port;

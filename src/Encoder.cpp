@@ -513,9 +513,17 @@ bool Encoder::initVideoProcessor(DXGI_FORMAT srcFormat, bool useP010) {
     contentDesc.OutputFrameRate.Denominator = 1;
     contentDesc.OutputWidth = m_width;
     contentDesc.OutputHeight = m_height;
-    contentDesc.Usage = D3D11_VIDEO_USAGE_OPTIMAL_SPEED;
-
-    hr = m_videoDevice->CreateVideoProcessorEnumerator(&contentDesc, &m_vpEnum);
+    static const D3D11_VIDEO_USAGE kUsageOrder[] = {
+        D3D11_VIDEO_USAGE_OPTIMAL_QUALITY,
+        D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
+        D3D11_VIDEO_USAGE_OPTIMAL_SPEED
+    };
+    hr = E_FAIL;
+    for (D3D11_VIDEO_USAGE u : kUsageOrder) {
+        contentDesc.Usage = u;
+        hr = m_videoDevice->CreateVideoProcessorEnumerator(&contentDesc, &m_vpEnum);
+        if (SUCCEEDED(hr) && m_vpEnum) break;
+    }
     if (FAILED(hr) || !m_vpEnum) { cleanupVideoProcessor(); return false; }
 
     DXGI_FORMAT outFmt = useP010 ? DXGI_FORMAT_P010 : DXGI_FORMAT_NV12;
@@ -620,10 +628,10 @@ bool Encoder::configureMftTypes(const GUID& outputSubtype, bool wantP010, UINT32
         if (!m_codecApi) return;
         setCodecBool(m_codecApi, CODECAPI_AVLowLatencyMode, true);
         setCodecBool(m_codecApi, CODECAPI_AVEncCommonRealTime, true);
-        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonQualityVsSpeed, 0);
+        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonQualityVsSpeed, 45);
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonMeanBitRate, bitrate);
-        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonBufferSize, bitrate / 10);
+        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonBufferSize, bitrate / 3);
         setCodecUint32(m_codecApi, CODECAPI_AVEncMPVDefaultBPictureCount, 0);
         UINT32 gopSize = std::min<UINT32>(600u, std::max<UINT32>(120u, m_fps * 4u));
         setCodecUint32(m_codecApi, CODECAPI_AVEncMPVGOPSize, gopSize);
@@ -783,7 +791,9 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
     std::stable_sort(candidates.begin(), candidates.end(),
                      [](const auto& a, const auto& b) { return a.first < b.first; });
 
-    UINT32 bitrate = computeTargetBitrateMbps(m_width, m_height, m_fps, wantP010, outputSubtype == MFVideoFormat_HEVC) * 1000000u;
+    UINT32 baseMbps = computeTargetBitrateMbps(m_width, m_height, m_fps, wantP010, outputSubtype == MFVideoFormat_HEVC);
+    UINT32 bitrate = std::max<UINT32>(12u, (baseMbps * static_cast<UINT32>(m_bitrateScalePct.load())) / 100u) * 1000000u;
+    m_appliedScalePct = m_bitrateScalePct.load();
 
     for (const auto& cand : candidates) {
         UINT32 idx = cand.second;
@@ -1204,9 +1214,34 @@ bool Encoder::waitAsyncInputReady() {
     return true;
 }
 
+void Encoder::notifyNetworkHealth(bool congested) {
+    uint64_t nowMs = GetTickCount64();
+    if (congested) {
+        m_lastCongestionMs.store(nowMs);
+        uint64_t prevAdj = m_lastRateAdjustMs.load();
+        if (prevAdj != 0 && nowMs - prevAdj < 1500ULL) return;
+        m_lastRateAdjustMs.store(nowMs);
+        m_bitrateScalePct.store(stepBitrateScalePct(m_bitrateScalePct.load(), true));
+    } else if (m_bitrateScalePct.load() < 100) {
+        uint64_t lastCong = m_lastCongestionMs.load();
+        uint64_t prevAdj = m_lastRateAdjustMs.load();
+        if (nowMs - lastCong >= 3500ULL && (prevAdj == 0 || nowMs - prevAdj >= 2000ULL)) {
+            m_lastRateAdjustMs.store(nowMs);
+            m_bitrateScalePct.store(stepBitrateScalePct(m_bitrateScalePct.load(), false));
+        }
+    }
+}
+
 bool Encoder::submitSampleToMft(IMFSample* sample, std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe, bool& outInputAccepted) {
     outInputAccepted = false;
     if (!sample) return false;
+
+    int targetPct = m_bitrateScalePct.load();
+    if (m_codecApi && targetPct != m_appliedScalePct) {
+        UINT32 newMbps = getTargetBitrateMbps();
+        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonMeanBitRate, newMbps * 1000000u);
+        m_appliedScalePct = targetPct;
+    }
 
     if ((m_forceKeyframe.exchange(false) || !m_hasEmittedKeyframe) && m_codecApi) {
         setCodecUint32(m_codecApi, CODECAPI_AVEncVideoForceKeyFrame, 1);

@@ -28,6 +28,7 @@ public:
     void broadcastAudio(const uint8_t* pcm, size_t size, uint32_t sampleRate, uint16_t channels);
     void broadcastAudioDevices(const std::string& serializedDevices);
     void setAudioSourceHandler(std::function<void(int)> handler);
+    void setCongestionHandler(std::function<void(bool)> handler);
 
     int getPort() const { return m_port; }
     int getActiveClients() const { return m_activeClients.load(); }
@@ -78,4 +79,6 @@ private:
     std::string m_audioDevices;
     std::function<void()> m_onKeyframeReq;
     std::function<void(int)> m_onAudioSourceReq;
+    std::function<void(bool)> m_onCongestion;
+    uint32_t m_cleanBroadcastCount = 0;
 };

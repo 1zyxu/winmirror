@@ -35,6 +35,7 @@ public:
     void requestKeyframe() { m_forceKeyframe.store(true); }
     bool hasKeyframeRequest() const { return m_forceKeyframe.load(); }
     bool hasEmittedKeyframe() const { return m_hasEmittedKeyframe; }
+    void notifyNetworkHealth(bool congested);
 
     ID3D11Device* getCaptureDevice() const { return m_d3dDevice; }
     uint32_t getWidth() const { return m_width; }
@@ -52,7 +53,8 @@ public:
         return computeBitrateMbps(width, height, fps, p010, hevc);
     }
     uint32_t getTargetBitrateMbps() const {
-        return computeTargetBitrateMbps(m_width, m_height, m_fps, m_useP010, m_codec == CODEC_HEVC);
+        uint32_t base = computeTargetBitrateMbps(m_width, m_height, m_fps, m_useP010, m_codec == CODEC_HEVC);
+        return std::max<uint32_t>(12u, (base * static_cast<uint32_t>(m_bitrateScalePct.load())) / 100u);
     }
     const std::string& getEncoderName() const { return m_encoderName; }
     DXGI_FORMAT getSrcFormat() const { return m_srcFormat; }
@@ -117,6 +119,10 @@ private:
     bool m_isNvidia = false;
     std::string m_encoderName = "Uninitialized";
     std::atomic<bool> m_forceKeyframe{true};
+    std::atomic<int> m_bitrateScalePct{100};
+    int m_appliedScalePct = 100;
+    std::atomic<uint64_t> m_lastCongestionMs{0};
+    std::atomic<uint64_t> m_lastRateAdjustMs{0};
 
     // D3D11 Video Processor (GPU HDR/SDR color conversion -> NV12/P010 ring)
     static constexpr int kVpRingSize = 4;

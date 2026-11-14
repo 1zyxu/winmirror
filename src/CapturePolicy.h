@@ -33,8 +33,17 @@ inline uint32_t resolveTargetFps(int cliFps, uint32_t monitorHz, bool& outUnlimi
 
 inline uint32_t computeBitrateMbps(uint32_t width, uint32_t height, uint32_t fps, bool p010, bool hevc) {
     bool highRes = ((static_cast<uint64_t>(width) * height) > 3000000ULL);
-    uint32_t base = p010 ? (highRes ? 32u : 16u) : (hevc ? (highRes ? 24u : 10u) : (highRes ? 28u : 13u));
+    uint32_t base = p010 ? (highRes ? 48u : 28u) : (hevc ? (highRes ? 38u : 20u) : (highRes ? 44u : 26u));
     uint32_t clampedFps = fps < 60u ? 60u : (fps > 240u ? 240u : fps);
-    uint32_t scaled = base + (base * (clampedFps - 60u)) / 150u;
-    return scaled > 80u ? 80u : scaled;
+    uint32_t scaled = base + (base * (clampedFps - 60u)) / 140u;
+    return scaled > 110u ? 110u : scaled;
+}
+
+inline int stepBitrateScalePct(int currentPct, bool congested) {
+    if (congested) {
+        int next = currentPct - 15;
+        return next < 60 ? 60 : next;
+    }
+    int next = currentPct + 10;
+    return next > 100 ? 100 : next;
 }

@@ -194,40 +194,69 @@ bool AirPlayServer::sendPacket(SOCKET sock, uint16_t type, uint16_t flags, uint3
 void AirPlayServer::broadcastVideo(std::shared_ptr<const EncodedFrame> frame) {
     if (!frame || frame->data.empty()) return;
 
-    std::lock_guard<std::mutex> clock(m_clientsMutex);
-    for (auto& c : m_clients) {
-        if (!c->alive) continue;
-        bool needKey = false;
-        {
-            std::lock_guard<std::mutex> qlock(c->queueMutex);
-            if (c->waitingForKeyframe && !frame->isKeyframe) {
-                continue;
-            }
-            if (frame->isKeyframe) {
-                c->waitingForKeyframe = false;
-                if (!c->videoQueue.empty()) {
-                    c->videoQueue.clear();
-                }
-            }
-            if (c->videoQueue.size() > 4) {
-                // 4-frame (~66ms) congestion cap avoids Wi-Fi micro-burst IDR storms while staying bounded
-                c->videoQueue.clear();
-                if (!frame->isKeyframe) {
-                    c->waitingForKeyframe = true;
-                    needKey = true;
-                }
-            }
-            if (!c->waitingForKeyframe) {
-                c->videoQueue.push_back(frame);
-            }
-        }
-        c->cv.notify_one();
+    bool anyKeyframeReq = false;
+    bool congested = false;
+    int activeClients = 0;
 
-        if (needKey) {
-            std::lock_guard<std::mutex> ilock(m_infoMutex);
-            if (m_onKeyframeReq) m_onKeyframeReq();
+    {
+        std::lock_guard<std::mutex> clock(m_clientsMutex);
+        for (auto& c : m_clients) {
+            if (!c->alive) continue;
+            activeClients++;
+            bool needKey = false;
+            {
+                std::lock_guard<std::mutex> qlock(c->queueMutex);
+                if (c->waitingForKeyframe && !frame->isKeyframe) {
+                    continue;
+                }
+                if (frame->isKeyframe) {
+                    c->waitingForKeyframe = false;
+                    if (!c->videoQueue.empty()) {
+                        c->videoQueue.clear();
+                    }
+                }
+                if (c->videoQueue.size() > 6) {
+                    // 6-frame cap preserves high-FPS burst absorption while signaling real link congestion
+                    congested = true;
+                    c->videoQueue.clear();
+                    if (!frame->isKeyframe) {
+                        c->waitingForKeyframe = true;
+                        needKey = true;
+                    }
+                }
+                if (!c->waitingForKeyframe) {
+                    c->videoQueue.push_back(frame);
+                }
+            }
+            c->cv.notify_one();
+            if (needKey) anyKeyframeReq = true;
         }
     }
+
+    if (activeClients == 0) return;
+
+    std::function<void()> keyFn;
+    std::function<void(bool)> congFn;
+    bool notifyCongestion = false;
+    bool congestionState = false;
+    {
+        std::lock_guard<std::mutex> ilock(m_infoMutex);
+        if (anyKeyframeReq) keyFn = m_onKeyframeReq;
+        if (congested) {
+            m_cleanBroadcastCount = 0;
+            notifyCongestion = true;
+            congestionState = true;
+            congFn = m_onCongestion;
+        } else if (++m_cleanBroadcastCount >= 90) {
+            m_cleanBroadcastCount = 0;
+            notifyCongestion = true;
+            congestionState = false;
+            congFn = m_onCongestion;
+        }
+    }
+
+    if (keyFn) keyFn();
+    if (notifyCongestion && congFn) congFn(congestionState);
 }
 
 void AirPlayServer::broadcastCursor(const CursorPayload& meta, const std::vector<uint8_t>& bgra) {
@@ -285,6 +314,11 @@ void AirPlayServer::broadcastAudio(const uint8_t* pcm, size_t size, uint32_t sam
 void AirPlayServer::setAudioSourceHandler(std::function<void(int)> handler) {
     std::lock_guard<std::mutex> ilock(m_infoMutex);
     m_onAudioSourceReq = std::move(handler);
+}
+
+void AirPlayServer::setCongestionHandler(std::function<void(bool)> handler) {
+    std::lock_guard<std::mutex> ilock(m_infoMutex);
+    m_onCongestion = std::move(handler);
 }
 
 void AirPlayServer::broadcastAudioDevices(const std::string& serializedDevices) {

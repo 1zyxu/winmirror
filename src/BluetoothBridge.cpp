@@ -104,6 +104,7 @@ bool BluetoothBridge::start(const std::string& ipsCsv, uint32_t width, uint32_t 
     }
 
     // Publish Windows Bluetooth SDP Record so macOS IOBluetooth auto-discovers this RFCOMM channel
+    // NS_BTH only supports Unicode WSAQUERYSETW / WSASetServiceW (ANSI WSASetServiceA fails silently).
     GUID serviceUuid = WINMIRROR_BT_SERVICE_UUID;
     CSADDR_INFO csAddr = {};
     csAddr.LocalAddr.lpSockaddr = reinterpret_cast<LPSOCKADDR>(&sa);
@@ -113,9 +114,9 @@ bool BluetoothBridge::start(const std::string& ipsCsv, uint32_t width, uint32_t 
     csAddr.iSocketType = SOCK_STREAM;
     csAddr.iProtocol = BTHPROTO_RFCOMM;
 
-    char svcName[] = "WinMirror AirPlay BT";
-    char svcComment[] = "WinMirror AirPlay Bluetooth Discovery & Control";
-    WSAQUERYSETA wsaq = {};
+    wchar_t svcName[] = L"WinMirror AirPlay BT";
+    wchar_t svcComment[] = L"WinMirror AirPlay Bluetooth Discovery & Control";
+    WSAQUERYSETW wsaq = {};
     wsaq.dwSize = sizeof(wsaq);
     wsaq.lpszServiceInstanceName = svcName;
     wsaq.lpServiceClassId = &serviceUuid;
@@ -124,12 +125,14 @@ bool BluetoothBridge::start(const std::string& ipsCsv, uint32_t width, uint32_t 
     wsaq.dwNumberOfCsAddrs = 1;
     wsaq.lpcsaBuffer = &csAddr;
 
-    if (WSASetServiceA(&wsaq, RNRSERVICE_REGISTER, 0) == SOCKET_ERROR) {
-        // Non-fatal: socket still accepts direct RFCOMM connections
+    int sdpErr = 0;
+    if (WSASetServiceW(&wsaq, RNRSERVICE_REGISTER, 0) == SOCKET_ERROR) {
+        sdpErr = WSAGetLastError();
     }
 
     std::cout << "[Bluetooth] Radio: " << m_radioName
-              << " | RFCOMM Ch " << sa.port;
+              << " | RFCOMM Ch " << sa.port
+              << (sdpErr == 0 ? " | SDP=OK" : (" | SDP=err(" + std::to_string(sdpErr) + ")"));
     if (!m_pairedNames.empty()) {
         std::cout << " | Paired: " << m_pairedNames;
     }

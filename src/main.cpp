@@ -16,6 +16,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cctype>
+#include <algorithm>
 #include <iphlpapi.h>
 #include <mmsystem.h>
 
@@ -146,6 +147,14 @@ static const char* gpuModeTag(uint16_t flags) {
     return "CPU";
 }
 
+static bool asciiContainsIC(const char* hay, const char* needle) {
+    if (!hay || !needle || !*needle) return false;
+    std::string h(hay), n(needle);
+    for (char& c : h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (char& c : n) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return h.find(n) != std::string::npos;
+}
+
 static std::string collectLocalIpsCsv(int port, bool printBanner) {
     if (printBanner) {
         std::cout << "==================================================================" << std::endl;
@@ -154,7 +163,14 @@ static std::string collectLocalIpsCsv(int port, bool printBanner) {
         std::cout << "AirPlay Discovery Transports (USB-C / Router LAN / Wi-Fi / BT):" << std::endl;
     }
 
-    std::ostringstream ipsCsv;
+    struct NetEndpoint {
+        int priority;
+        std::string ip;
+        const char* tag;
+        std::string desc;
+    };
+    std::vector<NetEndpoint> endpoints;
+
     ULONG bufLen = sizeof(IP_ADAPTER_INFO);
     std::vector<BYTE> buf(bufLen);
     PIP_ADAPTER_INFO pAdapter = reinterpret_cast<PIP_ADAPTER_INFO>(buf.data());
@@ -164,21 +180,55 @@ static std::string collectLocalIpsCsv(int port, bool printBanner) {
         pAdapter = reinterpret_cast<PIP_ADAPTER_INFO>(buf.data());
     }
 
-    bool firstIp = true;
     if (GetAdaptersInfo(pAdapter, &bufLen) == NO_ERROR) {
         while (pAdapter) {
             std::string ip = pAdapter->IpAddressList.IpAddress.String;
             if (ip != "0.0.0.0" && ip != "127.0.0.1") {
-                if (printBanner) {
-                    std::cout << "  -> airplay://" << ip << ":" << port
-                              << " [" << pAdapter->Description << "]" << std::endl;
+                bool dup = false;
+                for (const auto& existing : endpoints) {
+                    if (existing.ip == ip) { dup = true; break; }
                 }
-                if (!firstIp) ipsCsv << ",";
-                ipsCsv << ip;
-                firstIp = false;
+                if (!dup) {
+                    const char* d = pAdapter->Description;
+                    bool isVirtual = asciiContainsIC(d, "vEthernet") || asciiContainsIC(d, "Hyper-V") ||
+                                     asciiContainsIC(d, "VMware") || asciiContainsIC(d, "VirtualBox") ||
+                                     asciiContainsIC(d, "Wintun") || asciiContainsIC(d, "Tailscale") ||
+                                     asciiContainsIC(d, "ZeroTier") || asciiContainsIC(d, "TAP-");
+                    bool isUsb = (ip.rfind("169.254.", 0) == 0) || asciiContainsIC(d, "USB") ||
+                                 asciiContainsIC(d, "RNDIS") || asciiContainsIC(d, "NCM") ||
+                                 asciiContainsIC(d, "Remote NDIS") || asciiContainsIC(d, "Apple");
+                    bool isWifi = (pAdapter->Type == 71 /* IF_TYPE_IEEE80211 */) ||
+                                  asciiContainsIC(d, "Wi-Fi") || asciiContainsIC(d, "Wireless") ||
+                                  asciiContainsIC(d, "802.11");
+                    int prio = 3;
+                    const char* tag = "NET";
+                    if (isVirtual) {
+                        prio = 4; tag = "Virtual/VPN";
+                    } else if (isUsb) {
+                        prio = 0; tag = "USB";
+                    } else if (pAdapter->Type == MIB_IF_TYPE_ETHERNET && !isWifi) {
+                        prio = 1; tag = "LAN";
+                    } else if (isWifi) {
+                        prio = 2; tag = "Wi-Fi";
+                    }
+                    endpoints.push_back({prio, ip, tag, d ? d : ""});
+                }
             }
             pAdapter = pAdapter->Next;
         }
+    }
+
+    std::stable_sort(endpoints.begin(), endpoints.end(),
+        [](const NetEndpoint& a, const NetEndpoint& b) { return a.priority < b.priority; });
+
+    std::ostringstream ipsCsv;
+    for (size_t i = 0; i < endpoints.size(); ++i) {
+        if (printBanner) {
+            std::cout << "  -> [" << endpoints[i].tag << "] airplay://" << endpoints[i].ip << ":" << port
+                      << " (" << endpoints[i].desc << ")" << std::endl;
+        }
+        if (i > 0) ipsCsv << ",";
+        ipsCsv << endpoints[i].ip;
     }
     if (printBanner) {
         std::cout << "==================================================================\n" << std::endl;
@@ -281,6 +331,16 @@ int main(int argc, char* argv[]) {
     }
 
     if (checkOnly || installOnly) {
+        if (installOnly && rtLoaded && !preflightRep.hasVddDriver) {
+            if (preflightRep.isAdmin) {
+                if (installVirtualDisplayDriver(exeDir)) {
+                    rt.runPreflight(exePathW, true, preflightRep);
+                    printPreflightReport(preflightRep, true);
+                }
+            } else {
+                std::cout << "[Driver] Run elevated (--install as Administrator) to install 4K HDR Virtual Display Driver." << std::endl;
+            }
+        }
         shutdownTimerAndRuntime();
         return 0;
     }
@@ -388,6 +448,10 @@ int main(int argc, char* argv[]) {
     } else {
         std::cout << "[AudioCapture] Note: WASAPI loopback not active." << std::endl;
     }
+
+    server.setCongestionHandler([&encoder](bool congested) {
+        encoder.notifyNetworkHealth(congested);
+    });
 
     struct FrameShare {
         std::mutex mutex;

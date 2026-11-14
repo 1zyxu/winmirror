@@ -243,6 +243,21 @@ void enableHdrInVddXml(const std::wstring& xmlPath) {
             content.replace(hdrPos, 24, "<HDRPlus>true</HDRPlus>");
             changed = true;
         }
+        size_t sdr10Pos = content.find("<SDR10bit>false</SDR10bit>");
+        if (sdr10Pos != std::string::npos) {
+            content.replace(sdr10Pos, 26, "<SDR10bit>true</SDR10bit>");
+            changed = true;
+        }
+        if (content.find("3840") == std::string::npos) {
+            size_t resEnd = content.find("</resolutions>");
+            if (resEnd != std::string::npos) {
+                content.insert(resEnd,
+                    "    <resolution><width>3840</width><height>2160</height><refresh_rate>60</refresh_rate></resolution>\n"
+                    "    <resolution><width>3840</width><height>2160</height><refresh_rate>120</refresh_rate></resolution>\n"
+                    "    <resolution><width>3840</width><height>2160</height><refresh_rate>240</refresh_rate></resolution>\n");
+                changed = true;
+            }
+        }
         if (changed) {
             SetFilePointer(hFile, 0, nullptr, FILE_BEGIN);
             DWORD written = 0;
@@ -337,6 +352,7 @@ WM_RT_API int WM_RunPreflightAndInstall(const wchar_t* exePath, int applyTweaks,
     if (applyTweaks) {
         outReport->gpuPrefApplied = applyDirectXHighPerfGpuPref(exePath) ? 1 : 0;
         outReport->timerResolution100ns = WM_EnableHighResTimer();
+        enableHdrInVddXml(L"C:\\VirtualDisplayDriver\\vdd_settings.xml");
     } else {
         outReport->timerResolution100ns = 10000;
     }
@@ -373,7 +389,8 @@ WM_RT_API int WM_InstallVirtualDisplayFromDir(const wchar_t* vddExtractDir) {
         if (fileExistsW(xp)) {
             enableHdrInVddXml(xp);
             CreateDirectoryW(L"C:\\VirtualDisplayDriver", nullptr);
-            CopyFileW(xp.c_str(), L"C:\\VirtualDisplayDriver\\vdd_settings.xml", TRUE);
+            CopyFileW(xp.c_str(), L"C:\\VirtualDisplayDriver\\vdd_settings.xml", FALSE);
+            break;
         }
     }
 
