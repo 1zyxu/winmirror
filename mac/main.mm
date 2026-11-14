@@ -1,7 +1,9 @@
 #import <Cocoa/Cocoa.h>
+#import <QuartzCore/QuartzCore.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <netinet/tcp.h>
 #include <unistd.h>
 #include <string>
 #include <thread>
@@ -9,21 +11,52 @@
 #include <vector>
 #include <iostream>
 
+@interface FastImageView : NSView
+@property (nonatomic, strong) NSImage *currentImage;
+- (void)displayImage:(NSImage *)image;
+@end
+
+@implementation FastImageView
+
+- (instancetype)initWithFrame:(NSRect)frameRect {
+    self = [super initWithFrame:frameRect];
+    if (self) {
+        self.wantsLayer = YES;
+        self.layer.drawsAsynchronously = YES;
+        self.layer.contentsGravity = kCAGravityResizeAspect;
+    }
+    return self;
+}
+
+- (void)displayImage:(NSImage *)image {
+    if (!image) return;
+    CGImageRef cgImage = [image CGImageForProposedRect:nil context:nil hints:nil];
+    if (cgImage) {
+        self.layer.contents = (__bridge id)cgImage;
+    }
+}
+
+@end
+
 @interface MirrorWindowController : NSObject <NSWindowDelegate>
 @property (nonatomic, strong) NSWindow *window;
-@property (nonatomic, strong) NSImageView *imageView;
-@property (nonatomic, strong) NSTextField *statusLabel;
+@property (nonatomic, strong) FastImageView *renderView;
+@property (nonatomic, strong) NSTextField *fpsBadge;
 @property (nonatomic, assign) NSInteger frameCount;
 @property (nonatomic, assign) NSTimeInterval lastFpsTime;
+@property (atomic, strong) NSData *latestJpegData;
+@property (atomic, assign) BOOL isRenderScheduled;
+@property (nonatomic, strong) NSString *hostName;
 @end
 
 @implementation MirrorWindowController
 
-- (instancetype)init {
+- (instancetype)initWithHost:(NSString *)host {
     self = [super init];
     if (self) {
+        _hostName = host;
         NSRect screenRect = [[NSScreen mainScreen] visibleFrame];
-        NSRect frame = NSMakeRect(screenRect.origin.x + 100, screenRect.origin.y + 100, 1280, 720);
+        NSRect frame = NSMakeRect(screenRect.origin.x + 50, screenRect.origin.y + 50, screenRect.size.width - 100, screenRect.size.height - 100);
 
         NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                            NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
@@ -32,25 +65,27 @@
                                               styleMask:style
                                                 backing:NSBackingStoreBuffered
                                                   defer:NO];
-        [_window setTitle:@"WinMirror - Connecting to PC..."];
+        [_window setTitle:[NSString stringWithFormat:@"WinMirror — Connecting to %@...", host]];
         [_window setBackgroundColor:[NSColor blackColor]];
         [_window setMinSize:NSMakeSize(640, 360)];
         [_window setDelegate:self];
 
-        _imageView = [[NSImageView alloc] initWithFrame:[[_window contentView] bounds]];
-        [_imageView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
-        [_imageView setImageScaling:NSImageScaleProportionallyUpOrDown];
-        [[_window contentView] addSubview:_imageView];
+        _renderView = [[FastImageView alloc] initWithFrame:[[_window contentView] bounds]];
+        [_renderView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+        [[_window contentView] addSubview:_renderView];
 
-        _statusLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(16, 16, 400, 28)];
-        [_statusLabel setEditable:NO];
-        [_statusLabel setSelectable:NO];
-        [_statusLabel setBezeled:NO];
-        [_statusLabel setDrawsBackground:NO];
-        [_statusLabel setTextColor:[NSColor greenColor]];
-        [_statusLabel setFont:[NSFont boldSystemFontOfSize:14]];
-        [_statusLabel setStringValue:@"Searching for PC on USB / Network..."];
-        [[_window contentView] addSubview:_statusLabel];
+        _fpsBadge = [[NSTextField alloc] initWithFrame:NSMakeRect(20, [[_window contentView] bounds].size.height - 45, 260, 30)];
+        [_fpsBadge setAutoresizingMask:NSViewMinYMargin | NSViewMaxXMargin];
+        [_fpsBadge setEditable:NO];
+        [_fpsBadge setSelectable:NO];
+        [_fpsBadge setBezeled:NO];
+        [_fpsBadge setDrawsBackground:YES];
+        [_fpsBadge setBackgroundColor:[NSColor colorWithCalibratedRed:0 green:0 blue:0 alpha:0.65]];
+        [_fpsBadge setTextColor:[NSColor colorWithCalibratedRed:0.2 green:0.9 blue:0.4 alpha:1.0]];
+        [_fpsBadge setFont:[NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightBold]];
+        [_fpsBadge setStringValue:@"Connecting..."];
+        [_fpsBadge.layer setCornerRadius:6];
+        [[_window contentView] addSubview:_fpsBadge];
 
         [_window makeKeyAndOrderFront:nil];
         _lastFpsTime = [NSDate timeIntervalSinceReferenceDate];
@@ -58,99 +93,53 @@
     return self;
 }
 
-- (void)updateFrameWithData:(NSData *)jpegData host:(NSString *)host {
+- (void)pushJpegFrame:(NSData *)jpegData {
+    self.latestJpegData = jpegData;
     self.frameCount++;
-    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    if (now - self.lastFpsTime >= 1.0) {
-        NSInteger fps = self.frameCount;
-        self.frameCount = 0;
-        self.lastFpsTime = now;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self.window setTitle:[NSString stringWithFormat:@"WinMirror &mdash; %@ (%ld FPS)", host, (long)fps]];
-            [self.statusLabel setHidden:YES];
-        });
-    }
 
-    NSImage *image = [[NSImage alloc] initWithData:jpegData];
-    if (image) {
+    if (!self.isRenderScheduled) {
+        self.isRenderScheduled = YES;
         dispatch_async(dispatch_get_main_queue(), ^{
-            [self.imageView setImage:image];
+            NSData *data = self.latestJpegData;
+            self.isRenderScheduled = NO;
+            if (data) {
+                NSImage *image = [[NSImage alloc] initWithData:data];
+                [self.renderView displayImage:image];
+            }
+
+            NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+            if (now - self.lastFpsTime >= 0.5) {
+                double fps = (self.frameCount) / (now - self.lastFpsTime);
+                self.frameCount = 0;
+                self.lastFpsTime = now;
+                [self.fpsBadge setStringValue:[NSString stringWithFormat:@"⚡ %.0f FPS (Unlimited)", fps]];
+                [self.window setTitle:[NSString stringWithFormat:@"WinMirror — %@ | %.0f FPS", self.hostName, fps]];
+            }
         });
     }
 }
 
-- (void)setStatus:(NSString *)statusText {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self.statusLabel setStringValue:statusText];
-        [self.statusLabel setHidden:NO];
-    });
-}
-
-- (void)toggleFullscreen {
-    [self.window toggleFullScreen:nil];
+- (void)windowWillClose:(NSNotification *)notification {
+    exit(0);
 }
 
 @end
 
-static std::string discoverPcIp(int beaconPort = 8889, int timeoutSec = 3) {
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) return "";
-
-    int reuse = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-    setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
-
-    struct timeval tv = { timeoutSec, 0 };
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    sockaddr_in addr = {};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(beaconPort);
-    addr.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(sock);
-        return "";
-    }
-
-    char buffer[512] = {};
-    sockaddr_in senderAddr = {};
-    socklen_t senderLen = sizeof(senderAddr);
-
-    ssize_t received = recvfrom(sock, buffer, sizeof(buffer) - 1, 0, (struct sockaddr *)&senderAddr, &senderLen);
-    close(sock);
-
-    if (received > 0) {
-        char senderIp[INET_ADDRSTRLEN] = {};
-        inet_ntop(AF_INET, &senderAddr.sin_addr, senderIp, sizeof(senderIp));
-        return std::string(senderIp);
-    }
-
-    return "";
-}
-
-static void streamWorker(MirrorWindowController *controller, std::string targetHost, int port, std::atomic<bool> *running) {
+static void streamWorker(MirrorWindowController *controller, std::string host, int port, std::atomic<bool> *running) {
     while (*running) {
-        std::string host = targetHost;
-        if (host.empty() || host == "auto") {
-            [controller setStatus:@"Searching for Windows PC beacon..."];
-            host = discoverPcIp(8889, 2);
-            if (host.empty()) {
-                // Default fallback to common local host or check local loop
-                host = "127.0.0.1";
-            }
-        }
-
-        NSString *nsHost = [NSString stringWithUTF8String:host.c_str()];
-        [controller setStatus:[NSString stringWithFormat:@"Connecting to http://%s:%d/stream ...", host.c_str(), port]];
-
         int sock = socket(AF_INET, SOCK_STREAM, 0);
         if (sock < 0) {
-            sleep(1);
+            usleep(200000);
             continue;
         }
 
-        struct timeval tv = { 4, 0 };
+        int nodelay = 1;
+        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+        int rcvbuf = 1024 * 1024;
+        setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+        struct timeval tv = { 3, 0 };
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         sockaddr_in saddr = {};
@@ -160,7 +149,7 @@ static void streamWorker(MirrorWindowController *controller, std::string targetH
 
         if (connect(sock, (struct sockaddr *)&saddr, sizeof(saddr)) < 0) {
             close(sock);
-            sleep(1);
+            usleep(500000);
             continue;
         }
 
@@ -169,7 +158,7 @@ static void streamWorker(MirrorWindowController *controller, std::string targetH
 
         std::vector<uint8_t> buffer;
         buffer.reserve(512 * 1024);
-        char chunk[16384];
+        char chunk[32768];
 
         while (*running) {
             ssize_t bytes = recv(sock, chunk, sizeof(chunk), 0);
@@ -177,9 +166,8 @@ static void streamWorker(MirrorWindowController *controller, std::string targetH
 
             buffer.insert(buffer.end(), chunk, chunk + bytes);
 
-            // Look for JPEG delimiters (0xFFD8 to 0xFFD9)
             while (buffer.size() >= 4) {
-                // Find SOI (Start of Image): 0xFF 0xD8
+                // Find SOI (0xFF 0xD8)
                 size_t soi = std::string::npos;
                 for (size_t i = 0; i + 1 < buffer.size(); ++i) {
                     if (buffer[i] == 0xFF && buffer[i + 1] == 0xD8) {
@@ -193,7 +181,7 @@ static void streamWorker(MirrorWindowController *controller, std::string targetH
                     break;
                 }
 
-                // Find EOI (End of Image): 0xFF 0xD9
+                // Find EOI (0xFF 0xD9)
                 size_t eoi = std::string::npos;
                 for (size_t i = soi + 2; i + 1 < buffer.size(); ++i) {
                     if (buffer[i] == 0xFF && buffer[i + 1] == 0xD9) {
@@ -203,22 +191,21 @@ static void streamWorker(MirrorWindowController *controller, std::string targetH
                 }
 
                 if (eoi == std::string::npos) {
-                    // Incomplete frame, wait for more data
                     if (soi > 0) {
                         buffer.erase(buffer.begin(), buffer.begin() + soi);
                     }
                     break;
                 }
 
-                NSData *data = [NSData dataWithBytes:&buffer[soi] length:(eoi - soi)];
-                [controller updateFrameWithData:data host:nsHost];
+                NSData *frameData = [NSData dataWithBytes:&buffer[soi] length:(eoi - soi)];
+                [controller pushJpegFrame:frameData];
 
                 buffer.erase(buffer.begin(), buffer.begin() + eoi);
             }
         }
 
         close(sock);
-        sleep(1);
+        usleep(200000);
     }
 }
 
@@ -227,7 +214,7 @@ int main(int argc, const char *argv[]) {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 
-        std::string targetHost = "auto";
+        std::string targetHost = "192.168.0.105";
         int port = 8888;
 
         if (argc > 1) {
@@ -237,7 +224,8 @@ int main(int argc, const char *argv[]) {
             port = std::stoi(argv[2]);
         }
 
-        MirrorWindowController *controller = [[MirrorWindowController alloc] init];
+        NSString *nsHost = [NSString stringWithUTF8String:targetHost.c_str()];
+        MirrorWindowController *controller = [[MirrorWindowController alloc] initWithHost:nsHost];
 
         std::atomic<bool> running{true};
         std::thread worker(streamWorker, controller, targetHost, port, &running);

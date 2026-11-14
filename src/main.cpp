@@ -28,9 +28,9 @@ static BOOL WINAPI consoleCtrlHandler(DWORD signal) {
 
 static void printLocalIps(int port) {
     std::cout << "\n========================================================" << std::endl;
-    std::cout << "  WINMIRROR v" << WINMIRROR_VERSION << " -- Ultra-Low Latency Screen Mirror" << std::endl;
+    std::cout << "  WINMIRROR v" << WINMIRROR_VERSION << " -- UNLIMITED FPS MODE" << std::endl;
     std::cout << "========================================================" << std::endl;
-    std::cout << "Open on your Mac (Safari / Chrome / winmirror_mac):" << std::endl;
+    std::cout << "Connect Mac client to:" << std::endl;
 
     ULONG bufLen = sizeof(IP_ADAPTER_INFO);
     std::vector<BYTE> buf(bufLen);
@@ -51,7 +51,7 @@ static void printLocalIps(int port) {
             pAdapter = pAdapter->Next;
         }
     }
-    std::cout << "  -> http://localhost:" << port << " (Local Loopback / ADB)" << std::endl;
+    std::cout << "  -> http://localhost:" << port << " (Local Loopback)" << std::endl;
     std::cout << "========================================================\n" << std::endl;
 }
 
@@ -60,8 +60,8 @@ int main(int argc, char* argv[]) {
     timeBeginPeriod(1);
 
     int port = DEFAULT_PORT;
-    float quality = 0.75f;
-    int targetFps = 60;
+    float quality = 0.70f;
+    int targetFps = 0; // 0 = UNLIMITED (as fast as GPU/display refreshes)
     bool checkUpdate = true;
 
     for (int i = 1; i < argc; ++i) {
@@ -76,15 +76,6 @@ int main(int argc, char* argv[]) {
             checkUpdate = false;
         } else if (arg == "--update-only") {
             Updater::checkForUpdates(true);
-            return 0;
-        } else if (arg == "--help" || arg == "-h") {
-            std::cout << "Usage: winmirror.exe [options]\n"
-                      << "Options:\n"
-                      << "  --port <p>       Streaming port (default: 8888)\n"
-                      << "  --quality <q>    JPEG quality 0.1 - 1.0 (default: 0.75)\n"
-                      << "  --fps <f>        Target FPS 30 - 120 (default: 60)\n"
-                      << "  --no-update      Disable checking GitHub for updates\n"
-                      << "  --update-only    Check & apply update then exit\n";
             return 0;
         }
     }
@@ -123,39 +114,48 @@ int main(int argc, char* argv[]) {
     Beacon beacon(port);
     beacon.start();
 
-    std::cout << "[WinMirror] Streaming running! Press Ctrl+C to stop.\n" << std::endl;
+    std::cout << "[WinMirror] Streaming ACTIVE at "
+              << (targetFps == 0 ? "UNLIMITED FPS" : std::to_string(targetFps) + " FPS")
+              << " | Quality: " << quality << "\n" << std::endl;
 
-    const auto frameDuration = std::chrono::microseconds(1000000 / targetFps);
     RawFrame rawFrame;
     std::vector<uint8_t> jpegData;
 
     auto lastReport = std::chrono::steady_clock::now();
     uint32_t capturedFrames = 0;
 
+    const auto frameDuration = (targetFps > 0) ? std::chrono::microseconds(1000000 / targetFps) : std::chrono::microseconds(0);
+
     while (g_running) {
         auto frameStart = std::chrono::steady_clock::now();
 
-        if (capture.capture(rawFrame)) {
+        bool hasFrame = capture.capture(rawFrame);
+        if (hasFrame) {
             if (encoder.encodeBgraToJpeg(rawFrame.bgra.data(), rawFrame.width, rawFrame.height, jpegData)) {
                 frameBuffer.push(std::move(jpegData), rawFrame.width, rawFrame.height);
                 capturedFrames++;
             }
+        } else {
+            // When screen is static, sleep 1ms to yield CPU
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
 
         auto now = std::chrono::steady_clock::now();
-        if (now - lastReport >= std::chrono::seconds(5)) {
+        if (now - lastReport >= std::chrono::seconds(3)) {
             float elapsedSec = std::chrono::duration<float>(now - lastReport).count();
             float currentFps = capturedFrames / elapsedSec;
-            std::cout << "[WinMirror] Live FPS: " << std::fixed << std::setprecision(1) << currentFps
-                      << " | Active Clients: " << server.getActiveClients()
-                      << " | Capture: " << (capture.isDxgiActive() ? "DXGI GPU" : "GDI") << std::endl;
+            std::cout << "[WinMirror] Live: " << std::fixed << std::setprecision(1) << currentFps << " FPS"
+                      << " | Clients: " << server.getActiveClients()
+                      << " | GPU: " << (capture.isDxgiActive() ? "DXGI 11" : "GDI") << std::endl;
             capturedFrames = 0;
             lastReport = now;
         }
 
-        auto frameTime = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - frameStart);
-        if (frameTime < frameDuration) {
-            std::this_thread::sleep_for(frameDuration - frameTime);
+        if (targetFps > 0) {
+            auto frameTime = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - frameStart);
+            if (frameTime < frameDuration) {
+                std::this_thread::sleep_for(frameDuration - frameTime);
+            }
         }
     }
 
