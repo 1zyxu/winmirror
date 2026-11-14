@@ -63,6 +63,12 @@ void AudioCapture::refreshDeviceList() {
     if (!m_enumerator) return;
 
     int reqIdx = m_requestedIndex.load();
+    std::wstring targetId;
+    {
+        std::lock_guard<std::mutex> lock(m_devListMutex);
+        targetId = m_targetDeviceId;
+    }
+
     std::ostringstream oss;
     oss << "-1|" << (reqIdx < 0 ? 1 : 0) << "|Default PC Audio (Auto)\n";
 
@@ -74,6 +80,16 @@ void AudioCapture::refreshDeviceList() {
             IMMDevice* dev = nullptr;
             if (SUCCEEDED(coll->Item(i, &dev)) && dev) {
                 std::string name = "Audio Device " + std::to_string(i + 1);
+                bool selected = (reqIdx == static_cast<int>(i));
+
+                LPWSTR devId = nullptr;
+                if (SUCCEEDED(dev->GetId(&devId)) && devId) {
+                    if (reqIdx >= 0 && !targetId.empty()) {
+                        selected = (targetId == devId);
+                    }
+                    CoTaskMemFree(devId);
+                }
+
                 IPropertyStore* props = nullptr;
                 if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &props)) && props) {
                     PROPVARIANT pv;
@@ -86,7 +102,7 @@ void AudioCapture::refreshDeviceList() {
                     PropVariantClear(&pv);
                     props->Release();
                 }
-                oss << i << "|" << (reqIdx == static_cast<int>(i) ? 1 : 0) << "|" << name << "\n";
+                oss << i << "|" << (selected ? 1 : 0) << "|" << name << "\n";
                 dev->Release();
             }
         }
@@ -94,16 +110,24 @@ void AudioCapture::refreshDeviceList() {
     }
 
     std::string listStr = oss.str();
+    bool changed = false;
     {
         std::lock_guard<std::mutex> lock(m_devListMutex);
-        m_cachedDeviceList = listStr;
+        if (listStr != m_cachedDeviceList) {
+            m_cachedDeviceList = listStr;
+            changed = true;
+        }
     }
-    if (m_devCallback) {
+    if (changed && m_devCallback) {
         m_devCallback(listStr);
     }
 }
 
 void AudioCapture::setSourceDeviceIndex(int index) {
+    {
+        std::lock_guard<std::mutex> lock(m_devListMutex);
+        m_targetDeviceId.clear();
+    }
     m_requestedIndex.store(index < 0 ? -1 : index);
     m_forceReinit.store(true);
 }
@@ -113,61 +137,150 @@ std::string AudioCapture::getDeviceListSerialized() {
     return m_cachedDeviceList;
 }
 
-bool AudioCapture::initEndpoint() {
-    releaseEndpoint();
-    if (!m_enumerator) return false;
+bool AudioCapture::tryActivateDevice(IMMDevice* dev) {
+    if (!dev) return false;
 
-    int reqIdx = m_requestedIndex.load();
-    HRESULT hr = E_FAIL;
+    IAudioClient* client = nullptr;
+    IAudioCaptureClient* cap = nullptr;
+    WAVEFORMATEX* pwfx = nullptr;
 
-    if (reqIdx >= 0) {
-        IMMDeviceCollection* coll = nullptr;
-        if (SUCCEEDED(m_enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &coll)) && coll) {
-            UINT count = 0;
-            coll->GetCount(&count);
-            if (static_cast<UINT>(reqIdx) < count) {
-                hr = coll->Item(static_cast<UINT>(reqIdx), &m_device);
-            }
-            coll->Release();
-        }
-        if (FAILED(hr) || !m_device) {
-            m_requestedIndex.store(-1);
-        }
+    HRESULT hr = dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&client));
+    if (FAILED(hr) || !client) return false;
+
+    hr = client->GetMixFormat(&pwfx);
+    if (FAILED(hr) || !pwfx) {
+        client->Release();
+        return false;
     }
 
-    if (!m_device) {
-        hr = m_enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &m_device);
-        if (FAILED(hr) || !m_device) return false;
+    hr = client->Initialize(
+        AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_LOOPBACK,
+        2000000, // 200ms buffer for low latency
+        0,
+        pwfx,
+        nullptr
+    );
+    if (FAILED(hr)) {
+        CoTaskMemFree(pwfx);
+        client->Release();
+        return false;
     }
 
+    hr = client->GetService(__uuidof(IAudioCaptureClient), reinterpret_cast<void**>(&cap));
+    if (FAILED(hr) || !cap) {
+        CoTaskMemFree(pwfx);
+        client->Release();
+        return false;
+    }
+
+    m_device = dev;
+    m_device->AddRef();
+    m_audioClient = client;
+    m_captureClient = cap;
+    m_pwfx = pwfx;
+
+    m_deviceId.clear();
     LPWSTR devId = nullptr;
     if (SUCCEEDED(m_device->GetId(&devId)) && devId) {
         m_deviceId = devId;
         CoTaskMemFree(devId);
     }
 
-    hr = m_device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&m_audioClient));
-    if (FAILED(hr)) { releaseEndpoint(); return false; }
-
-    hr = m_audioClient->GetMixFormat(&m_pwfx);
-    if (FAILED(hr) || !m_pwfx) { releaseEndpoint(); return false; }
-
-    hr = m_audioClient->Initialize(
-        AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_LOOPBACK,
-        2000000, // 200ms buffer for low latency
-        0,
-        m_pwfx,
-        nullptr
-    );
-    if (FAILED(hr)) { releaseEndpoint(); return false; }
-
-    hr = m_audioClient->GetService(__uuidof(IAudioCaptureClient), reinterpret_cast<void**>(&m_captureClient));
-    if (FAILED(hr)) { releaseEndpoint(); return false; }
-
     m_sampleRate.store(m_pwfx->nSamplesPerSec);
-    refreshDeviceList();
     return true;
+}
+
+bool AudioCapture::initEndpoint() {
+    releaseEndpoint();
+    if (!m_enumerator) return false;
+
+    int reqIdx = m_requestedIndex.load();
+    std::wstring targetId;
+    {
+        std::lock_guard<std::mutex> lock(m_devListMutex);
+        targetId = m_targetDeviceId;
+    }
+
+    IMMDeviceCollection* coll = nullptr;
+    UINT activeCount = 0;
+    if (SUCCEEDED(m_enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &coll)) && coll) {
+        coll->GetCount(&activeCount);
+    }
+
+    // 1. Honor explicit PC source selection (prefer stable device ID if known, else index)
+    if (reqIdx >= 0 && coll) {
+        IMMDevice* chosen = nullptr;
+        if (!targetId.empty()) {
+            for (UINT i = 0; i < activeCount; ++i) {
+                IMMDevice* cand = nullptr;
+                if (SUCCEEDED(coll->Item(i, &cand)) && cand) {
+                    LPWSTR cid = nullptr;
+                    bool match = (SUCCEEDED(cand->GetId(&cid)) && cid && targetId == cid);
+                    if (cid) CoTaskMemFree(cid);
+                    if (match) {
+                        chosen = cand;
+                        m_requestedIndex.store(static_cast<int>(i));
+                        break;
+                    }
+                    cand->Release();
+                }
+            }
+        } else if (static_cast<UINT>(reqIdx) < activeCount) {
+            coll->Item(static_cast<UINT>(reqIdx), &chosen);
+        }
+
+        if (chosen) {
+            bool ok = tryActivateDevice(chosen);
+            chosen->Release();
+            if (ok) {
+                std::lock_guard<std::mutex> lock(m_devListMutex);
+                m_targetDeviceId = m_deviceId;
+                coll->Release();
+                refreshDeviceList();
+                return true;
+            }
+        }
+
+        // Unplugged or unavailable pinned source: gracefully fall back to Auto Default
+        m_requestedIndex.store(-1);
+        std::lock_guard<std::mutex> lock(m_devListMutex);
+        m_targetDeviceId.clear();
+    }
+
+    // 2. Try Windows default playback endpoints (eConsole -> eMultimedia)
+    for (ERole role : { eConsole, eMultimedia }) {
+        IMMDevice* defDev = nullptr;
+        if (SUCCEEDED(m_enumerator->GetDefaultAudioEndpoint(eRender, role, &defDev)) && defDev) {
+            bool ok = tryActivateDevice(defDev);
+            defDev->Release();
+            if (ok) {
+                if (coll) coll->Release();
+                refreshDeviceList();
+                return true;
+            }
+        }
+    }
+
+    // 3. Final fallback: any active render endpoint (e.g. Speakers / Monitor HDMI / VoiceMeeter)
+    if (coll) {
+        for (UINT i = 0; i < activeCount; ++i) {
+            IMMDevice* cand = nullptr;
+            if (SUCCEEDED(coll->Item(i, &cand)) && cand) {
+                bool ok = tryActivateDevice(cand);
+                cand->Release();
+                if (ok) {
+                    coll->Release();
+                    refreshDeviceList();
+                    return true;
+                }
+            }
+        }
+        coll->Release();
+    }
+
+    refreshDeviceList();
+    return false;
 }
 
 bool AudioCapture::init(AudioDataCallback callback, AudioDevicesCallback devCallback) {
@@ -182,23 +295,27 @@ bool AudioCapture::init(AudioDataCallback callback, AudioDevicesCallback devCall
         __uuidof(IMMDeviceEnumerator),
         reinterpret_cast<void**>(&m_enumerator)
     );
-    if (FAILED(hr)) return false;
+    if (FAILED(hr) || !m_enumerator) return false;
 
-    if (!initEndpoint()) {
-        cleanup();
-        return false;
-    }
+    // Best-effort initial endpoint bind; captureLoop continuously recovers when unplugged/replugged
+    initEndpoint();
     return true;
 }
 
 void AudioCapture::start() {
-    if (m_running || !m_audioClient) return;
+    if (m_running || !m_enumerator) return;
 
-    m_audioClient->Start();
+    if (m_audioClient) {
+        m_audioClient->Start();
+    }
     m_running = true;
     m_thread = std::thread(&AudioCapture::captureLoop, this);
-    std::cout << "[AudioCapture] WASAPI Loopback started (" << m_pwfx->nSamplesPerSec
-              << " Hz Stereo)" << std::endl;
+    if (m_pwfx) {
+        std::cout << "[AudioCapture] WASAPI Loopback started (" << m_pwfx->nSamplesPerSec
+                  << " Hz Stereo)" << std::endl;
+    } else {
+        std::cout << "[AudioCapture] Waiting for active PC playback device (auto-attach enabled)" << std::endl;
+    }
 }
 
 void AudioCapture::stop() {
@@ -220,33 +337,33 @@ void AudioCapture::captureLoop() {
     std::vector<int16_t> pcmOut;
     pcmOut.reserve(48000 * 2);
     int silentTailLeft = 0;
-    int idleTicks = 0;
+    auto lastEndpointPoll = std::chrono::steady_clock::now();
 
     while (m_running) {
+        auto now = std::chrono::steady_clock::now();
+
         if (m_forceReinit.exchange(false)) {
-            if (initEndpoint() && m_audioClient) {
-                m_audioClient->Start();
+            if (initEndpoint() && m_audioClient && SUCCEEDED(m_audioClient->Start())) {
                 silentTailLeft = 0;
             }
         }
 
-        if (!m_captureClient || !m_pwfx) {
-            if (!initEndpoint() || FAILED(m_audioClient->Start())) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                continue;
-            }
-        }
+        // Poll device list + default playback endpoint every 300ms regardless of packet flow
+        if (now - lastEndpointPoll >= std::chrono::milliseconds(300)) {
+            lastEndpointPoll = now;
+            refreshDeviceList();
 
-        // Re-check default playback device roughly once per second when in Auto (-1) mode
-        if (++idleTicks >= 500) {
-            idleTicks = 0;
-            if (m_requestedIndex.load() < 0) {
+            if (m_requestedIndex.load() < 0 && m_enumerator && m_captureClient) {
                 IMMDevice* defDev = nullptr;
-                if (m_enumerator && SUCCEEDED(m_enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &defDev)) && defDev) {
+                HRESULT defHr = m_enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &defDev);
+                if (FAILED(defHr) || !defDev) {
+                    defHr = m_enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &defDev);
+                }
+                if (SUCCEEDED(defHr) && defDev) {
                     LPWSTR defId = nullptr;
                     if (SUCCEEDED(defDev->GetId(&defId)) && defId) {
                         if (m_deviceId != defId) {
-                            if (initEndpoint() && SUCCEEDED(m_audioClient->Start())) {
+                            if (initEndpoint() && m_audioClient && SUCCEEDED(m_audioClient->Start())) {
                                 silentTailLeft = 0;
                             }
                         }
@@ -255,6 +372,14 @@ void AudioCapture::captureLoop() {
                     defDev->Release();
                 }
             }
+        }
+
+        if (!m_captureClient || !m_pwfx) {
+            if (!initEndpoint() || !m_audioClient || FAILED(m_audioClient->Start())) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                continue;
+            }
+            silentTailLeft = 0;
         }
 
         if (!m_captureClient || !m_pwfx) continue;

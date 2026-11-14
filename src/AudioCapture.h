@@ -29,6 +29,7 @@ public:
 private:
     void captureLoop();
     bool initEndpoint();
+    bool tryActivateDevice(IMMDevice* dev);
     void refreshDeviceList();
     void releaseEndpoint();
     void cleanup();
@@ -41,6 +42,7 @@ private:
     std::atomic<bool> m_forceReinit{false};
     std::mutex m_devListMutex;
     std::string m_cachedDeviceList;
+    std::wstring m_targetDeviceId;
     std::thread m_thread;
 
     IMMDeviceEnumerator* m_enumerator = nullptr;

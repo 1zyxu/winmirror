@@ -203,6 +203,7 @@ static void unmuteMacDevice(AudioDeviceID devId, float targetVolume) {
 
 - (void)playPcm:(const uint8_t *)data length:(size_t)len sampleRate:(uint32_t)sampleRate;
 - (void)handleCallback:(AudioQueueBufferRef)buf;
+- (void)handleDefaultDeviceRouteChange;
 - (void)switchToDeviceUID:(NSString *)uid;
 - (void)restartAudio;
 - (void)stop;
@@ -217,12 +218,23 @@ static void unmuteMacDevice(AudioDeviceID devId, float targetVolume) {
     UInt32 _chunkBytes;
     BOOL _started;
     std::atomic<bool> _disposing;
+    std::atomic<bool> _alive;
     std::chrono::steady_clock::time_point _lastSignalTime;
 }
 
 static void AirPlayAudioCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueBufferRef inBuffer) {
     MacAudioPlayer *player = (__bridge MacAudioPlayer *)inUserData;
     [player handleCallback:inBuffer];
+}
+
+static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObjectPropertyAddress *, void *inClientData) {
+    MacAudioPlayer *player = (__bridge MacAudioPlayer *)inClientData;
+    [player retain];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [player handleDefaultDeviceRouteChange];
+        [player release];
+    });
+    return noErr;
 }
 
 - (instancetype)init {
@@ -232,9 +244,17 @@ static void AirPlayAudioCallback(void *inUserData, AudioQueueRef inAQ, AudioQueu
         _chunkBytes = (48000 / 50) * 4;
         _started = NO;
         _disposing = false;
+        _alive = true;
         _muted = NO;
         _selectedDeviceUID = nil;
         _lastSignalTime = std::chrono::steady_clock::time_point{};
+
+        AudioObjectPropertyAddress defOutAddr = {
+            kAudioHardwarePropertyDefaultOutputDevice,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        AudioObjectAddPropertyListener(kAudioObjectSystemObject, &defOutAddr, OnCoreAudioRouteChanged, (__bridge void *)self);
     }
     return self;
 }
@@ -406,12 +426,26 @@ static void AirPlayAudioCallback(void *inUserData, AudioQueueRef inAQ, AudioQueu
     }
 }
 
+- (void)handleDefaultDeviceRouteChange {
+    std::lock_guard<std::mutex> qlock(_queueMutex);
+    if (_alive.load() && !_muted && _selectedDeviceUID.length == 0 && _audioQueue) {
+        [self configureForSampleRateLocked:_sampleRate];
+    }
+}
+
 - (void)restartAudio {
     std::lock_guard<std::mutex> qlock(_queueMutex);
     [self configureForSampleRateLocked:_sampleRate];
 }
 
 - (void)stop {
+    _alive = false;
+    AudioObjectPropertyAddress defOutAddr = {
+        kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    AudioObjectRemovePropertyListener(kAudioObjectSystemObject, &defOutAddr, OnCoreAudioRouteChanged, (__bridge void *)self);
     std::lock_guard<std::mutex> qlock(_queueMutex);
     [self stopLocked];
 }
