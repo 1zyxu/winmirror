@@ -215,21 +215,25 @@ bool ScreenCapture::initDxgi() {
     }
 
     bool ok = false;
-    for (IDXGIAdapter1* cand : nvidiaAdapters) {
-        if (!ok) ok = initDxgiOnAdapter(cand);
-        cand->Release();
+    // Prefer an adapter that actually presents live desktop updates before accepting a static frame
+    for (int pass = 0; pass < 2 && !ok; ++pass) {
+        bool requireLive = (pass == 0);
+        for (IDXGIAdapter1* cand : nvidiaAdapters) {
+            if (!ok) ok = initDxgiOnAdapter(cand, requireLive);
+        }
+        for (IDXGIAdapter1* cand : otherAdapters) {
+            if (!ok) ok = initDxgiOnAdapter(cand, requireLive);
+        }
     }
-    for (IDXGIAdapter1* cand : otherAdapters) {
-        if (!ok) ok = initDxgiOnAdapter(cand);
-        cand->Release();
-    }
+    for (IDXGIAdapter1* cand : nvidiaAdapters) cand->Release();
+    for (IDXGIAdapter1* cand : otherAdapters) cand->Release();
     if (!ok) {
-        ok = initDxgiOnAdapter(nullptr);
+        ok = initDxgiOnAdapter(nullptr, false);
     }
     return ok;
 }
 
-bool ScreenCapture::initDxgiOnAdapter(IDXGIAdapter1* adapter) {
+bool ScreenCapture::initDxgiOnAdapter(IDXGIAdapter1* adapter, bool requireLivePresent) {
     cleanupDxgi();
 
     D3D_FEATURE_LEVEL featureLevels[] = {
@@ -360,7 +364,7 @@ bool ScreenCapture::initDxgiOnAdapter(IDXGIAdapter1* adapter) {
         dxgiOutput->Release();
 
         if (SUCCEEDED(hr) && m_duplication) {
-            for (int a = 0; a < 5 && !acquireDxgi(20); ++a) {}
+            for (int a = 0; a < 5 && !acquireDxgi(20, requireLivePresent); ++a) {}
             if (m_duplication && m_hasValidGpuFrame) {
                 duplicated = true;
             } else {
@@ -441,7 +445,7 @@ bool ScreenCapture::acquireFrame(uint32_t timeoutMs) {
     return acquireGdi();
 }
 
-bool ScreenCapture::acquireDxgi(uint32_t timeoutMs) {
+bool ScreenCapture::acquireDxgi(uint32_t timeoutMs, bool requireLivePresent) {
     if (!m_duplication || !m_d3dContext) return false;
 
     DXGI_OUTDUPL_FRAME_INFO frameInfo = {};
@@ -456,8 +460,8 @@ bool ScreenCapture::acquireDxgi(uint32_t timeoutMs) {
         return false;
     }
 
-    // Check if frame contains actual screen image updates vs cursor-only update
-    if (frameInfo.LastPresentTime.QuadPart == 0 && m_hasValidGpuFrame) {
+    // Check if frame contains actual screen image updates vs un-presented/cursor-only update
+    if (frameInfo.LastPresentTime.QuadPart == 0 && (m_hasValidGpuFrame || requireLivePresent)) {
         desktopResource->Release();
         m_duplication->ReleaseFrame();
         return false;

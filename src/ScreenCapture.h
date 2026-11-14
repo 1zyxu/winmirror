@@ -54,9 +54,9 @@ public:
 
 private:
     bool initDxgi();
-    bool initDxgiOnAdapter(IDXGIAdapter1* adapter);
+    bool initDxgiOnAdapter(IDXGIAdapter1* adapter, bool requireLivePresent = false);
     void cleanupDxgi();
-    bool acquireDxgi(uint32_t timeoutMs);
+    bool acquireDxgi(uint32_t timeoutMs, bool requireLivePresent = false);
 
     bool initGdi();
     void cleanupGdi();
@@ -67,7 +67,6 @@ private:
 
     bool m_useDxgi = true;
     bool m_isHdrOutput = false;
-    bool m_hasNewGdiFrame = false;
     bool m_hasValidGpuFrame = false;
     uint32_t m_dxgiReinitFails = 0;
     uint32_t m_width = 0;

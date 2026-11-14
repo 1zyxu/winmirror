@@ -33,6 +33,7 @@ public:
 
     void requestKeyframe() { m_forceKeyframe.store(true); }
     bool hasKeyframeRequest() const { return m_forceKeyframe.load(); }
+    bool hasEmittedKeyframe() const { return m_hasEmittedKeyframe; }
 
     ID3D11Device* getCaptureDevice() const { return m_d3dDevice; }
     uint32_t getWidth() const { return m_width; }
@@ -83,11 +84,12 @@ private:
     static void convertBgraToNv12Studio(const uint8_t* bgra, uint32_t width, uint32_t height, std::vector<uint8_t>& outNv12);
 
     bool waitAsyncInputReady();
+    bool shouldRetryWithFallback(bool inputAccepted, bool asyncTimedOut);
     bool submitSampleToMft(IMFSample* sample, std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe, bool& outInputAccepted);
     bool submitDxgiSurface(ID3D11Texture2D* tex, uint64_t ptsUs,
                            std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe, bool& outInputAccepted);
     bool encodePackedYuv(const std::vector<uint8_t>& yuvData, uint64_t ptsUs,
-                         std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe);
+                         std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe, bool& outInputAccepted);
     bool collectSyncOutput(std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe);
     bool pumpAsyncEvents(bool waitOutput);
 
@@ -126,6 +128,7 @@ private:
     ID3D11Texture2D* m_vpStagingTex = nullptr;
     ID3D11Texture2D* m_nvGpuTex[kVpRingSize] = {};
     ID3D11Texture2D* m_nvUploadTex = nullptr;
+    bool m_vpFailedAtRuntime = false;
     bool m_hasVideoProcessor = false;
 
     // Zero-Copy D3D11 Media Foundation Manager
@@ -148,6 +151,7 @@ private:
     size_t m_planIndex = 0;
     int m_vpMode = -1;
     bool m_hasProducedOutput = false;
+    bool m_hasEmittedKeyframe = false;
     uint32_t m_submittedWithoutOutput = 0;
     uint32_t m_waitTimeouts = 0;
 

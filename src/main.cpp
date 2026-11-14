@@ -155,6 +155,62 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    RawFrame cpuFallbackFrame;
+    std::vector<uint8_t> annexB;
+    auto encodeCapturedFrame = [&](uint64_t ptsUs, bool& outIsKey) -> bool {
+        ID3D11Device* snapDev = nullptr;
+        ID3D11DeviceContext* snapCtx = nullptr;
+        ID3D11Texture2D* snapTex = nullptr;
+        uint32_t snapW = 0, snapH = 0;
+        DXGI_FORMAT snapFmt = DXGI_FORMAT_B8G8R8A8_UNORM;
+        bool snapHdr = false;
+        bool haveGpu = capture.grabGpuFrame(&snapDev, &snapCtx, &snapTex, snapW, snapH, snapFmt, snapHdr);
+
+        if (haveGpu && (snapDev != encoder.getCaptureDevice() ||
+                        (snapW & ~1u) != encoder.getWidth() ||
+                        (snapH & ~1u) != encoder.getHeight() ||
+                        snapFmt != encoder.getSrcFormat() ||
+                        snapHdr != encoder.isHdrSource())) {
+            encoder.init(snapDev, snapCtx, snapW, snapH, snapFmt,
+                         static_cast<uint32_t>(targetFps), snapHdr);
+        }
+
+        outIsKey = false;
+        bool encoded = false;
+        if (haveGpu && encoder.hasVideoProcessor()) {
+            encoded = encoder.encodeGpuFrame(snapTex, ptsUs, annexB, outIsKey);
+        }
+        if (!encoded && !encoder.hasVideoProcessor() && capture.copyCurrentFrameToBgra(cpuFallbackFrame)) {
+            if ((cpuFallbackFrame.width & ~1u) != encoder.getWidth() ||
+                (cpuFallbackFrame.height & ~1u) != encoder.getHeight()) {
+                encoder.init(snapDev, snapCtx, cpuFallbackFrame.width, cpuFallbackFrame.height,
+                             DXGI_FORMAT_B8G8R8A8_UNORM, static_cast<uint32_t>(targetFps), false);
+            }
+            encoded = encoder.encodeBgraCpu(cpuFallbackFrame.bgra.data(),
+                                            cpuFallbackFrame.width, cpuFallbackFrame.height,
+                                            ptsUs, annexB, outIsKey);
+        }
+
+        if (snapTex) snapTex->Release();
+        if (snapCtx) snapCtx->Release();
+        if (snapDev) snapDev->Release();
+        return encoded && !annexB.empty();
+    };
+
+    // Probe encoder on an initial frame so faulty zero-copy/VP paths fall back before advertising to Mac
+    bool warmKey = false;
+    for (int w = 0; w < 20 && !encoder.hasEmittedKeyframe(); ++w) {
+        if (!encodeCapturedFrame(static_cast<uint64_t>(w) * 16667ULL, warmKey)) {
+            encoder.popPendingFrame(annexB, warmKey);
+        }
+        if (!encoder.hasEmittedKeyframe()) {
+            if (w == 0) capture.acquireFrame(16);
+            Sleep(8);
+        }
+    }
+    while (encoder.popPendingFrame(annexB, warmKey)) {}
+    encoder.requestKeyframe();
+
     AirPlayServer server(port);
 
     AudioCapture audioCapture;
@@ -258,8 +314,6 @@ int main(int argc, char* argv[]) {
     uint16_t lastSentFlags = buildHelloFlags(btReady, capture, encoder);
 
     const auto minFrameGap = std::chrono::microseconds(1000000 / targetFps);
-    RawFrame cpuFallbackFrame;
-    std::vector<uint8_t> annexB;
 
     auto syncStreamMetadata = [&]() {
         uint16_t flagsNow = buildHelloFlags(btBridge.isRadioAvailable(), capture, encoder);
@@ -321,53 +375,13 @@ int main(int argc, char* argv[]) {
             if (!g_running) break;
 
             bool gotNewScreen = (curSeq != lastEncodedSeq);
-            if (gotNewScreen || encoder.hasKeyframeRequest()) {
+            if (gotNewScreen || encoder.hasKeyframeRequest() || !encoder.hasEmittedKeyframe()) {
                 lastEncodedSeq = curSeq;
-
-                ID3D11Device* snapDev = nullptr;
-                ID3D11DeviceContext* snapCtx = nullptr;
-                ID3D11Texture2D* snapTex = nullptr;
-                uint32_t snapW = 0, snapH = 0;
-                DXGI_FORMAT snapFmt = DXGI_FORMAT_B8G8R8A8_UNORM;
-                bool snapHdr = false;
-                bool haveGpu = capture.grabGpuFrame(&snapDev, &snapCtx, &snapTex, snapW, snapH, snapFmt, snapHdr);
-
-                if (haveGpu) {
-                    if (snapDev != encoder.getCaptureDevice() ||
-                        (snapW & ~1u) != encoder.getWidth() ||
-                        (snapH & ~1u) != encoder.getHeight() ||
-                        snapFmt != encoder.getSrcFormat() ||
-                        snapHdr != encoder.isHdrSource()) {
-                        encoder.init(snapDev, snapCtx, snapW, snapH, snapFmt,
-                                     static_cast<uint32_t>(targetFps), snapHdr);
-                        syncStreamMetadata();
-                    }
-                }
 
                 auto encodeNow = std::chrono::steady_clock::now();
                 uint64_t ptsUs = std::chrono::duration_cast<std::chrono::microseconds>(encodeNow - startTime).count();
                 bool isKey = false;
-                bool encoded = false;
-
-                if (haveGpu && encoder.hasVideoProcessor()) {
-                    encoded = encoder.encodeGpuFrame(snapTex, ptsUs, annexB, isKey);
-                }
-                if (!encoded && !encoder.hasVideoProcessor() && capture.copyCurrentFrameToBgra(cpuFallbackFrame)) {
-                    if ((cpuFallbackFrame.width & ~1u) != encoder.getWidth() ||
-                        (cpuFallbackFrame.height & ~1u) != encoder.getHeight()) {
-                        encoder.init(snapDev, snapCtx, cpuFallbackFrame.width, cpuFallbackFrame.height,
-                                     DXGI_FORMAT_B8G8R8A8_UNORM, static_cast<uint32_t>(targetFps), false);
-                    }
-                    encoded = encoder.encodeBgraCpu(cpuFallbackFrame.bgra.data(),
-                                                    cpuFallbackFrame.width, cpuFallbackFrame.height,
-                                                    ptsUs, annexB, isKey);
-                }
-
-                if (snapTex) snapTex->Release();
-                if (snapCtx) snapCtx->Release();
-                if (snapDev) snapDev->Release();
-
-                if (encoded && !annexB.empty()) {
+                if (encodeCapturedFrame(ptsUs, isKey)) {
                     emitEncoded(annexB, isKey, ptsUs);
                 }
                 syncStreamMetadata();

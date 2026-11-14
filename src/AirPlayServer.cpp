@@ -1,6 +1,7 @@
 #include "AirPlayServer.h"
 #include <iostream>
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 AirPlayServer::AirPlayServer(int port)
@@ -27,7 +28,7 @@ void AirPlayServer::setStreamInfo(uint32_t width, uint32_t height, uint16_t fps,
 
         char hostname[64] = "WindowsPC";
         gethostname(hostname, sizeof(hostname) - 1);
-        strncpy(m_hello.deviceName, hostname, sizeof(m_hello.deviceName) - 1);
+        snprintf(m_hello.deviceName, sizeof(m_hello.deviceName), "%s v%s", hostname, WINMIRROR_VERSION);
 
         m_onKeyframeReq = std::move(onKeyframeReq);
     }

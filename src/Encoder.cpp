@@ -54,12 +54,47 @@ static bool isNvidiaMftCandidate(IMFActivate* act, std::string& outFriendlyName)
     return containsInsensitive(vendorId, "10de") || containsInsensitive(outFriendlyName, "nvidia");
 }
 
-static const DXGI_FORMAT kTryVideoProcInFormats[] = {
-    DXGI_FORMAT_R16G16B16A16_FLOAT,
-    DXGI_FORMAT_R10G10B10A2_UNORM,
-    DXGI_FORMAT_B8G8R8A8_UNORM,
-    DXGI_FORMAT_R8G8B8A8_UNORM
-};
+static void inspectAnnexB(const uint8_t* data, size_t len, VideoCodec codec,
+                          bool& hasParamSets, bool& hasIdr, std::vector<uint8_t>* outParamSets) {
+    hasParamSets = false;
+    hasIdr = false;
+    if (!data || len < 4) return;
+    auto findSc = [&](size_t from, size_t& scLen) -> size_t {
+        for (size_t p = from; p + 3 <= len; ++p) {
+            if (data[p] == 0 && data[p + 1] == 0) {
+                if (data[p + 2] == 1) { scLen = 3; return p; }
+                if (p + 4 <= len && data[p + 2] == 0 && data[p + 3] == 1) { scLen = 4; return p; }
+            }
+        }
+        scLen = 0;
+        return len;
+    };
+    size_t scLen = 0;
+    size_t pos = findSc(0, scLen);
+    while (pos < len) {
+        size_t nalStart = pos + scLen;
+        size_t nextSc = 0;
+        size_t nextPos = findSc(nalStart, nextSc);
+        if (nalStart < nextPos) {
+            uint8_t b0 = data[nalStart];
+            bool isParam = false;
+            if (codec == CODEC_HEVC) {
+                uint8_t nt = (b0 >> 1) & 0x3F;
+                if (nt == 32 || nt == 33 || nt == 34) { isParam = true; hasParamSets = true; }
+                else if (nt >= 16 && nt <= 21) { hasIdr = true; }
+            } else {
+                uint8_t nt = b0 & 0x1F;
+                if (nt == 7 || nt == 8) { isParam = true; hasParamSets = true; }
+                else if (nt == 5) { hasIdr = true; }
+            }
+            if (isParam && outParamSets) {
+                outParamSets->insert(outParamSets->end(), data + pos, data + nextPos);
+            }
+        }
+        pos = nextPos;
+        scLen = nextSc;
+    }
+}
 
 static bool setCodecBool(ICodecAPI* api, const GUID& key, bool val) {
     if (!api) return false;
@@ -364,19 +399,23 @@ bool Encoder::startPlanFrom(size_t startIdx) {
             }
         }
 
-        int targetMode = step.p010 ? 1 : 0;
-        if (m_vpMode != targetMode) {
+        if (!step.hw || m_vpFailedAtRuntime) {
             cleanupVideoProcessor();
             cleanupNvUploadTextures();
-            m_vpMode = -1;
-            if (m_d3dDevice) {
-                bool vpOk = initVideoProcessor(m_srcFormat, step.p010);
-                if (step.p010 && !vpOk) continue;
-                if (vpOk && !initNvUploadTextures(step.p010)) {
-                    if (step.p010) { cleanupVideoProcessor(); continue; }
+        } else {
+            int targetMode = step.p010 ? 1 : 0;
+            if (m_vpMode != targetMode) {
+                cleanupVideoProcessor();
+                cleanupNvUploadTextures();
+                if (m_d3dDevice) {
+                    bool vpOk = initVideoProcessor(m_srcFormat, step.p010);
+                    if (step.p010 && !vpOk) continue;
+                    if (vpOk && !initNvUploadTextures(step.p010)) {
+                        if (step.p010) { cleanupVideoProcessor(); continue; }
+                    }
                 }
+                m_vpMode = targetMode;
             }
-            m_vpMode = targetMode;
         }
 
         m_useP010 = step.p010;
@@ -413,6 +452,7 @@ bool Encoder::init(ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dContext,
     m_isHdrSource = isHdrDisplay || (srcFormat == DXGI_FORMAT_R16G16B16A16_FLOAT);
     m_planIndex = 0;
     m_vpMode = -1;
+    m_vpFailedAtRuntime = false;
 
     if (m_width == 0 || m_height == 0) return false;
 
@@ -553,6 +593,7 @@ bool Encoder::initVideoProcessor(DXGI_FORMAT srcFormat, bool useP010) {
 
 void Encoder::cleanupVideoProcessor() {
     m_hasVideoProcessor = false;
+    m_vpMode = -1;
     if (m_vpStagingTex) { m_vpStagingTex->Release(); m_vpStagingTex = nullptr; }
     for (int i = 0; i < kVpRingSize; ++i) {
         if (m_vpOutView[i]) { m_vpOutView[i]->Release(); m_vpOutView[i] = nullptr; }
@@ -855,6 +896,7 @@ void Encoder::cleanupMft() {
     m_isNvidia = false;
     m_needInputCount = 0;
     m_hasProducedOutput = false;
+    m_hasEmittedKeyframe = false;
     m_submittedWithoutOutput = 0;
     m_waitTimeouts = 0;
     m_seqHeader.clear();
@@ -986,6 +1028,27 @@ bool Encoder::submitDxgiSurface(ID3D11Texture2D* tex, uint64_t ptsUs,
     return submitSampleToMft(sample, outAnnexB, outIsKeyframe, outInputAccepted);
 }
 
+bool Encoder::shouldRetryWithFallback(bool inputAccepted, bool asyncTimedOut) {
+    if (!inputAccepted) {
+        std::cerr << "[Encoder] Input rejected by MFT - switching encoder..." << std::endl;
+        return advanceFallback();
+    }
+    if (asyncTimedOut) {
+        if (!m_hasEmittedKeyframe && ++m_waitTimeouts >= 3) {
+            std::cerr << "[Encoder] Async MFT input timeout - switching encoder..." << std::endl;
+            return advanceFallback();
+        }
+        return false;
+    }
+    if ((!m_hasProducedOutput && m_submittedWithoutOutput >= 5) ||
+        (!m_hasEmittedKeyframe && m_submittedWithoutOutput >= 8)) {
+        std::cerr << "[Encoder] MFT produced 0 keyframes after " << m_submittedWithoutOutput
+                  << " frames - switching encoder..." << std::endl;
+        return advanceFallback();
+    }
+    return false;
+}
+
 bool Encoder::encodeGpuFrame(ID3D11Texture2D* gpuSrcTex, uint64_t ptsUs,
                              std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe) {
     if (!gpuSrcTex) return false;
@@ -1009,6 +1072,7 @@ bool Encoder::encodeGpuFrame(ID3D11Texture2D* gpuSrcTex, uint64_t ptsUs,
         if (FAILED(hr) || !inView) {
             std::cerr << "[Encoder] CreateVideoProcessorInputView failed (0x" << std::hex << hr << std::dec
                       << ") - falling back to CPU path." << std::endl;
+            m_vpFailedAtRuntime = true;
             cleanupVideoProcessor();
             return false;
         }
@@ -1022,6 +1086,7 @@ bool Encoder::encodeGpuFrame(ID3D11Texture2D* gpuSrcTex, uint64_t ptsUs,
         if (FAILED(hr)) {
             std::cerr << "[Encoder] VideoProcessorBlt failed (0x" << std::hex << hr << std::dec
                       << ") - falling back to CPU path." << std::endl;
+            m_vpFailedAtRuntime = true;
             cleanupVideoProcessor();
             return false;
         }
@@ -1029,12 +1094,13 @@ bool Encoder::encodeGpuFrame(ID3D11Texture2D* gpuSrcTex, uint64_t ptsUs,
         // Flush VideoProcessorBlt to GPU queue immediately so NVENC reads current frame without batch stall
         m_d3dContext->Flush();
 
+        if (!waitAsyncInputReady()) {
+            if (popPendingFrame(outAnnexB, outIsKeyframe)) return true;
+            if (shouldRetryWithFallback(true, true)) continue;
+            return false;
+        }
+
         if (m_useD3dManager) {
-            if (!waitAsyncInputReady()) {
-                if (popPendingFrame(outAnnexB, outIsKeyframe)) return true;
-                if (!m_hasProducedOutput && ++m_waitTimeouts >= 3 && advanceFallback()) continue;
-                return false;
-            }
             ID3D11Texture2D* submitTex = outTex;
             if (m_nvDevice) {
                 if (!m_nvGpuTex[slot] || !copyStagedYuvToNvTexture(outTex, m_nvGpuTex[slot])) {
@@ -1045,27 +1111,19 @@ bool Encoder::encodeGpuFrame(ID3D11Texture2D* gpuSrcTex, uint64_t ptsUs,
             }
 
             bool inputAccepted = false;
-            bool gotOut = submitDxgiSurface(submitTex, ptsUs, outAnnexB, outIsKeyframe, inputAccepted);
-            if (gotOut) return true;
-            if (!inputAccepted) {
-                std::cerr << "[Encoder] DXGI zero-copy rejected by MFT - switching encoder..." << std::endl;
-                if (advanceFallback()) continue;
-                return false;
+            if (submitDxgiSurface(submitTex, ptsUs, outAnnexB, outIsKeyframe, inputAccepted)) {
+                return true;
             }
-            if (!m_hasProducedOutput && m_submittedWithoutOutput >= 5) {
-                std::cerr << "[Encoder] Zero-copy MFT produced 0 packets after 5 frames - switching encoder..." << std::endl;
-                if (advanceFallback()) continue;
-            }
+            if (shouldRetryWithFallback(inputAccepted, false)) continue;
             return false;
         }
 
         if (!copyTextureToPackedYuv(outTex, m_yuvBuffer)) return false;
-        bool gotOut = encodePackedYuv(m_yuvBuffer, ptsUs, outAnnexB, outIsKeyframe);
-        if (gotOut) return true;
-        if (!m_hasProducedOutput && m_submittedWithoutOutput >= 5) {
-            std::cerr << "[Encoder] GPU MFT produced 0 packets after 5 frames - switching encoder..." << std::endl;
-            if (advanceFallback()) continue;
+        bool inputAccepted = false;
+        if (encodePackedYuv(m_yuvBuffer, ptsUs, outAnnexB, outIsKeyframe, inputAccepted)) {
+            return true;
         }
+        if (shouldRetryWithFallback(inputAccepted, false)) continue;
         return false;
     }
     return false;
@@ -1075,9 +1133,23 @@ bool Encoder::encodeBgraCpu(const uint8_t* bgra, uint32_t width, uint32_t height
                             std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe) {
     if (!m_mft || !bgra || width != m_width || height != m_height || m_useP010) return false;
     convertBgraToNv12Studio(bgra, width, height, m_yuvBuffer);
-    if (encodePackedYuv(m_yuvBuffer, ptsUs, outAnnexB, outIsKeyframe)) return true;
-    if (!m_hasProducedOutput && m_submittedWithoutOutput >= 5 && advanceFallback()) {
-        return encodePackedYuv(m_yuvBuffer, ptsUs, outAnnexB, outIsKeyframe);
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        if (!m_mft) return false;
+        if (m_useD3dManager) {
+            if (advanceFallback()) continue;
+            return false;
+        }
+        if (!waitAsyncInputReady()) {
+            if (popPendingFrame(outAnnexB, outIsKeyframe)) return true;
+            if (shouldRetryWithFallback(true, true)) continue;
+            return false;
+        }
+        bool inputAccepted = false;
+        if (encodePackedYuv(m_yuvBuffer, ptsUs, outAnnexB, outIsKeyframe, inputAccepted)) {
+            return true;
+        }
+        if (shouldRetryWithFallback(inputAccepted, false)) continue;
+        return false;
     }
     return false;
 }
@@ -1096,7 +1168,8 @@ bool Encoder::popPendingFrame(std::vector<uint8_t>& outAnnexB, bool& outIsKeyfra
     m_readyOutputs.pop_front();
     if (!outAnnexB.empty()) {
         m_hasProducedOutput = true;
-        m_submittedWithoutOutput = 0;
+        if (outIsKeyframe) m_hasEmittedKeyframe = true;
+        if (m_hasEmittedKeyframe) m_submittedWithoutOutput = 0;
         return true;
     }
     return false;
@@ -1128,7 +1201,7 @@ bool Encoder::submitSampleToMft(IMFSample* sample, std::vector<uint8_t>& outAnne
     outInputAccepted = false;
     if (!sample) return false;
 
-    if (m_forceKeyframe.exchange(false) && m_codecApi) {
+    if ((m_forceKeyframe.exchange(false) || !m_hasEmittedKeyframe) && m_codecApi) {
         setCodecUint32(m_codecApi, CODECAPI_AVEncVideoForceKeyFrame, 1);
     }
 
@@ -1140,21 +1213,30 @@ bool Encoder::submitSampleToMft(IMFSample* sample, std::vector<uint8_t>& outAnne
     }
 
     outInputAccepted = true;
-    if (!m_hasProducedOutput) {
+    if (!m_hasEmittedKeyframe) {
         m_submittedWithoutOutput++;
     }
+    bool ok = false;
     if (m_isAsync) {
         m_needInputCount--;
         pumpAsyncEvents(true);
-        return popPendingFrame(outAnnexB, outIsKeyframe);
+        ok = popPendingFrame(outAnnexB, outIsKeyframe);
+    } else {
+        ok = collectSyncOutput(outAnnexB, outIsKeyframe);
     }
-    return collectSyncOutput(outAnnexB, outIsKeyframe);
+    if (ok && !m_hasEmittedKeyframe && m_submittedWithoutOutput >= 8) {
+        outAnnexB.clear();
+        outIsKeyframe = false;
+        return false;
+    }
+    return ok;
 }
 
 bool Encoder::encodePackedYuv(const std::vector<uint8_t>& yuvData, uint64_t ptsUs,
-                              std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe) {
+                              std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe,
+                              bool& outInputAccepted) {
+    outInputAccepted = false;
     if (!m_mft || yuvData.empty()) return false;
-    if (!waitAsyncInputReady()) return false;
 
     IMFMediaBuffer* mfBuf = nullptr;
     DWORD dataSize = static_cast<DWORD>(yuvData.size());
@@ -1177,8 +1259,7 @@ bool Encoder::encodePackedYuv(const std::vector<uint8_t>& yuvData, uint64_t ptsU
     sample->SetSampleTime(static_cast<LONGLONG>(ptsUs) * 10);
     sample->SetSampleDuration(10000000LL / m_fps);
 
-    bool inputAccepted = false;
-    return submitSampleToMft(sample, outAnnexB, outIsKeyframe, inputAccepted);
+    return submitSampleToMft(sample, outAnnexB, outIsKeyframe, outInputAccepted);
 }
 
 bool Encoder::collectSyncOutput(std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe) {
@@ -1260,20 +1341,19 @@ bool Encoder::collectSyncOutput(std::vector<uint8_t>& outAnnexB, bool& outIsKeyf
                 BYTE* pBytes = nullptr;
                 DWORD len = 0;
                 if (SUCCEEDED(contiguous->Lock(&pBytes, nullptr, &len)) && len > 0) {
-                    if (outIsKeyframe && !m_seqHeader.empty()) {
-                        // Ensure SPS/PPS(/VPS) precede keyframe if driver omitted inline headers
-                        bool hasStartCode = (len > 4 && pBytes[0] == 0 && pBytes[1] == 0);
-                        uint8_t firstNalType = 0;
-                        if (hasStartCode) {
-                            size_t off = (pBytes[2] == 1) ? 3 : 4;
-                            if (off < len) {
-                                firstNalType = (m_codec == CODEC_HEVC) ? ((pBytes[off] >> 1) & 0x3F) : (pBytes[off] & 0x1F);
-                            }
-                        }
-                        bool alreadyHasParamSets = (m_codec == CODEC_HEVC) ? (firstNalType == 32 || firstNalType == 33) : (firstNalType == 7);
-                        if (!alreadyHasParamSets) {
-                            outAnnexB.insert(outAnnexB.end(), m_seqHeader.begin(), m_seqHeader.end());
-                        }
+                    bool hasParamSets = false;
+                    bool hasIdr = false;
+                    std::vector<uint8_t> extractedParams;
+                    inspectAnnexB(pBytes, len, m_codec, hasParamSets, hasIdr,
+                                  m_seqHeader.empty() ? &extractedParams : nullptr);
+                    if (hasIdr) {
+                        outIsKeyframe = true;
+                    }
+                    if (m_seqHeader.empty() && !extractedParams.empty()) {
+                        m_seqHeader = std::move(extractedParams);
+                    }
+                    if (outIsKeyframe && !hasParamSets && !m_seqHeader.empty()) {
+                        outAnnexB.insert(outAnnexB.end(), m_seqHeader.begin(), m_seqHeader.end());
                     }
                     outAnnexB.insert(outAnnexB.end(), pBytes, pBytes + len);
                     contiguous->Unlock();
@@ -1285,7 +1365,8 @@ bool Encoder::collectSyncOutput(std::vector<uint8_t>& outAnnexB, bool& outIsKeyf
 
         if (!outAnnexB.empty()) {
             m_hasProducedOutput = true;
-            m_submittedWithoutOutput = 0;
+            if (outIsKeyframe) m_hasEmittedKeyframe = true;
+            if (m_hasEmittedKeyframe) m_submittedWithoutOutput = 0;
             return true;
         }
     }
