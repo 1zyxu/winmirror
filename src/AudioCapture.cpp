@@ -1,7 +1,25 @@
 #include "AudioCapture.h"
 #include <iostream>
+#include <sstream>
 #include <vector>
 #include <algorithm>
+#include <propsys.h>
+
+static const PROPERTYKEY WINMIRROR_PKEY_FriendlyName = {
+    { 0xa45c254e, 0xdf1c, 0x4efd, { 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0 } }, 14
+};
+
+static std::string wideToUtf8(const wchar_t* w) {
+    if (!w || !*w) return {};
+    int need = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    if (need <= 1) return {};
+    std::string out(need - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, &out[0], need, nullptr, nullptr);
+    for (char& ch : out) {
+        if (ch == '|' || ch == '\n' || ch == '\r') ch = ' ';
+    }
+    return out;
+}
 
 AudioCapture::AudioCapture() = default;
 
@@ -10,7 +28,10 @@ AudioCapture::~AudioCapture() {
     cleanup();
 }
 
-void AudioCapture::cleanup() {
+void AudioCapture::releaseEndpoint() {
+    if (m_audioClient) {
+        m_audioClient->Stop();
+    }
     if (m_pwfx) {
         CoTaskMemFree(m_pwfx);
         m_pwfx = nullptr;
@@ -27,15 +48,132 @@ void AudioCapture::cleanup() {
         m_device->Release();
         m_device = nullptr;
     }
+    m_deviceId.clear();
+}
+
+void AudioCapture::cleanup() {
+    releaseEndpoint();
     if (m_enumerator) {
         m_enumerator->Release();
         m_enumerator = nullptr;
     }
 }
 
-bool AudioCapture::init(AudioDataCallback callback) {
+void AudioCapture::refreshDeviceList() {
+    if (!m_enumerator) return;
+
+    int reqIdx = m_requestedIndex.load();
+    std::ostringstream oss;
+    oss << "-1|" << (reqIdx < 0 ? 1 : 0) << "|Default PC Audio (Auto)\n";
+
+    IMMDeviceCollection* coll = nullptr;
+    if (SUCCEEDED(m_enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &coll)) && coll) {
+        UINT count = 0;
+        coll->GetCount(&count);
+        for (UINT i = 0; i < count; ++i) {
+            IMMDevice* dev = nullptr;
+            if (SUCCEEDED(coll->Item(i, &dev)) && dev) {
+                std::string name = "Audio Device " + std::to_string(i + 1);
+                IPropertyStore* props = nullptr;
+                if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &props)) && props) {
+                    PROPVARIANT pv;
+                    PropVariantInit(&pv);
+                    if (SUCCEEDED(props->GetValue(WINMIRROR_PKEY_FriendlyName, &pv)) &&
+                        pv.vt == VT_LPWSTR && pv.pwszVal) {
+                        std::string conv = wideToUtf8(pv.pwszVal);
+                        if (!conv.empty()) name = std::move(conv);
+                    }
+                    PropVariantClear(&pv);
+                    props->Release();
+                }
+                oss << i << "|" << (reqIdx == static_cast<int>(i) ? 1 : 0) << "|" << name << "\n";
+                dev->Release();
+            }
+        }
+        coll->Release();
+    }
+
+    std::string listStr = oss.str();
+    {
+        std::lock_guard<std::mutex> lock(m_devListMutex);
+        m_cachedDeviceList = listStr;
+    }
+    if (m_devCallback) {
+        m_devCallback(listStr);
+    }
+}
+
+void AudioCapture::setSourceDeviceIndex(int index) {
+    m_requestedIndex.store(index < 0 ? -1 : index);
+    m_forceReinit.store(true);
+}
+
+std::string AudioCapture::getDeviceListSerialized() {
+    std::lock_guard<std::mutex> lock(m_devListMutex);
+    return m_cachedDeviceList;
+}
+
+bool AudioCapture::initEndpoint() {
+    releaseEndpoint();
+    if (!m_enumerator) return false;
+
+    int reqIdx = m_requestedIndex.load();
+    HRESULT hr = E_FAIL;
+
+    if (reqIdx >= 0) {
+        IMMDeviceCollection* coll = nullptr;
+        if (SUCCEEDED(m_enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &coll)) && coll) {
+            UINT count = 0;
+            coll->GetCount(&count);
+            if (static_cast<UINT>(reqIdx) < count) {
+                hr = coll->Item(static_cast<UINT>(reqIdx), &m_device);
+            }
+            coll->Release();
+        }
+        if (FAILED(hr) || !m_device) {
+            m_requestedIndex.store(-1);
+        }
+    }
+
+    if (!m_device) {
+        hr = m_enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &m_device);
+        if (FAILED(hr) || !m_device) return false;
+    }
+
+    LPWSTR devId = nullptr;
+    if (SUCCEEDED(m_device->GetId(&devId)) && devId) {
+        m_deviceId = devId;
+        CoTaskMemFree(devId);
+    }
+
+    hr = m_device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&m_audioClient));
+    if (FAILED(hr)) { releaseEndpoint(); return false; }
+
+    hr = m_audioClient->GetMixFormat(&m_pwfx);
+    if (FAILED(hr) || !m_pwfx) { releaseEndpoint(); return false; }
+
+    hr = m_audioClient->Initialize(
+        AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_LOOPBACK,
+        2000000, // 200ms buffer for low latency
+        0,
+        m_pwfx,
+        nullptr
+    );
+    if (FAILED(hr)) { releaseEndpoint(); return false; }
+
+    hr = m_audioClient->GetService(__uuidof(IAudioCaptureClient), reinterpret_cast<void**>(&m_captureClient));
+    if (FAILED(hr)) { releaseEndpoint(); return false; }
+
+    m_sampleRate.store(m_pwfx->nSamplesPerSec);
+    refreshDeviceList();
+    return true;
+}
+
+bool AudioCapture::init(AudioDataCallback callback, AudioDevicesCallback devCallback) {
     cleanup();
     m_callback = callback;
+    m_devCallback = devCallback;
 
     HRESULT hr = CoCreateInstance(
         __uuidof(MMDeviceEnumerator),
@@ -46,29 +184,10 @@ bool AudioCapture::init(AudioDataCallback callback) {
     );
     if (FAILED(hr)) return false;
 
-    hr = m_enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &m_device);
-    if (FAILED(hr)) { cleanup(); return false; }
-
-    hr = m_device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&m_audioClient));
-    if (FAILED(hr)) { cleanup(); return false; }
-
-    hr = m_audioClient->GetMixFormat(&m_pwfx);
-    if (FAILED(hr)) { cleanup(); return false; }
-
-    // Initialize in low-latency loopback mode
-    hr = m_audioClient->Initialize(
-        AUDCLNT_SHAREMODE_SHARED,
-        AUDCLNT_STREAMFLAGS_LOOPBACK,
-        2000000, // 200ms buffer for low latency
-        0,
-        m_pwfx,
-        nullptr
-    );
-    if (FAILED(hr)) { cleanup(); return false; }
-
-    hr = m_audioClient->GetService(__uuidof(IAudioCaptureClient), reinterpret_cast<void**>(&m_captureClient));
-    if (FAILED(hr)) { cleanup(); return false; }
-
+    if (!initEndpoint()) {
+        cleanup();
+        return false;
+    }
     return true;
 }
 
@@ -96,20 +215,64 @@ void AudioCapture::stop() {
 }
 
 void AudioCapture::captureLoop() {
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
     std::vector<int16_t> pcmOut;
     pcmOut.reserve(48000 * 2);
-
-    const bool isFloat = (m_pwfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) ||
-        (m_pwfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
-         reinterpret_cast<WAVEFORMATEXTENSIBLE*>(m_pwfx)->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
-
-    const int channels = m_pwfx->nChannels;
-    const uint32_t sampleRate = m_pwfx->nSamplesPerSec;
+    int silentTailLeft = 0;
+    int idleTicks = 0;
 
     while (m_running) {
+        if (m_forceReinit.exchange(false)) {
+            if (initEndpoint() && m_audioClient) {
+                m_audioClient->Start();
+                silentTailLeft = 0;
+            }
+        }
+
+        if (!m_captureClient || !m_pwfx) {
+            if (!initEndpoint() || FAILED(m_audioClient->Start())) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
+            }
+        }
+
+        // Re-check default playback device roughly once per second when in Auto (-1) mode
+        if (++idleTicks >= 500) {
+            idleTicks = 0;
+            if (m_requestedIndex.load() < 0) {
+                IMMDevice* defDev = nullptr;
+                if (m_enumerator && SUCCEEDED(m_enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &defDev)) && defDev) {
+                    LPWSTR defId = nullptr;
+                    if (SUCCEEDED(defDev->GetId(&defId)) && defId) {
+                        if (m_deviceId != defId) {
+                            if (initEndpoint() && SUCCEEDED(m_audioClient->Start())) {
+                                silentTailLeft = 0;
+                            }
+                        }
+                        CoTaskMemFree(defId);
+                    }
+                    defDev->Release();
+                }
+            }
+        }
+
+        if (!m_captureClient || !m_pwfx) continue;
+
+        const bool isFloat = (m_pwfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) ||
+            (m_pwfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+             reinterpret_cast<WAVEFORMATEXTENSIBLE*>(m_pwfx)->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+        const int channels = std::max<int>(1, m_pwfx->nChannels);
+        const int bits = m_pwfx->wBitsPerSample;
+        const uint32_t sampleRate = m_pwfx->nSamplesPerSec;
+
         UINT32 packetLength = 0;
         HRESULT hr = m_captureClient->GetNextPacketSize(&packetLength);
-        if (FAILED(hr)) break;
+        if (hr == AUDCLNT_E_DEVICE_INVALIDATED || FAILED(hr)) {
+            releaseEndpoint();
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
 
         if (packetLength == 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -122,39 +285,69 @@ void AudioCapture::captureLoop() {
             DWORD flags = 0;
 
             hr = m_captureClient->GetBuffer(&pData, &numFrames, &flags, nullptr, nullptr);
-            if (FAILED(hr)) break;
+            if (FAILED(hr)) {
+                if (hr == AUDCLNT_E_DEVICE_INVALIDATED) releaseEndpoint();
+                break;
+            }
 
-            if (numFrames > 0 && !(flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
-                pcmOut.resize(numFrames * 2);
+            if (numFrames > 0) {
+                if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
+                    silentTailLeft = 3;
+                    pcmOut.resize(numFrames * 2);
 
-                if (isFloat) {
-                    const float* fData = reinterpret_cast<const float*>(pData);
-                    for (UINT32 i = 0; i < numFrames; ++i) {
-                        float left = fData[i * channels + 0];
-                        float right = (channels > 1) ? fData[i * channels + 1] : left;
-
-                        left = std::max(-1.0f, std::min(1.0f, left));
-                        right = std::max(-1.0f, std::min(1.0f, right));
-
-                        pcmOut[i * 2 + 0] = static_cast<int16_t>(left * 32767.0f);
-                        pcmOut[i * 2 + 1] = static_cast<int16_t>(right * 32767.0f);
+                    if (isFloat) {
+                        const float* fData = reinterpret_cast<const float*>(pData);
+                        for (UINT32 i = 0; i < numFrames; ++i) {
+                            float left = std::max(-1.0f, std::min(1.0f, fData[i * channels + 0]));
+                            float right = std::max(-1.0f, std::min(1.0f, (channels > 1) ? fData[i * channels + 1] : left));
+                            pcmOut[i * 2 + 0] = static_cast<int16_t>(left * 32767.0f);
+                            pcmOut[i * 2 + 1] = static_cast<int16_t>(right * 32767.0f);
+                        }
+                    } else if (bits == 32) {
+                        const int32_t* iData = reinterpret_cast<const int32_t*>(pData);
+                        for (UINT32 i = 0; i < numFrames; ++i) {
+                            pcmOut[i * 2 + 0] = static_cast<int16_t>(iData[i * channels + 0] >> 16);
+                            pcmOut[i * 2 + 1] = static_cast<int16_t>(((channels > 1) ? iData[i * channels + 1] : iData[i * channels + 0]) >> 16);
+                        }
+                    } else if (bits == 24) {
+                        const int stride = channels * 3;
+                        for (UINT32 i = 0; i < numFrames; ++i) {
+                            const uint8_t* framePtr = pData + i * stride;
+                            auto read24 = [](const uint8_t* b) -> int16_t {
+                                return static_cast<int16_t>((static_cast<int8_t>(b[2]) << 8) | b[1]);
+                            };
+                            pcmOut[i * 2 + 0] = read24(framePtr);
+                            pcmOut[i * 2 + 1] = (channels > 1) ? read24(framePtr + 3) : pcmOut[i * 2 + 0];
+                        }
+                    } else {
+                        const int16_t* sData = reinterpret_cast<const int16_t*>(pData);
+                        for (UINT32 i = 0; i < numFrames; ++i) {
+                            pcmOut[i * 2 + 0] = sData[i * channels + 0];
+                            pcmOut[i * 2 + 1] = (channels > 1) ? sData[i * channels + 1] : sData[i * channels + 0];
+                        }
                     }
-                } else {
-                    const int16_t* sData = reinterpret_cast<const int16_t*>(pData);
-                    for (UINT32 i = 0; i < numFrames; ++i) {
-                        pcmOut[i * 2 + 0] = sData[i * channels + 0];
-                        pcmOut[i * 2 + 1] = (channels > 1) ? sData[i * channels + 1] : sData[i * channels + 0];
-                    }
-                }
 
-                if (m_callback) {
-                    m_callback(reinterpret_cast<const uint8_t*>(pcmOut.data()), pcmOut.size() * sizeof(int16_t), sampleRate, 2);
+                    if (m_callback) {
+                        m_callback(reinterpret_cast<const uint8_t*>(pcmOut.data()), pcmOut.size() * sizeof(int16_t), sampleRate, 2);
+                    }
+                } else if (silentTailLeft > 0) {
+                    --silentTailLeft;
+                    pcmOut.assign(numFrames * 2, 0);
+                    if (m_callback) {
+                        m_callback(reinterpret_cast<const uint8_t*>(pcmOut.data()), pcmOut.size() * sizeof(int16_t), sampleRate, 2);
+                    }
                 }
             }
 
             m_captureClient->ReleaseBuffer(numFrames);
+            if (!m_captureClient) break;
             hr = m_captureClient->GetNextPacketSize(&packetLength);
-            if (FAILED(hr)) break;
+            if (FAILED(hr)) {
+                if (hr == AUDCLNT_E_DEVICE_INVALIDATED) releaseEndpoint();
+                break;
+            }
         }
     }
+
+    CoUninitialize();
 }

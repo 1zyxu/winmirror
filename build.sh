@@ -33,7 +33,7 @@ build_mac() {
         -Wl,-sectcreate,__TEXT,__info_plist,mac/Info.plist \
         -framework Cocoa -framework QuartzCore -framework VideoToolbox \
         -framework AVFoundation -framework CoreMedia -framework CoreVideo \
-        -framework AudioToolbox -framework IOBluetooth \
+        -framework AudioToolbox -framework CoreAudio -framework IOBluetooth \
         mac/main.mm -o winmirror_mac
     echo "==> Built winmirror_mac successfully!"
     ls -lh winmirror_mac

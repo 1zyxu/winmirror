@@ -5,6 +5,7 @@
 #import <CoreVideo/CoreVideo.h>
 #import <VideoToolbox/VideoToolbox.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import <CoreAudio/CoreAudio.h>
 #import <IOBluetooth/IOBluetooth.h>
 
 #include <arpa/inet.h>
@@ -40,13 +41,15 @@ enum ColorProfile : uint8_t {
 };
 
 enum PacketType : uint16_t {
-    PACKET_TYPE_HELLO        = 0x01,
-    PACKET_TYPE_VIDEO        = 0x02,
-    PACKET_TYPE_AUDIO        = 0x03,
-    PACKET_TYPE_CURSOR       = 0x04,
-    PACKET_TYPE_PING         = 0x05,
-    PACKET_TYPE_PONG         = 0x06,
-    PACKET_TYPE_KEYFRAME_REQ = 0x07
+    PACKET_TYPE_HELLO         = 0x01,
+    PACKET_TYPE_VIDEO         = 0x02,
+    PACKET_TYPE_AUDIO         = 0x03,
+    PACKET_TYPE_CURSOR        = 0x04,
+    PACKET_TYPE_PING          = 0x05,
+    PACKET_TYPE_PONG          = 0x06,
+    PACKET_TYPE_KEYFRAME_REQ  = 0x07,
+    PACKET_TYPE_AUDIO_DEVICES = 0x08,
+    PACKET_TYPE_SET_AUDIO_SRC = 0x09
 };
 
 #pragma pack(push, 1)
@@ -87,45 +90,189 @@ struct CursorPayload {
 #pragma pack(pop)
 
 // ============================================================================
-// Low-Latency Adaptive SampleRate CoreAudio Output
+// CoreAudio Device Enumeration + Low-Latency Pull-Ring Audio Output
 // ============================================================================
-#define NUM_AQ_BUFS 12
-#define AQ_BUF_SIZE 16384
+#define NUM_AQ_BUFS 4
+
+struct MacAudioDeviceInfo {
+    AudioDeviceID deviceId = 0;
+    NSString *name = nil;
+    NSString *uid = nil;
+    BOOL isDefault = NO;
+    BOOL isMuted = NO;
+    float volume = -1.0f;
+};
+
+static std::vector<MacAudioDeviceInfo> enumerateMacOutputDevices() {
+    std::vector<MacAudioDeviceInfo> result;
+
+    AudioDeviceID defId = 0;
+    UInt32 defSize = sizeof(defId);
+    AudioObjectPropertyAddress defAddr = {
+        kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    AudioObjectGetPropertyData(kAudioObjectSystemObject, &defAddr, 0, nullptr, &defSize, &defId);
+
+    AudioObjectPropertyAddress devListAddr = {
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    UInt32 ds = 0;
+    if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &devListAddr, 0, nullptr, &ds) != noErr || ds == 0) {
+        return result;
+    }
+
+    std::vector<AudioDeviceID> ids(ds / sizeof(AudioDeviceID));
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &devListAddr, 0, nullptr, &ds, ids.data()) != noErr) {
+        return result;
+    }
+
+    for (AudioDeviceID devId : ids) {
+        AudioObjectPropertyAddress streamAddr = {
+            kAudioDevicePropertyStreams,
+            kAudioObjectPropertyScopeOutput,
+            kAudioObjectPropertyElementMain
+        };
+        UInt32 ss = 0;
+        if (AudioObjectGetPropertyDataSize(devId, &streamAddr, 0, nullptr, &ss) != noErr || ss == 0) {
+            continue;
+        }
+
+        CFStringRef cfName = nullptr, cfUid = nullptr;
+        UInt32 ns = sizeof(cfName), us = sizeof(cfUid);
+        AudioObjectPropertyAddress na = { kAudioDevicePropertyDeviceNameCFString, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+        AudioObjectPropertyAddress ua = { kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+        AudioObjectGetPropertyData(devId, &na, 0, nullptr, &ns, &cfName);
+        AudioObjectGetPropertyData(devId, &ua, 0, nullptr, &us, &cfUid);
+
+        if (!cfName || !cfUid) {
+            if (cfName) CFRelease(cfName);
+            if (cfUid) CFRelease(cfUid);
+            continue;
+        }
+
+        MacAudioDeviceInfo info;
+        info.deviceId = devId;
+        info.name = [NSString stringWithString:(__bridge NSString *)cfName];
+        info.uid = [NSString stringWithString:(__bridge NSString *)cfUid];
+        info.isDefault = (devId == defId);
+
+        UInt32 muted = 0, ms = sizeof(muted);
+        AudioObjectPropertyAddress ma = { kAudioDevicePropertyMute, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain };
+        if (AudioObjectGetPropertyData(devId, &ma, 0, nullptr, &ms, &muted) == noErr) {
+            info.isMuted = (muted != 0);
+        }
+
+        Float32 vol = -1.0f;
+        UInt32 vs = sizeof(vol);
+        AudioObjectPropertyAddress va0 = { kAudioDevicePropertyVolumeScalar, kAudioObjectPropertyScopeOutput, 0 };
+        AudioObjectPropertyAddress va1 = { kAudioDevicePropertyVolumeScalar, kAudioObjectPropertyScopeOutput, 1 };
+        if (AudioObjectGetPropertyData(devId, &va0, 0, nullptr, &vs, &vol) == noErr) {
+            info.volume = vol;
+        } else if (AudioObjectGetPropertyData(devId, &va1, 0, nullptr, &vs, &vol) == noErr) {
+            info.volume = vol;
+        }
+
+        CFRelease(cfName);
+        CFRelease(cfUid);
+        result.push_back(std::move(info));
+    }
+    return result;
+}
+
+static void unmuteMacDevice(AudioDeviceID devId, float targetVolume) {
+    UInt32 muted = 0;
+    AudioObjectPropertyAddress ma = { kAudioDevicePropertyMute, kAudioObjectPropertyScopeOutput, kAudioObjectPropertyElementMain };
+    AudioObjectSetPropertyData(devId, &ma, 0, nullptr, sizeof(muted), &muted);
+
+    Float32 vol = std::max(0.0f, std::min(1.0f, targetVolume));
+    for (UInt32 ch : { 0u, 1u, 2u }) {
+        AudioObjectPropertyAddress va = { kAudioDevicePropertyVolumeScalar, kAudioObjectPropertyScopeOutput, ch };
+        AudioObjectSetPropertyData(devId, &va, 0, nullptr, sizeof(vol), &vol);
+    }
+}
 
 @interface MacAudioPlayer : NSObject
+@property (nonatomic, copy) NSString *selectedDeviceUID;
+@property (nonatomic, assign) BOOL muted;
+@property (nonatomic, readonly) uint32_t activeSampleRate;
+@property (nonatomic, readonly) BOOL hasActiveSignal;
+
 - (void)playPcm:(const uint8_t *)data length:(size_t)len sampleRate:(uint32_t)sampleRate;
-- (void)recycleBuffer:(AudioQueueBufferRef)buf;
+- (void)handleCallback:(AudioQueueBufferRef)buf;
+- (void)switchToDeviceUID:(NSString *)uid;
+- (void)restartAudio;
 - (void)stop;
 @end
 
 @implementation MacAudioPlayer {
     AudioQueueRef _audioQueue;
-    std::vector<AudioQueueBufferRef> _freeBuffers;
+    std::mutex _queueMutex;
     std::mutex _bufMutex;
+    std::deque<uint8_t> _pcmRing;
     uint32_t _sampleRate;
+    UInt32 _chunkBytes;
     BOOL _started;
-    int _inFlight;
+    std::atomic<bool> _disposing;
+    std::chrono::steady_clock::time_point _lastSignalTime;
 }
 
 static void AirPlayAudioCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueBufferRef inBuffer) {
     MacAudioPlayer *player = (__bridge MacAudioPlayer *)inUserData;
-    [player recycleBuffer:inBuffer];
+    [player handleCallback:inBuffer];
 }
 
 - (instancetype)init {
     self = [super init];
     if (self) {
-        _sampleRate = 0;
+        _sampleRate = 48000;
+        _chunkBytes = (48000 / 50) * 4;
         _started = NO;
-        _inFlight = 0;
+        _disposing = false;
+        _muted = NO;
+        _selectedDeviceUID = nil;
+        _lastSignalTime = std::chrono::steady_clock::time_point{};
     }
     return self;
 }
 
-- (void)configureForSampleRate:(uint32_t)sr {
-    [self stop];
+- (uint32_t)activeSampleRate {
+    return _sampleRate;
+}
+
+- (BOOL)hasActiveSignal {
+    auto age = std::chrono::steady_clock::now() - _lastSignalTime;
+    return _lastSignalTime.time_since_epoch().count() > 0 && age < std::chrono::seconds(2);
+}
+
+- (void)stopLocked {
+    _disposing = true;
+    AudioQueueRef q = _audioQueue;
+    _audioQueue = NULL;
+    _started = NO;
+
+    if (q) {
+        AudioQueueStop(q, true);
+        AudioQueueDispose(q, true);
+    }
+    {
+        std::lock_guard<std::mutex> lock(_bufMutex);
+        _pcmRing.clear();
+    }
+    _disposing = false;
+}
+
+- (void)configureForSampleRateLocked:(uint32_t)sr {
+    [self stopLocked];
+    if (_muted) return;
+
     if (sr < 8000 || sr > 192000) sr = 48000;
     _sampleRate = sr;
+    _chunkBytes = ((sr / 50) * 4);
+    if (_chunkBytes < 256) _chunkBytes = 3840;
 
     AudioStreamBasicDescription format = {};
     format.mSampleRate = static_cast<Float64>(sr);
@@ -147,70 +294,132 @@ static void AirPlayAudioCallback(void *inUserData, AudioQueueRef inAQ, AudioQueu
         &_audioQueue
     );
 
-    if (status == noErr) {
-        std::lock_guard<std::mutex> lock(_bufMutex);
-        _freeBuffers.clear();
-        _inFlight = 0;
-        for (int i = 0; i < NUM_AQ_BUFS; ++i) {
-            AudioQueueBufferRef b = nullptr;
-            if (AudioQueueAllocateBuffer(_audioQueue, AQ_BUF_SIZE, &b) == noErr) {
-                _freeBuffers.push_back(b);
-            }
+    if (status != noErr || !_audioQueue) {
+        _audioQueue = NULL;
+        return;
+    }
+
+    if (_selectedDeviceUID.length > 0) {
+        CFStringRef cfUid = (__bridge CFStringRef)_selectedDeviceUID;
+        OSStatus routeSt = AudioQueueSetProperty(_audioQueue, kAudioQueueProperty_CurrentDevice, &cfUid, sizeof(cfUid));
+        if (routeSt != noErr) {
+            // Fallback gracefully to system default if selected external device vanished
+            _selectedDeviceUID = nil;
         }
+    }
+
+    // Prime continuous pull buffers so CoreAudio & Bluetooth A2DP never starve or drop bursts
+    for (int i = 0; i < NUM_AQ_BUFS; ++i) {
+        AudioQueueBufferRef b = nullptr;
+        if (AudioQueueAllocateBuffer(_audioQueue, _chunkBytes, &b) == noErr && b) {
+            memset(b->mAudioData, 0, _chunkBytes);
+            b->mAudioDataByteSize = _chunkBytes;
+            AudioQueueEnqueueBuffer(_audioQueue, b, 0, NULL);
+        }
+    }
+
+    if (AudioQueueStart(_audioQueue, NULL) == noErr) {
+        _started = YES;
     }
 }
 
-- (void)recycleBuffer:(AudioQueueBufferRef)buf {
-    std::lock_guard<std::mutex> lock(_bufMutex);
-    _freeBuffers.push_back(buf);
-    if (_inFlight > 0) _inFlight--;
+- (void)handleCallback:(AudioQueueBufferRef)buf {
+    if (_disposing.load() || !_audioQueue || !buf) return;
+
+    const UInt32 want = std::min<UInt32>(_chunkBytes, buf->mAudioDataBytesCapacity);
+    uint8_t *dst = static_cast<uint8_t *>(buf->mAudioData);
+    UInt32 copied = 0;
+
+    if (!_muted) {
+        std::lock_guard<std::mutex> lock(_bufMutex);
+        copied = std::min<UInt32>(want, static_cast<UInt32>(_pcmRing.size()));
+        copied &= ~3u; // keep stereo 16-bit 4-byte frame alignment
+        if (copied > 0) {
+            std::copy_n(_pcmRing.begin(), copied, dst);
+            _pcmRing.erase(_pcmRing.begin(), _pcmRing.begin() + copied);
+        }
+    }
+
+    if (copied < want) {
+        memset(dst + copied, 0, want - copied);
+    }
+    buf->mAudioDataByteSize = want;
+
+    if (!_disposing.load() && _audioQueue) {
+        AudioQueueEnqueueBuffer(_audioQueue, buf, 0, NULL);
+    }
 }
 
 - (void)playPcm:(const uint8_t *)data length:(size_t)len sampleRate:(uint32_t)sampleRate {
-    if (len == 0) return;
-    if (!_audioQueue || _sampleRate != sampleRate) {
-        [self configureForSampleRate:sampleRate];
+    if (!data || len < 4) return;
+    if (sampleRate < 8000 || sampleRate > 192000) sampleRate = 48000;
+
+    // Detect non-silent signal accurately on incoming PCM for live UI status
+    const int16_t *samples = reinterpret_cast<const int16_t *>(data);
+    size_t count = len / sizeof(int16_t);
+    for (size_t i = 0; i < count; i += 8) {
+        if (samples[i] > 8 || samples[i] < -8) {
+            _lastSignalTime = std::chrono::steady_clock::now();
+            break;
+        }
+    }
+
+    std::lock_guard<std::mutex> qlock(_queueMutex);
+    if (_muted) return;
+
+    UInt32 isRun = 0, runSz = sizeof(isRun);
+    BOOL queueDead = (!_audioQueue || _sampleRate != sampleRate || !_started ||
+                      AudioQueueGetProperty(_audioQueue, kAudioQueueProperty_IsRunning, &isRun, &runSz) != noErr ||
+                      isRun == 0);
+    if (queueDead) {
+        [self configureForSampleRateLocked:sampleRate];
     }
     if (!_audioQueue) return;
 
-    AudioQueueBufferRef buf = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(_bufMutex);
-        // Anti-drift latency cap: drop excess packets if >= 8 queued (~80ms)
-        if (_inFlight >= 8 || _freeBuffers.empty()) {
-            return;
-        }
-        buf = _freeBuffers.back();
-        _freeBuffers.pop_back();
-        _inFlight++;
-    }
+    std::lock_guard<std::mutex> block(_bufMutex);
+    _pcmRing.insert(_pcmRing.end(), data, data + (len & ~3u));
 
-    UInt32 copyLen = static_cast<UInt32>(std::min<size_t>(len, buf->mAudioDataBytesCapacity));
-    memcpy(buf->mAudioData, data, copyLen);
-    buf->mAudioDataByteSize = copyLen;
-
-    AudioQueueEnqueueBuffer(_audioQueue, buf, 0, NULL);
-
-    if (!_started) {
-        _started = YES;
-        AudioQueueStart(_audioQueue, NULL);
+    // Cap buffer at ~100ms so A/V stays tightly synced on wireless/USB
+    const size_t maxBytes = static_cast<size_t>(_sampleRate) * 4 / 10;
+    if (_pcmRing.size() > maxBytes) {
+        size_t drop = (_pcmRing.size() - maxBytes + 3) & ~3u;
+        drop = std::min(drop, _pcmRing.size());
+        _pcmRing.erase(_pcmRing.begin(), _pcmRing.begin() + drop);
     }
 }
 
-- (void)stop {
-    if (_audioQueue) {
-        AudioQueueStop(_audioQueue, true);
-        AudioQueueDispose(_audioQueue, true);
-        _audioQueue = NULL;
-        _started = NO;
+- (void)switchToDeviceUID:(NSString *)uid {
+    std::lock_guard<std::mutex> qlock(_queueMutex);
+    _muted = NO;
+    self.selectedDeviceUID = uid;
+    [self configureForSampleRateLocked:_sampleRate];
+}
+
+- (void)setMuted:(BOOL)muted {
+    std::lock_guard<std::mutex> qlock(_queueMutex);
+    if (_muted == muted) return;
+    _muted = muted;
+    if (muted) {
+        [self stopLocked];
+    } else {
+        [self configureForSampleRateLocked:_sampleRate];
     }
-    std::lock_guard<std::mutex> lock(_bufMutex);
-    _freeBuffers.clear();
-    _inFlight = 0;
+}
+
+- (void)restartAudio {
+    std::lock_guard<std::mutex> qlock(_queueMutex);
+    [self configureForSampleRateLocked:_sampleRate];
+}
+
+- (void)stop {
+    std::lock_guard<std::mutex> qlock(_queueMutex);
+    [self stopLocked];
 }
 
 - (void)dealloc {
     [self stop];
+    [_selectedDeviceUID release];
+    _selectedDeviceUID = nil;
     [super dealloc];
 }
 @end
@@ -668,12 +877,15 @@ private:
 // ============================================================================
 // Bluetooth Discovery + Control Link Bridge + Window Controller
 // ============================================================================
-@interface MirrorWindowController : NSObject <NSWindowDelegate, NSNetServiceDelegate, IOBluetoothRFCOMMChannelDelegate>
+@interface MirrorWindowController : NSObject <NSWindowDelegate, NSNetServiceDelegate, IOBluetoothRFCOMMChannelDelegate, NSMenuDelegate>
 @property (nonatomic, strong) NSWindow *window;
 @property (nonatomic, strong) AirPlayVideoView *videoView;
 @property (nonatomic, strong) MacAudioPlayer *audioPlayer;
 @property (nonatomic, strong) NSNetService *bonjourService;
 @property (nonatomic, strong) IOBluetoothRFCOMMChannel *btChannel;
+@property (nonatomic, strong) NSPopUpButton *audioPopup;
+@property (nonatomic, strong) NSMenu *topAudioMenu;
+@property (nonatomic, strong) NSMutableArray<NSDictionary *> *pcAudioDevices;
 
 @property (nonatomic, assign) NSInteger frameCount;
 @property (nonatomic, assign) NSTimeInterval lastFpsTime;
@@ -688,6 +900,8 @@ private:
 
 - (void)addDiscoveredHost:(NSString *)ip port:(int)port source:(NSString *)src;
 - (std::string)pickTargetHost:(int &)outPort;
+- (void)updatePcAudioDevices:(NSString *)serialized;
+- (int)consumePendingPcAudioSource;
 @end
 
 @implementation MirrorWindowController {
@@ -697,12 +911,15 @@ private:
     int _cliPort;
     BOOL _hasCliHost;
     std::string _lineBuf;
+    std::atomic<int> _pendingPcAudioSrc;
 }
 
 - (instancetype)initWithCliHost:(NSString *)host port:(int)port {
     self = [super init];
     if (self) {
         _audioPlayer = [[MacAudioPlayer alloc] init];
+        _pcAudioDevices = [[NSMutableArray alloc] init];
+        _pendingPcAudioSrc = -999;
         _currentWidth = 1920;
         _currentHeight = 1080;
         _currentCodec = CODEC_H264;
@@ -738,6 +955,8 @@ private:
         _videoView = [[AirPlayVideoView alloc] initWithFrame:[[_window contentView] bounds]];
         [_videoView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
         [[_window contentView] addSubview:_videoView];
+
+        [self setupAudioSwitchBarAndMenus];
 
         [_window makeKeyAndOrderFront:nil];
         _lastFpsTime = [NSDate timeIntervalSinceReferenceDate];
@@ -857,6 +1076,239 @@ private:
     self.btLinked = NO;
     self.btChannel = nil;
     [self refreshTitle];
+}
+
+- (void)setupAudioSwitchBarAndMenus {
+    // 1. Trailing Titlebar "Switch Audio" control right on top window bar
+    NSView *accContainer = [[[NSView alloc] initWithFrame:NSMakeRect(0, 0, 215, 26)] autorelease];
+    _audioPopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(4, 2, 204, 22) pullsDown:NO];
+    _audioPopup.controlSize = NSControlSizeSmall;
+    _audioPopup.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
+    _audioPopup.toolTip = @"Switch PC Audio Output Device or Mute (Press M)";
+    _audioPopup.menu.delegate = self;
+
+    NSTitlebarAccessoryViewController *accVC = [[[NSTitlebarAccessoryViewController alloc] init] autorelease];
+    accVC.view = accContainer;
+    accVC.layoutAttribute = NSLayoutAttributeTrailing;
+    [accContainer addSubview:_audioPopup];
+    [_window addTitlebarAccessoryViewController:accVC];
+
+    // 2. Native macOS Top Menu Bar ("WinMirror AirPlay" + "Audio")
+    NSMenu *mainMenu = [[[NSMenu alloc] initWithTitle:@""] autorelease];
+
+    NSMenuItem *appMenuItem = [[[NSMenuItem alloc] initWithTitle:@"WinMirror AirPlay" action:nil keyEquivalent:@""] autorelease];
+    NSMenu *appMenu = [[[NSMenu alloc] initWithTitle:@"WinMirror AirPlay"] autorelease];
+    NSMenuItem *fsItem = [[[NSMenuItem alloc] initWithTitle:@"Toggle Fullscreen"
+                                                    action:@selector(toggleFullscreenAction:)
+                                             keyEquivalent:@"f"] autorelease];
+    fsItem.target = self;
+    [appMenu addItem:fsItem];
+    [appMenu addItem:[NSMenuItem separatorItem]];
+    NSMenuItem *quitItem = [[[NSMenuItem alloc] initWithTitle:@"Quit WinMirror AirPlay"
+                                                      action:@selector(terminate:)
+                                               keyEquivalent:@"q"] autorelease];
+    [appMenu addItem:quitItem];
+    appMenuItem.submenu = appMenu;
+    [mainMenu addItem:appMenuItem];
+
+    NSMenuItem *audioBarItem = [[[NSMenuItem alloc] initWithTitle:@"Switch Audio" action:nil keyEquivalent:@""] autorelease];
+    _topAudioMenu = [[NSMenu alloc] initWithTitle:@"Switch Audio"];
+    _topAudioMenu.delegate = self;
+    audioBarItem.submenu = _topAudioMenu;
+    [mainMenu addItem:audioBarItem];
+
+    [NSApp setMainMenu:mainMenu];
+    [self refreshAudioSwitchControls];
+
+    // 3. Window keyboard shortcuts (F = Fullscreen, M = Mute Audio)
+    __unsafe_unretained MirrorWindowController *weakSelf = self;
+    [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent *(NSEvent *ev) {
+        if (ev.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagOption | NSEventModifierFlagControl)) {
+            return ev;
+        }
+        NSString *c = [ev.charactersIgnoringModifiers lowercaseString];
+        if ([c isEqualToString:@"f"]) {
+            [weakSelf.window toggleFullScreen:nil];
+            return nil;
+        }
+        if ([c isEqualToString:@"m"]) {
+            [weakSelf toggleAudioMuteAction:nil];
+            return nil;
+        }
+        return ev;
+    }];
+}
+
+- (void)populateAudioMenu:(NSMenu *)menu {
+    [menu removeAllItems];
+    BOOL isPopup = (menu == _audioPopup.menu);
+    NSString *selUid = _audioPlayer.selectedDeviceUID;
+    BOOL isMuted = _audioPlayer.muted;
+    std::vector<MacAudioDeviceInfo> devs = enumerateMacOutputDevices();
+
+    NSString *signalTxt = _audioPlayer.hasActiveSignal ? @"Active" : @"Idle/Silent";
+    NSString *statusTitle = [NSString stringWithFormat:@"PC Audio (%u Hz) • %@",
+                             _audioPlayer.activeSampleRate, signalTxt];
+    NSMenuItem *statusItem = [[[NSMenuItem alloc] initWithTitle:statusTitle action:nil keyEquivalent:@""] autorelease];
+    statusItem.enabled = NO;
+    [menu addItem:statusItem];
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem *muteItem = [[[NSMenuItem alloc] initWithTitle:@"🔇 Mute PC Audio"
+                                                        action:@selector(onAudioMenuAction:)
+                                                 keyEquivalent:@""] autorelease];
+    muteItem.target = self;
+    muteItem.tag = -1;
+    muteItem.state = isMuted ? NSControlStateValueOn : NSControlStateValueOff;
+    [menu addItem:muteItem];
+
+    NSMenuItem *defItem = [[[NSMenuItem alloc] initWithTitle:@"🔊 System Default"
+                                                       action:@selector(onAudioMenuAction:)
+                                                keyEquivalent:@""] autorelease];
+    defItem.target = self;
+    defItem.tag = 0;
+    defItem.state = (!isMuted && selUid.length == 0) ? NSControlStateValueOn : NSControlStateValueOff;
+    [menu addItem:defItem];
+
+    [menu addItem:[NSMenuItem separatorItem]];
+
+    NSInteger selectedIndex = isMuted ? 2 : 3;
+    std::vector<std::pair<AudioDeviceID, NSString *>> mutedDevs;
+
+    for (size_t i = 0; i < devs.size(); ++i) {
+        const auto &d = devs[i];
+        NSMutableString *label = [NSMutableString stringWithFormat:@"🔊 %@", d.name];
+        if (d.isDefault) [label appendString:@" ★"];
+        if (d.isMuted || (d.volume >= 0.0f && d.volume <= 0.01f)) {
+            [label appendString:@" (0% Muted)"];
+            mutedDevs.push_back({ d.deviceId, d.name });
+        } else if (d.volume > 0.0f) {
+            [label appendFormat:@" (%.0f%%)", d.volume * 100.0f];
+        }
+
+        NSMenuItem *item = [[[NSMenuItem alloc] initWithTitle:label
+                                                       action:@selector(onAudioMenuAction:)
+                                                keyEquivalent:@""] autorelease];
+        item.target = self;
+        item.tag = 100 + static_cast<NSInteger>(i);
+        item.representedObject = d.uid;
+        BOOL match = (!isMuted && selUid.length > 0 && [selUid isEqualToString:d.uid]);
+        item.state = match ? NSControlStateValueOn : NSControlStateValueOff;
+        if (match) selectedIndex = menu.numberOfItems;
+        [menu addItem:item];
+    }
+
+    if (_pcAudioDevices.count > 0) {
+        [menu addItem:[NSMenuItem separatorItem]];
+        NSMenuItem *hdr = [[[NSMenuItem alloc] initWithTitle:@"PC Audio Source (Capture)" action:nil keyEquivalent:@""] autorelease];
+        hdr.enabled = NO;
+        [menu addItem:hdr];
+
+        for (NSDictionary *pcDev in _pcAudioDevices) {
+            NSInteger idx = [pcDev[@"index"] integerValue];
+            BOOL sel = [pcDev[@"selected"] boolValue];
+            NSString *devName = pcDev[@"name"];
+            NSString *pcTitle = [NSString stringWithFormat:@"🖥️ %@", devName];
+            NSMenuItem *pcItem = [[[NSMenuItem alloc] initWithTitle:pcTitle
+                                                             action:@selector(onPcAudioSourceAction:)
+                                                      keyEquivalent:@""] autorelease];
+            pcItem.target = self;
+            pcItem.tag = idx;
+            pcItem.state = sel ? NSControlStateValueOn : NSControlStateValueOff;
+            [menu addItem:pcItem];
+        }
+    }
+
+    if (!mutedDevs.empty()) {
+        [menu addItem:[NSMenuItem separatorItem]];
+        for (const auto &md : mutedDevs) {
+            NSString *fixTitle = [NSString stringWithFormat:@"⚡ Unmute %@ (60%%)", md.second];
+            NSMenuItem *fixItem = [[[NSMenuItem alloc] initWithTitle:fixTitle
+                                                              action:@selector(onUnmuteDeviceAction:)
+                                                       keyEquivalent:@""] autorelease];
+            fixItem.target = self;
+            fixItem.tag = static_cast<NSInteger>(md.first);
+            [menu addItem:fixItem];
+        }
+    }
+
+    [menu addItem:[NSMenuItem separatorItem]];
+    NSMenuItem *restartItem = [[[NSMenuItem alloc] initWithTitle:@"🔄 Restart Audio Output"
+                                                           action:@selector(onAudioMenuAction:)
+                                                    keyEquivalent:@""] autorelease];
+    restartItem.target = self;
+    restartItem.tag = -2;
+    [menu addItem:restartItem];
+
+    if (isPopup && selectedIndex < _audioPopup.numberOfItems) {
+        [_audioPopup selectItemAtIndex:selectedIndex];
+    }
+}
+
+- (void)updatePcAudioDevices:(NSString *)serialized {
+    [_pcAudioDevices removeAllObjects];
+    for (NSString *line in [serialized componentsSeparatedByString:@"\n"]) {
+        if (!line.length) continue;
+        NSArray<NSString *> *parts = [line componentsSeparatedByString:@"|"];
+        if (parts.count >= 3) {
+            [_pcAudioDevices addObject:@{
+                @"index": @([parts[0] integerValue]),
+                @"selected": @([parts[1] integerValue] != 0),
+                @"name": parts[2]
+            }];
+        }
+    }
+    [self refreshAudioSwitchControls];
+}
+
+- (int)consumePendingPcAudioSource {
+    return _pendingPcAudioSrc.exchange(-999);
+}
+
+- (void)onPcAudioSourceAction:(NSMenuItem *)sender {
+    _pendingPcAudioSrc.store(static_cast<int>(sender.tag));
+    [self refreshAudioSwitchControls];
+}
+
+- (void)refreshAudioSwitchControls {
+    [self populateAudioMenu:_audioPopup.menu];
+    [self populateAudioMenu:_topAudioMenu];
+}
+
+- (void)menuNeedsUpdate:(NSMenu *)menu {
+    [self populateAudioMenu:menu];
+}
+
+- (void)onAudioMenuAction:(NSMenuItem *)sender {
+    if (sender.tag == -1) {
+        BOOL nextMute = (sender.menu == _topAudioMenu) ? !_audioPlayer.muted : YES;
+        [_audioPlayer setMuted:nextMute];
+    } else if (sender.tag == -2) {
+        [_audioPlayer restartAudio];
+    } else if (sender.tag == 0) {
+        [_audioPlayer switchToDeviceUID:nil];
+    } else if (sender.tag >= 100) {
+        NSString *uid = [sender.representedObject isKindOfClass:[NSString class]] ? sender.representedObject : nil;
+        [_audioPlayer switchToDeviceUID:uid];
+    }
+    [self refreshAudioSwitchControls];
+    [self refreshTitle];
+}
+
+- (void)onUnmuteDeviceAction:(NSMenuItem *)sender {
+    unmuteMacDevice(static_cast<AudioDeviceID>(sender.tag), 0.6f);
+    [_audioPlayer restartAudio];
+    [self refreshAudioSwitchControls];
+}
+
+- (void)toggleAudioMuteAction:(id)sender {
+    [_audioPlayer setMuted:!_audioPlayer.muted];
+    [self refreshAudioSwitchControls];
+    [self refreshTitle];
+}
+
+- (void)toggleFullscreenAction:(id)sender {
+    [_window toggleFullScreen:nil];
 }
 
 - (void)refreshTitle {
@@ -1004,6 +1456,15 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
         auto lastPing = std::chrono::steady_clock::now();
 
         while (*running) {
+            int reqAudioIdx = [controller consumePendingPcAudioSource];
+            if (reqAudioIdx != -999) {
+                PacketHeader req = {};
+                req.magic = PACKET_MAGIC;
+                req.type = PACKET_TYPE_SET_AUDIO_SRC;
+                req.extra1 = static_cast<uint32_t>(static_cast<int32_t>(reqAudioIdx));
+                send(sock, &req, sizeof(req), 0);
+            }
+
             // Periodic 1Hz RTT ping
             auto now = std::chrono::steady_clock::now();
             if (now - lastPing >= std::chrono::seconds(1)) {
@@ -1063,6 +1524,14 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
                 }
             } else if (hdr.type == PACKET_TYPE_AUDIO && hdr.payloadSize > 0) {
                 [controller.audioPlayer playPcm:payloadBuf.data() length:hdr.payloadSize sampleRate:hdr.extra1];
+            } else if (hdr.type == PACKET_TYPE_AUDIO_DEVICES && hdr.payloadSize > 0) {
+                std::string raw(reinterpret_cast<const char *>(payloadBuf.data()), hdr.payloadSize);
+                NSString *nsDevs = [NSString stringWithUTF8String:raw.c_str()];
+                if (nsDevs.length > 0) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [controller updatePcAudioDevices:nsDevs];
+                    });
+                }
             } else if (hdr.type == PACKET_TYPE_CURSOR && hdr.payloadSize >= sizeof(CursorPayload)) {
                 CursorPayload meta = {};
                 memcpy(&meta, payloadBuf.data(), sizeof(CursorPayload));

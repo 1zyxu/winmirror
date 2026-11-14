@@ -3,8 +3,8 @@
 #include <algorithm>
 #include <cstring>
 
-AirPlayServer::AirPlayServer(AudioBuffer& audioBuffer, int port)
-    : m_audioBuffer(audioBuffer), m_port(port) {}
+AirPlayServer::AirPlayServer(int port)
+    : m_port(port) {}
 
 AirPlayServer::~AirPlayServer() {
     stop();
@@ -237,13 +237,45 @@ void AirPlayServer::broadcastCursor(const CursorPayload& meta, const std::vector
     }
 }
 
-void AirPlayServer::notifyAudioAvailable() {
+void AirPlayServer::broadcastAudio(const uint8_t* pcm, size_t size, uint32_t sampleRate, uint16_t channels) {
+    if (!pcm || size == 0) return;
+
+    auto pkt = std::make_shared<AudioPacket>();
+    pkt->pcm.assign(pcm, pcm + size);
+    pkt->sampleRate = sampleRate;
+    pkt->channels = channels;
+
     std::lock_guard<std::mutex> clock(m_clientsMutex);
     for (auto& c : m_clients) {
         if (!c->alive) continue;
         {
             std::lock_guard<std::mutex> qlock(c->queueMutex);
-            c->hasAudioPending = true;
+            c->audioQueue.push_back(pkt);
+            if (c->audioQueue.size() > 16) {
+                c->audioQueue.pop_front();
+            }
+        }
+        c->cv.notify_one();
+    }
+}
+
+void AirPlayServer::setAudioSourceHandler(std::function<void(int)> handler) {
+    std::lock_guard<std::mutex> ilock(m_infoMutex);
+    m_onAudioSourceReq = std::move(handler);
+}
+
+void AirPlayServer::broadcastAudioDevices(const std::string& serializedDevices) {
+    {
+        std::lock_guard<std::mutex> ilock(m_infoMutex);
+        m_audioDevices = serializedDevices;
+    }
+
+    std::lock_guard<std::mutex> clock(m_clientsMutex);
+    for (auto& c : m_clients) {
+        if (!c->alive) continue;
+        {
+            std::lock_guard<std::mutex> qlock(c->queueMutex);
+            c->hasAudioListPending = true;
         }
         c->cv.notify_one();
     }
@@ -276,6 +308,13 @@ void AirPlayServer::clientRecvLoop(std::shared_ptr<ClientSession> session) {
         if (hdr.type == PACKET_TYPE_KEYFRAME_REQ) {
             std::lock_guard<std::mutex> ilock(m_infoMutex);
             if (m_onKeyframeReq) m_onKeyframeReq();
+        } else if (hdr.type == PACKET_TYPE_SET_AUDIO_SRC) {
+            std::function<void(int)> fn;
+            {
+                std::lock_guard<std::mutex> ilock(m_infoMutex);
+                fn = m_onAudioSourceReq;
+            }
+            if (fn) fn(static_cast<int32_t>(hdr.extra1));
         } else if (hdr.type == PACKET_TYPE_PING) {
             {
                 std::lock_guard<std::mutex> qlock(session->queueMutex);
@@ -295,12 +334,14 @@ void AirPlayServer::runClient(std::shared_ptr<ClientSession> session) {
     HelloPayload hello = {};
     CursorPayload initCursor = {};
     std::vector<uint8_t> initCursorBgra;
+    std::string initAudioDevs;
     bool sendInitCursor = false;
     std::function<void()> keyReq;
 
     {
         std::lock_guard<std::mutex> lock(m_infoMutex);
         hello = m_hello;
+        initAudioDevs = m_audioDevices;
         keyReq = m_onKeyframeReq;
         if (m_hasCursor && !m_lastCursorBgra.empty()) {
             initCursor = m_lastCursor;
@@ -312,11 +353,17 @@ void AirPlayServer::runClient(std::shared_ptr<ClientSession> session) {
 
     if (!sendPacket(session->sock, PACKET_TYPE_HELLO, 0, 0, 0, &hello, sizeof(hello))) {
         session->alive = false;
-    } else if (sendInitCursor) {
-        std::vector<uint8_t> payload(sizeof(CursorPayload) + initCursorBgra.size());
-        memcpy(payload.data(), &initCursor, sizeof(CursorPayload));
-        memcpy(payload.data() + sizeof(CursorPayload), initCursorBgra.data(), initCursorBgra.size());
-        sendPacket(session->sock, PACKET_TYPE_CURSOR, 0, 0, 0, payload.data(), static_cast<uint32_t>(payload.size()));
+    } else {
+        if (!initAudioDevs.empty()) {
+            sendPacket(session->sock, PACKET_TYPE_AUDIO_DEVICES, 0, 0, 0,
+                       initAudioDevs.data(), static_cast<uint32_t>(initAudioDevs.size()));
+        }
+        if (sendInitCursor) {
+            std::vector<uint8_t> payload(sizeof(CursorPayload) + initCursorBgra.size());
+            memcpy(payload.data(), &initCursor, sizeof(CursorPayload));
+            memcpy(payload.data() + sizeof(CursorPayload), initCursorBgra.data(), initCursorBgra.size());
+            sendPacket(session->sock, PACKET_TYPE_CURSOR, 0, 0, 0, payload.data(), static_cast<uint32_t>(payload.size()));
+        }
     }
 
     if (session->alive && keyReq) {
@@ -325,7 +372,7 @@ void AirPlayServer::runClient(std::shared_ptr<ClientSession> session) {
 
     std::thread recvThread(&AirPlayServer::clientRecvLoop, this, session);
 
-    std::vector<std::vector<uint8_t>> audioChunks;
+    std::deque<std::shared_ptr<const AudioPacket>> audioBatch;
     std::vector<uint8_t> cursorBuf;
 
     while (session->alive && m_running) {
@@ -333,8 +380,8 @@ void AirPlayServer::runClient(std::shared_ptr<ClientSession> session) {
         CursorPayload curMeta = {};
         std::vector<uint8_t> curBgra;
         bool sendCur = false;
-        bool sendAud = false;
         bool sendHello = false;
+        bool sendAudioList = false;
         bool sendPong = false;
         uint32_t pongE1 = 0, pongE2 = 0;
 
@@ -342,8 +389,9 @@ void AirPlayServer::runClient(std::shared_ptr<ClientSession> session) {
             std::unique_lock<std::mutex> lock(session->queueMutex);
             session->cv.wait_for(lock, std::chrono::milliseconds(50), [&]() {
                 return !session->alive || !m_running ||
-                       !session->videoQueue.empty() || session->hasCursorPending ||
-                       session->hasAudioPending || session->hasHelloPending || session->hasPongPending;
+                       !session->videoQueue.empty() || !session->audioQueue.empty() ||
+                       session->hasCursorPending || session->hasHelloPending ||
+                       session->hasAudioListPending || session->hasPongPending;
             });
 
             if (!session->alive || !m_running) break;
@@ -351,6 +399,10 @@ void AirPlayServer::runClient(std::shared_ptr<ClientSession> session) {
             if (session->hasHelloPending) {
                 session->hasHelloPending = false;
                 sendHello = true;
+            }
+            if (session->hasAudioListPending) {
+                session->hasAudioListPending = false;
+                sendAudioList = true;
             }
             if (session->hasPongPending) {
                 session->hasPongPending = false;
@@ -364,9 +416,8 @@ void AirPlayServer::runClient(std::shared_ptr<ClientSession> session) {
                 session->hasCursorPending = false;
                 sendCur = true;
             }
-            if (session->hasAudioPending) {
-                session->hasAudioPending = false;
-                sendAud = true;
+            if (!session->audioQueue.empty()) {
+                audioBatch.swap(session->audioQueue);
             }
             if (!session->videoQueue.empty()) {
                 videoFrame = std::move(session->videoQueue.front());
@@ -382,6 +433,20 @@ void AirPlayServer::runClient(std::shared_ptr<ClientSession> session) {
             }
             if (!sendPacket(session->sock, PACKET_TYPE_HELLO, 0, 0, 0, &latestHello, sizeof(latestHello))) {
                 break;
+            }
+        }
+
+        if (sendAudioList) {
+            std::string devsCopy;
+            {
+                std::lock_guard<std::mutex> ilock(m_infoMutex);
+                devsCopy = m_audioDevices;
+            }
+            if (!devsCopy.empty()) {
+                if (!sendPacket(session->sock, PACKET_TYPE_AUDIO_DEVICES, 0, 0, 0,
+                                devsCopy.data(), static_cast<uint32_t>(devsCopy.size()))) {
+                    break;
+                }
             }
         }
 
@@ -404,22 +469,18 @@ void AirPlayServer::runClient(std::shared_ptr<ClientSession> session) {
             }
         }
 
-        // Priority 2: Audio PCM (zero delay)
-        if (sendAud) {
-            uint32_t sr = 48000;
-            uint16_t ch = 2;
-            audioChunks.clear();
-            if (m_audioBuffer.popAll(audioChunks, sr, ch)) {
-                for (const auto& chunk : audioChunks) {
-                    if (!sendPacket(session->sock, PACKET_TYPE_AUDIO, 0, sr,
-                                    static_cast<uint32_t>(ch) | (16u << 16),
-                                    chunk.data(), static_cast<uint32_t>(chunk.size()))) {
-                        session->alive = false;
-                        break;
-                    }
+        // Priority 2: Audio PCM (per-client queue, zero delay)
+        if (!audioBatch.empty()) {
+            for (const auto& pkt : audioBatch) {
+                if (!sendPacket(session->sock, PACKET_TYPE_AUDIO, 0, pkt->sampleRate,
+                                static_cast<uint32_t>(pkt->channels) | (16u << 16),
+                                pkt->pcm.data(), static_cast<uint32_t>(pkt->pcm.size()))) {
+                    session->alive = false;
+                    break;
                 }
-                if (!session->alive) break;
             }
+            audioBatch.clear();
+            if (!session->alive) break;
         }
 
         // Priority 3: Hardware Encoded Video Frame

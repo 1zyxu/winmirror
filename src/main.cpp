@@ -144,14 +144,20 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    AudioBuffer audioBuffer;
-    AirPlayServer server(audioBuffer, port);
+    AirPlayServer server(port);
 
     AudioCapture audioCapture;
-    if (audioCapture.init([&audioBuffer, &server](const uint8_t* pcm, size_t size, uint32_t sr, uint16_t ch) {
-        audioBuffer.push(pcm, size, sr, ch);
-        server.notifyAudioAvailable();
-    })) {
+    if (audioCapture.init(
+        [&server](const uint8_t* pcm, size_t size, uint32_t sr, uint16_t ch) {
+            server.broadcastAudio(pcm, size, sr, ch);
+        },
+        [&server](const std::string& devs) {
+            server.broadcastAudioDevices(devs);
+        })) {
+        server.broadcastAudioDevices(audioCapture.getDeviceListSerialized());
+        server.setAudioSourceHandler([&audioCapture](int index) {
+            audioCapture.setSourceDeviceIndex(index);
+        });
         audioCapture.start();
     } else {
         std::cout << "[AudioCapture] Note: WASAPI loopback not active." << std::endl;

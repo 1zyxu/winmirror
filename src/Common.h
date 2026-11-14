@@ -21,7 +21,7 @@
 #include <chrono>
 #include <memory>
 
-#define WINMIRROR_VERSION "2.0.0"
+#define WINMIRROR_VERSION "2.0.1"
 #define WINMIRROR_REPO "1zyxu/winmirror"
 #define AIRPLAY_PORT 7001
 #define BEACON_PORT 8889
@@ -45,13 +45,15 @@ enum ColorProfile : uint8_t {
 };
 
 enum PacketType : uint16_t {
-    PACKET_TYPE_HELLO        = 0x01,
-    PACKET_TYPE_VIDEO        = 0x02,
-    PACKET_TYPE_AUDIO        = 0x03,
-    PACKET_TYPE_CURSOR       = 0x04,
-    PACKET_TYPE_PING         = 0x05,
-    PACKET_TYPE_PONG         = 0x06,
-    PACKET_TYPE_KEYFRAME_REQ = 0x07
+    PACKET_TYPE_HELLO         = 0x01,
+    PACKET_TYPE_VIDEO         = 0x02,
+    PACKET_TYPE_AUDIO         = 0x03,
+    PACKET_TYPE_CURSOR        = 0x04,
+    PACKET_TYPE_PING          = 0x05,
+    PACKET_TYPE_PONG          = 0x06,
+    PACKET_TYPE_KEYFRAME_REQ  = 0x07,
+    PACKET_TYPE_AUDIO_DEVICES = 0x08,
+    PACKET_TYPE_SET_AUDIO_SRC = 0x09
 };
 
 #pragma pack(push, 1)
@@ -102,34 +104,8 @@ struct EncodedFrame {
     uint64_t seq = 0;
 };
 
-class AudioBuffer {
-public:
-    void push(const uint8_t* pcm, size_t size, uint32_t sampleRate, uint16_t channels) {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_sampleRate = sampleRate;
-        m_channels = channels;
-        m_chunks.emplace_back(pcm, pcm + size);
-        if (m_chunks.size() > 16) {
-            m_chunks.pop_front();
-        }
-    }
-
-    bool popAll(std::vector<std::vector<uint8_t>>& out, uint32_t& sampleRate, uint16_t& channels) {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_chunks.empty()) return false;
-        sampleRate = m_sampleRate;
-        channels = m_channels;
-        out.reserve(m_chunks.size());
-        for (auto& chunk : m_chunks) {
-            out.push_back(std::move(chunk));
-        }
-        m_chunks.clear();
-        return true;
-    }
-
-private:
-    std::mutex m_mutex;
-    std::deque<std::vector<uint8_t>> m_chunks;
-    uint32_t m_sampleRate = 48000;
-    uint16_t m_channels = 2;
+struct AudioPacket {
+    std::vector<uint8_t> pcm;
+    uint32_t sampleRate = 48000;
+    uint16_t channels = 2;
 };
