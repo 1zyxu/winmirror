@@ -1,6 +1,7 @@
 #include "ScreenCapture.h"
 #include <iostream>
 #include <cmath>
+#include <algorithm>
 
 #ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
 #define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 ((DPI_AWARENESS_CONTEXT)-4)
@@ -27,55 +28,35 @@ void ScreenCapture::initHalfTable() {
         uint32_t exp = (h >> 10) & 0x1f;
         uint32_t mant = h & 0x3ff;
 
-        if (sign) {
-            s_halfToByteTable[i] = 0;
+        if (sign || exp == 31) {
+            s_halfToByteTable[i] = sign ? 0 : 255;
             continue;
         }
 
-        if (exp == 31) {
-            s_halfToByteTable[i] = 255;
-            continue;
-        }
-
-        float f = 0.0f;
-        if (exp == 0) {
-            f = (mant / 1024.0f) * std::ldexp(1.0f, -14);
-        } else {
-            f = (1.0f + mant / 1024.0f) * std::ldexp(1.0f, static_cast<int>(exp) - 15);
-        }
+        float f = (exp == 0)
+            ? (mant / 1024.0f) * std::ldexp(1.0f, -14)
+            : (1.0f + mant / 1024.0f) * std::ldexp(1.0f, static_cast<int>(exp) - 15);
 
         if (f <= 0.0f) {
             s_halfToByteTable[i] = 0;
-        } else if (f >= 1.0f) {
-            s_halfToByteTable[i] = 255;
         } else {
-            // Standard sRGB gamma 2.2 curve
-            float srgb = std::pow(f, 1.0f / 2.2f);
-            s_halfToByteTable[i] = static_cast<uint8_t>(srgb * 255.0f + 0.5f);
+            // Smooth Reinhard tone mapping for CPU scRGB HDR fallback -> sRGB [0..255]
+            float mapped = f / (1.0f + 0.15f * f);
+            if (mapped > 1.0f) mapped = 1.0f;
+            float srgb = std::pow(mapped, 1.0f / 2.2f);
+            s_halfToByteTable[i] = static_cast<uint8_t>(std::min(255.0f, srgb * 255.0f + 0.5f));
         }
     }
 
     s_tableInitialized = true;
 }
 
-void ScreenCapture::drawCursor(uint8_t* bgra, uint32_t width, uint32_t height, int32_t screenLeft, int32_t screenTop) {
-    CURSORINFO ci = { sizeof(CURSORINFO) };
-    if (!GetCursorInfo(&ci)) return;
-    if (!(ci.flags & CURSOR_SHOWING) || !ci.hCursor) return;
-
-    ICONINFO ii = {};
-    if (!GetIconInfo(ci.hCursor, &ii)) return;
-
-    int cx = GetSystemMetrics(SM_CXCURSOR);
-    int cy = GetSystemMetrics(SM_CYCURSOR);
-    if (cx <= 0) cx = 32;
-    if (cy <= 0) cy = 32;
-
-    int cursorX = (ci.ptScreenPos.x - screenLeft) - ii.xHotspot;
-    int cursorY = (ci.ptScreenPos.y - screenTop) - ii.yHotspot;
+void ScreenCapture::extractCursorBgra(HCURSOR hCursor, int cx, int cy, std::vector<uint8_t>& outPremulBgra) {
+    outPremulBgra.assign(static_cast<size_t>(cx) * cy * 4, 0);
 
     HDC hdcScreen = GetDC(NULL);
-    HDC hdcMem = CreateCompatibleDC(hdcScreen);
+    HDC hdcBlack = CreateCompatibleDC(hdcScreen);
+    HDC hdcWhite = CreateCompatibleDC(hdcScreen);
 
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -85,51 +66,60 @@ void ScreenCapture::drawCursor(uint8_t* bgra, uint32_t width, uint32_t height, i
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
 
-    void* pBits = nullptr;
-    HBITMAP hbmMem = CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
-    HBITMAP hbmOld = static_cast<HBITMAP>(SelectObject(hdcMem, hbmMem));
+    uint32_t* pBlack = nullptr;
+    uint32_t* pWhite = nullptr;
+    HBITMAP hbmBlack = CreateDIBSection(hdcBlack, &bmi, DIB_RGB_COLORS, reinterpret_cast<void**>(&pBlack), NULL, 0);
+    HBITMAP hbmWhite = CreateDIBSection(hdcWhite, &bmi, DIB_RGB_COLORS, reinterpret_cast<void**>(&pWhite), NULL, 0);
 
-    uint32_t* pPixels = reinterpret_cast<uint32_t*>(pBits);
+    if (hbmBlack && hbmWhite && pBlack && pWhite) {
+        HBITMAP oldB = static_cast<HBITMAP>(SelectObject(hdcBlack, hbmBlack));
+        HBITMAP oldW = static_cast<HBITMAP>(SelectObject(hdcWhite, hbmWhite));
 
-    // 1. Copy real background from bgra underneath the cursor
-    for (int y = 0; y < cy; ++y) {
-        int sy = cursorY + y;
-        for (int x = 0; x < cx; ++x) {
-            int sx = cursorX + x;
-            if (sy >= 0 && sy < static_cast<int>(height) && sx >= 0 && sx < static_cast<int>(width)) {
-                size_t idx = (static_cast<size_t>(sy) * width + sx) * 4;
-                pPixels[y * cx + x] = bgra[idx] | (bgra[idx + 1] << 8) | (bgra[idx + 2] << 16) | (0xFF << 24);
+        const size_t nPix = static_cast<size_t>(cx) * cy;
+        for (size_t i = 0; i < nPix; ++i) {
+            pBlack[i] = 0x00000000;
+            pWhite[i] = 0x00FFFFFF;
+        }
+
+        // Drawing onto pure black and pure white separates premultiplied color and true alpha/XOR mask cleanly
+        DrawIconEx(hdcBlack, 0, 0, hCursor, cx, cy, 0, NULL, DI_NORMAL);
+        DrawIconEx(hdcWhite, 0, 0, hCursor, cx, cy, 0, NULL, DI_NORMAL);
+
+        for (size_t i = 0; i < nPix; ++i) {
+            uint32_t b = pBlack[i];
+            uint32_t w = pWhite[i];
+
+            int bB = b & 0xFF, bG = (b >> 8) & 0xFF, bR = (b >> 16) & 0xFF;
+            int wB = w & 0xFF, wG = (w >> 8) & 0xFF, wR = (w >> 16) & 0xFF;
+
+            uint8_t outB = 0, outG = 0, outR = 0, outA = 0;
+            if (wB < bB || wG < bG || wR < bR) {
+                // XOR-inverted pixel (e.g. text I-beam): make visible white
+                outB = 255; outG = 255; outR = 255; outA = 230;
             } else {
-                pPixels[y * cx + x] = 0;
+                int diff = ((wB - bB) + (wG - bG) + (wR - bR)) / 3;
+                int a = std::max(0, std::min(255, 255 - diff));
+                outA = static_cast<uint8_t>(a);
+                outB = static_cast<uint8_t>(std::min(a, bB));
+                outG = static_cast<uint8_t>(std::min(a, bG));
+                outR = static_cast<uint8_t>(std::min(a, bR));
             }
+
+            outPremulBgra[i * 4 + 0] = outB;
+            outPremulBgra[i * 4 + 1] = outG;
+            outPremulBgra[i * 4 + 2] = outR;
+            outPremulBgra[i * 4 + 3] = outA;
         }
+
+        SelectObject(hdcBlack, oldB);
+        SelectObject(hdcWhite, oldW);
     }
 
-    // 2. Windows draws and blends the icon natively with full alpha/mask support
-    DrawIconEx(hdcMem, 0, 0, ci.hCursor, cx, cy, 0, NULL, DI_NORMAL);
-
-    // 3. Write blended pixels back to bgra buffer
-    for (int y = 0; y < cy; ++y) {
-        int sy = cursorY + y;
-        if (sy < 0 || sy >= static_cast<int>(height)) continue;
-        for (int x = 0; x < cx; ++x) {
-            int sx = cursorX + x;
-            if (sx < 0 || sx >= static_cast<int>(width)) continue;
-            uint32_t c = pPixels[y * cx + x];
-            size_t idx = (static_cast<size_t>(sy) * width + sx) * 4;
-            bgra[idx + 0] = c & 0xFF;         // B
-            bgra[idx + 1] = (c >> 8) & 0xFF;  // G
-            bgra[idx + 2] = (c >> 16) & 0xFF; // R
-        }
-    }
-
-    SelectObject(hdcMem, hbmOld);
-    DeleteObject(hbmMem);
-    DeleteDC(hdcMem);
+    if (hbmBlack) DeleteObject(hbmBlack);
+    if (hbmWhite) DeleteObject(hbmWhite);
+    DeleteDC(hdcBlack);
+    DeleteDC(hdcWhite);
     ReleaseDC(NULL, hdcScreen);
-
-    if (ii.hbmColor) DeleteObject(ii.hbmColor);
-    if (ii.hbmMask) DeleteObject(ii.hbmMask);
 }
 
 ScreenCapture::ScreenCapture() = default;
@@ -143,22 +133,23 @@ bool ScreenCapture::init() {
 
     HMODULE hUser32 = GetModuleHandleA("user32.dll");
     if (hUser32) {
-        auto setDpiAwareness = (PFN_SetProcessDpiAwarenessContext)GetProcAddress(hUser32, "SetProcessDpiAwarenessContext");
+        auto setDpiAwareness = reinterpret_cast<PFN_SetProcessDpiAwarenessContext>(
+            GetProcAddress(hUser32, "SetProcessDpiAwarenessContext"));
         if (setDpiAwareness) {
             setDpiAwareness(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         }
     }
 
     if (initDxgi()) {
-        std::cout << "[ScreenCapture] Initialized DXGI Desktop Duplication (GPU Capture: "
-                  << m_width << "x" << m_height << ")" << std::endl;
+        std::cout << "[ScreenCapture] DXGI GPU Capture (" << m_width << "x" << m_height
+                  << ", " << (isHdrOutput() ? "HDR16/10-bit" : "SDR 8-bit BGRA") << ")" << std::endl;
         m_useDxgi = true;
         return true;
     }
 
     std::cout << "[ScreenCapture] Falling back to GDI capture..." << std::endl;
     if (initGdi()) {
-        std::cout << "[ScreenCapture] Initialized GDI Capture (" << m_width << "x" << m_height << ")" << std::endl;
+        std::cout << "[ScreenCapture] GDI Capture (" << m_width << "x" << m_height << ")" << std::endl;
         m_useDxgi = false;
         return true;
     }
@@ -182,27 +173,50 @@ bool ScreenCapture::initDxgi() {
     };
     D3D_FEATURE_LEVEL chosenLevel;
 
+    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
     HRESULT hr = D3D11CreateDevice(
         nullptr,
         D3D_DRIVER_TYPE_HARDWARE,
         nullptr,
-        0,
+        flags,
         featureLevels,
-        sizeof(featureLevels) / sizeof(featureLevels[0]),
+        ARRAYSIZE(featureLevels),
         D3D11_SDK_VERSION,
         &m_d3dDevice,
         &chosenLevel,
         &m_d3dContext
     );
 
+    if (FAILED(hr)) {
+        // Retry without VIDEO_SUPPORT flag just in case driver rejects it
+        hr = D3D11CreateDevice(
+            nullptr,
+            D3D_DRIVER_TYPE_HARDWARE,
+            nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            featureLevels,
+            ARRAYSIZE(featureLevels),
+            D3D11_SDK_VERSION,
+            &m_d3dDevice,
+            &chosenLevel,
+            &m_d3dContext
+        );
+    }
+
     if (FAILED(hr)) return false;
 
+    ID3D10Multithread* mt = nullptr;
+    if (SUCCEEDED(m_d3dDevice->QueryInterface(__uuidof(ID3D10Multithread), reinterpret_cast<void**>(&mt)))) {
+        mt->SetMultithreadProtected(TRUE);
+        mt->Release();
+    }
+
     IDXGIDevice* dxgiDevice = nullptr;
-    hr = m_d3dDevice->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDevice);
+    hr = m_d3dDevice->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgiDevice));
     if (FAILED(hr)) { cleanupDxgi(); return false; }
 
     IDXGIAdapter* dxgiAdapter = nullptr;
-    hr = dxgiDevice->GetParent(__uuidof(IDXGIAdapter), (void**)&dxgiAdapter);
+    hr = dxgiDevice->GetParent(__uuidof(IDXGIAdapter), reinterpret_cast<void**>(&dxgiAdapter));
     dxgiDevice->Release();
     if (FAILED(hr)) { cleanupDxgi(); return false; }
 
@@ -211,12 +225,46 @@ bool ScreenCapture::initDxgi() {
     dxgiAdapter->Release();
     if (FAILED(hr)) { cleanupDxgi(); return false; }
 
+    IDXGIOutput6* dxgiOutput6 = nullptr;
+    if (SUCCEEDED(dxgiOutput->QueryInterface(__uuidof(IDXGIOutput6), reinterpret_cast<void**>(&dxgiOutput6)))) {
+        DXGI_OUTPUT_DESC1 desc1 = {};
+        if (SUCCEEDED(dxgiOutput6->GetDesc1(&desc1))) {
+            m_isHdrOutput = (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+        }
+        dxgiOutput6->Release();
+    }
+
+    // Prefer DuplicateOutput1 so Windows hands us native HDR scRGB R16G16B16A16_FLOAT when Windows HDR is ON
+    IDXGIOutput5* dxgiOutput5 = nullptr;
+    if (SUCCEEDED(dxgiOutput->QueryInterface(__uuidof(IDXGIOutput5), reinterpret_cast<void**>(&dxgiOutput5)))) {
+        DXGI_OUTPUT_DESC outputDesc = {};
+        dxgiOutput5->GetDesc(&outputDesc);
+        m_screenLeft = outputDesc.DesktopCoordinates.left;
+        m_screenTop = outputDesc.DesktopCoordinates.top;
+        m_width = outputDesc.DesktopCoordinates.right - outputDesc.DesktopCoordinates.left;
+        m_height = outputDesc.DesktopCoordinates.bottom - outputDesc.DesktopCoordinates.top;
+
+        const DXGI_FORMAT supportedFormats[] = {
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            DXGI_FORMAT_R10G10B10A2_UNORM,
+            DXGI_FORMAT_B8G8R8A8_UNORM
+        };
+        hr = dxgiOutput5->DuplicateOutput1(m_d3dDevice, 0, ARRAYSIZE(supportedFormats), supportedFormats, &m_duplication);
+        dxgiOutput5->Release();
+        dxgiOutput->Release();
+        if (SUCCEEDED(hr) && m_duplication) {
+            return true;
+        }
+        cleanupDxgi();
+        return false;
+    }
+
     IDXGIOutput1* dxgiOutput1 = nullptr;
-    hr = dxgiOutput->QueryInterface(__uuidof(IDXGIOutput1), (void**)&dxgiOutput1);
+    hr = dxgiOutput->QueryInterface(__uuidof(IDXGIOutput1), reinterpret_cast<void**>(&dxgiOutput1));
     dxgiOutput->Release();
     if (FAILED(hr)) { cleanupDxgi(); return false; }
 
-    DXGI_OUTPUT_DESC outputDesc;
+    DXGI_OUTPUT_DESC outputDesc = {};
     dxgiOutput1->GetDesc(&outputDesc);
     m_screenLeft = outputDesc.DesktopCoordinates.left;
     m_screenTop = outputDesc.DesktopCoordinates.top;
@@ -231,54 +279,32 @@ bool ScreenCapture::initDxgi() {
 }
 
 void ScreenCapture::cleanupDxgi() {
+    if (m_gpuCopyTex) { m_gpuCopyTex->Release(); m_gpuCopyTex = nullptr; }
     if (m_stagingTexture) { m_stagingTexture->Release(); m_stagingTexture = nullptr; }
     if (m_duplication) { m_duplication->Release(); m_duplication = nullptr; }
     if (m_d3dContext) { m_d3dContext->Release(); m_d3dContext = nullptr; }
     if (m_d3dDevice) { m_d3dDevice->Release(); m_d3dDevice = nullptr; }
 }
 
-bool ScreenCapture::capture(RawFrame& outFrame) {
+bool ScreenCapture::acquireFrame() {
     if (m_useDxgi) {
-        if (captureDxgi(outFrame)) {
-            return true;
-        }
+        if (acquireDxgi()) return true;
         if (!m_duplication) {
             initDxgi();
         }
         return false;
     }
-
-    if (captureGdi(outFrame)) {
-        drawCursor(outFrame.bgra.data(), outFrame.width, outFrame.height, 0, 0);
-        return true;
-    }
-    return false;
+    return acquireGdi();
 }
 
-bool ScreenCapture::captureDxgi(RawFrame& outFrame) {
+bool ScreenCapture::acquireDxgi() {
     if (!m_duplication || !m_d3dContext) return false;
 
-    DXGI_OUTDUPL_FRAME_INFO frameInfo;
+    DXGI_OUTDUPL_FRAME_INFO frameInfo = {};
     IDXGIResource* desktopResource = nullptr;
 
     HRESULT hr = m_duplication->AcquireNextFrame(16, &frameInfo, &desktopResource);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-        CURSORINFO ci = { sizeof(CURSORINFO) };
-        if (GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING) && ci.hCursor) {
-            if (ci.ptScreenPos.x != m_lastCursorPos.x || ci.ptScreenPos.y != m_lastCursorPos.y || ci.hCursor != m_lastHCursor) {
-                if (!m_lastCleanBgra.empty()) {
-                    m_lastCursorPos = ci.ptScreenPos;
-                    m_lastHCursor = ci.hCursor;
-
-                    outFrame.width = m_width;
-                    outFrame.height = m_height;
-                    outFrame.pitch = m_width * 4;
-                    outFrame.bgra = m_lastCleanBgra;
-                    drawCursor(outFrame.bgra.data(), m_width, m_height, m_screenLeft, m_screenTop);
-                    return true;
-                }
-            }
-        }
         return false;
     }
     if (FAILED(hr)) {
@@ -286,28 +312,71 @@ bool ScreenCapture::captureDxgi(RawFrame& outFrame) {
         return false;
     }
 
+    // Check if frame contains actual screen image updates vs cursor-only update
+    if (frameInfo.LastPresentTime.QuadPart == 0 && m_gpuCopyTex != nullptr) {
+        desktopResource->Release();
+        m_duplication->ReleaseFrame();
+        return false;
+    }
+
     ID3D11Texture2D* desktopImage = nullptr;
-    hr = desktopResource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&desktopImage);
+    hr = desktopResource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&desktopImage));
     desktopResource->Release();
     if (FAILED(hr)) {
         m_duplication->ReleaseFrame();
         return false;
     }
 
-    D3D11_TEXTURE2D_DESC actualDesc;
+    D3D11_TEXTURE2D_DESC actualDesc = {};
     desktopImage->GetDesc(&actualDesc);
 
-    // Recreate staging texture if resolution or pixel format changed (e.g. 4K, 1080p, HDR Float16)
-    if (!m_stagingTexture || m_width != actualDesc.Width || m_height != actualDesc.Height || m_format != actualDesc.Format) {
-        if (m_stagingTexture) {
-            m_stagingTexture->Release();
-            m_stagingTexture = nullptr;
-        }
+    if (!m_gpuCopyTex || m_width != actualDesc.Width || m_height != actualDesc.Height || m_format != actualDesc.Format) {
+        if (m_gpuCopyTex) { m_gpuCopyTex->Release(); m_gpuCopyTex = nullptr; }
+        if (m_stagingTexture) { m_stagingTexture->Release(); m_stagingTexture = nullptr; }
 
         m_width = actualDesc.Width;
         m_height = actualDesc.Height;
         m_format = actualDesc.Format;
 
+        D3D11_TEXTURE2D_DESC gpuDesc = {};
+        gpuDesc.Width = m_width;
+        gpuDesc.Height = m_height;
+        gpuDesc.MipLevels = 1;
+        gpuDesc.ArraySize = 1;
+        gpuDesc.Format = m_format;
+        gpuDesc.SampleDesc.Count = 1;
+        gpuDesc.Usage = D3D11_USAGE_DEFAULT;
+        gpuDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        hr = m_d3dDevice->CreateTexture2D(&gpuDesc, nullptr, &m_gpuCopyTex);
+        if (FAILED(hr)) {
+            desktopImage->Release();
+            m_duplication->ReleaseFrame();
+            return false;
+        }
+    }
+
+    m_d3dContext->CopyResource(m_gpuCopyTex, desktopImage);
+    desktopImage->Release();
+    m_duplication->ReleaseFrame();
+    return true;
+}
+
+bool ScreenCapture::copyCurrentFrameToBgra(RawFrame& outFrame) {
+    if (!m_useDxgi) {
+        if (!m_gdiBits || m_width == 0 || m_height == 0) return false;
+        outFrame.width = m_width;
+        outFrame.height = m_height;
+        outFrame.pitch = m_width * 4;
+        size_t totalBytes = static_cast<size_t>(m_width) * m_height * 4;
+        if (outFrame.bgra.size() != totalBytes) outFrame.bgra.resize(totalBytes);
+        memcpy(outFrame.bgra.data(), m_gdiBits, totalBytes);
+        return true;
+    }
+
+    if (!m_gpuCopyTex || !m_d3dContext) return false;
+
+    if (!m_stagingTexture) {
         D3D11_TEXTURE2D_DESC desc = {};
         desc.Width = m_width;
         desc.Height = m_height;
@@ -317,22 +386,17 @@ bool ScreenCapture::captureDxgi(RawFrame& outFrame) {
         desc.SampleDesc.Count = 1;
         desc.Usage = D3D11_USAGE_STAGING;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-
-        hr = m_d3dDevice->CreateTexture2D(&desc, nullptr, &m_stagingTexture);
-        if (FAILED(hr)) {
-            desktopImage->Release();
-            m_duplication->ReleaseFrame();
+        if (FAILED(m_d3dDevice->CreateTexture2D(&desc, nullptr, &m_stagingTexture))) {
             return false;
         }
     }
 
-    m_d3dContext->CopyResource(m_stagingTexture, desktopImage);
-    desktopImage->Release();
-    m_duplication->ReleaseFrame();
+    m_d3dContext->CopyResource(m_stagingTexture, m_gpuCopyTex);
 
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    hr = m_d3dContext->Map(m_stagingTexture, 0, D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(hr)) return false;
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(m_d3dContext->Map(m_stagingTexture, 0, D3D11_MAP_READ, 0, &mapped))) {
+        return false;
+    }
 
     outFrame.width = m_width;
     outFrame.height = m_height;
@@ -347,11 +411,9 @@ bool ScreenCapture::captureDxgi(RawFrame& outFrame) {
     uint8_t* dstRow = outFrame.bgra.data();
 
     if (m_format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
-        // Windows 11 HDR (scRGB 64-bit float) -> 32-bit BGRA (True 1:1 pixel mapping)
         for (uint32_t y = 0; y < m_height; ++y) {
             const HalfRGBA* srcPixel = reinterpret_cast<const HalfRGBA*>(srcRow);
             uint8_t* dstPixel = dstRow;
-
             for (uint32_t x = 0; x < m_width; ++x) {
                 dstPixel[0] = s_halfToByteTable[srcPixel[x].b];
                 dstPixel[1] = s_halfToByteTable[srcPixel[x].g];
@@ -359,30 +421,40 @@ bool ScreenCapture::captureDxgi(RawFrame& outFrame) {
                 dstPixel[3] = 255;
                 dstPixel += 4;
             }
-
             srcRow += mapped.RowPitch;
             dstRow += (m_width * 4);
         }
     } else if (m_format == DXGI_FORMAT_R10G10B10A2_UNORM) {
-        // 10-bit HDR -> 32-bit BGRA
         for (uint32_t y = 0; y < m_height; ++y) {
             const uint32_t* srcPixel = reinterpret_cast<const uint32_t*>(srcRow);
             uint8_t* dstPixel = dstRow;
-
             for (uint32_t x = 0; x < m_width; ++x) {
                 uint32_t p = srcPixel[x];
-                dstPixel[0] = static_cast<uint8_t>((p >> 20) & 0x3FF) >> 2;
-                dstPixel[1] = static_cast<uint8_t>((p >> 10) & 0x3FF) >> 2;
-                dstPixel[2] = static_cast<uint8_t>(p & 0x3FF) >> 2;
+                dstPixel[0] = static_cast<uint8_t>(((p >> 20) & 0x3FF) >> 2); // B
+                dstPixel[1] = static_cast<uint8_t>(((p >> 10) & 0x3FF) >> 2); // G
+                dstPixel[2] = static_cast<uint8_t>((p & 0x3FF) >> 2);         // R
                 dstPixel[3] = 255;
                 dstPixel += 4;
             }
-
+            srcRow += mapped.RowPitch;
+            dstRow += (m_width * 4);
+        }
+    } else if (m_format == DXGI_FORMAT_R8G8B8A8_UNORM || m_format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
+        for (uint32_t y = 0; y < m_height; ++y) {
+            const uint8_t* sp = srcRow;
+            uint8_t* dp = dstRow;
+            for (uint32_t x = 0; x < m_width; ++x) {
+                dp[0] = sp[2]; // B
+                dp[1] = sp[1]; // G
+                dp[2] = sp[0]; // R
+                dp[3] = 255;
+                sp += 4;
+                dp += 4;
+            }
             srcRow += mapped.RowPitch;
             dstRow += (m_width * 4);
         }
     } else {
-        // Standard SDR 8-bit B8G8R8A8_UNORM
         size_t rowBytes = static_cast<size_t>(m_width) * 4;
         for (uint32_t y = 0; y < m_height; ++y) {
             memcpy(dstRow, srcRow, rowBytes);
@@ -392,17 +464,65 @@ bool ScreenCapture::captureDxgi(RawFrame& outFrame) {
     }
 
     m_d3dContext->Unmap(m_stagingTexture, 0);
+    return true;
+}
 
-    // Save clean desktop frame for smooth mouse interpolation
-    m_lastCleanBgra = outFrame.bgra;
-
+bool ScreenCapture::pollCursor(CursorPayload& outMeta, std::vector<uint8_t>& outBgra, bool forceBitmap) {
     CURSORINFO ci = { sizeof(CURSORINFO) };
-    if (GetCursorInfo(&ci)) {
-        m_lastCursorPos = ci.ptScreenPos;
-        m_lastHCursor = ci.hCursor;
+    if (!GetCursorInfo(&ci)) return false;
+
+    bool visible = (ci.flags & CURSOR_SHOWING) && (ci.hCursor != nullptr);
+    int relX = ci.ptScreenPos.x - m_screenLeft;
+    int relY = ci.ptScreenPos.y - m_screenTop;
+
+    bool shapeChanged = (ci.hCursor != m_lastHCursor) || (forceBitmap && m_cachedCursorBgra.empty());
+    bool posChanged = (ci.ptScreenPos.x != m_lastCursorPos.x) ||
+                      (ci.ptScreenPos.y != m_lastCursorPos.y) ||
+                      (visible != m_lastCursorVisible);
+
+    if (!forceBitmap && !shapeChanged && !posChanged) {
+        return false;
     }
 
-    drawCursor(outFrame.bgra.data(), outFrame.width, outFrame.height, m_screenLeft, m_screenTop);
+    if (visible && (shapeChanged || (forceBitmap && m_cachedCursorBgra.empty()))) {
+        ICONINFO ii = {};
+        if (GetIconInfo(ci.hCursor, &ii)) {
+            m_cursorHotX = static_cast<int16_t>(ii.xHotspot);
+            m_cursorHotY = static_cast<int16_t>(ii.yHotspot);
+            int cx = GetSystemMetrics(SM_CXCURSOR);
+            int cy = GetSystemMetrics(SM_CYCURSOR);
+            if (cx <= 0 || cx > 128) cx = 32;
+            if (cy <= 0 || cy > 128) cy = 32;
+            m_cursorW = static_cast<uint16_t>(cx);
+            m_cursorH = static_cast<uint16_t>(cy);
+            extractCursorBgra(ci.hCursor, cx, cy, m_cachedCursorBgra);
+            if (ii.hbmColor) DeleteObject(ii.hbmColor);
+            if (ii.hbmMask) DeleteObject(ii.hbmMask);
+        }
+    }
+
+    m_lastCursorPos = ci.ptScreenPos;
+    m_lastHCursor = ci.hCursor;
+    m_lastCursorVisible = visible;
+
+    outMeta.x = relX;
+    outMeta.y = relY;
+    outMeta.screenW = m_width;
+    outMeta.screenH = m_height;
+    outMeta.hotspotX = m_cursorHotX;
+    outMeta.hotspotY = m_cursorHotY;
+    outMeta.width = m_cursorW;
+    outMeta.height = m_cursorH;
+    outMeta.visible = visible ? 1 : 0;
+
+    if ((shapeChanged || forceBitmap) && !m_cachedCursorBgra.empty()) {
+        outMeta.hasBitmap = 1;
+        outBgra = m_cachedCursorBgra;
+    } else {
+        outMeta.hasBitmap = 0;
+        outBgra.clear();
+    }
+
     return true;
 }
 
@@ -411,6 +531,8 @@ bool ScreenCapture::initGdi() {
 
     m_width = GetSystemMetrics(SM_CXSCREEN);
     m_height = GetSystemMetrics(SM_CYSCREEN);
+    m_screenLeft = 0;
+    m_screenTop = 0;
 
     m_hdcScreen = GetDC(NULL);
     if (!m_hdcScreen) return false;
@@ -440,22 +562,7 @@ void ScreenCapture::cleanupGdi() {
     m_gdiBits = nullptr;
 }
 
-bool ScreenCapture::captureGdi(RawFrame& outFrame) {
+bool ScreenCapture::acquireGdi() {
     if (!m_hdcMem || !m_gdiBits) return false;
-
-    if (!BitBlt(m_hdcMem, 0, 0, m_width, m_height, m_hdcScreen, 0, 0, SRCCOPY)) {
-        return false;
-    }
-
-    outFrame.width = m_width;
-    outFrame.height = m_height;
-    outFrame.pitch = m_width * 4;
-
-    size_t totalBytes = static_cast<size_t>(m_width) * m_height * 4;
-    if (outFrame.bgra.size() != totalBytes) {
-        outFrame.bgra.resize(totalBytes);
-    }
-
-    memcpy(outFrame.bgra.data(), m_gdiBits, totalBytes);
-    return true;
+    return BitBlt(m_hdcMem, 0, 0, m_width, m_height, m_hdcScreen, 0, 0, SRCCOPY) == TRUE;
 }

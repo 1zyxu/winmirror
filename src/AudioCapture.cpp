@@ -55,11 +55,11 @@ bool AudioCapture::init(AudioDataCallback callback) {
     hr = m_audioClient->GetMixFormat(&m_pwfx);
     if (FAILED(hr)) { cleanup(); return false; }
 
-    // Initialize in loopback mode
+    // Initialize in low-latency loopback mode
     hr = m_audioClient->Initialize(
         AUDCLNT_SHAREMODE_SHARED,
         AUDCLNT_STREAMFLAGS_LOOPBACK,
-        10000000, // 1 second buffer
+        2000000, // 200ms buffer for low latency
         0,
         m_pwfx,
         nullptr
@@ -78,7 +78,8 @@ void AudioCapture::start() {
     m_audioClient->Start();
     m_running = true;
     m_thread = std::thread(&AudioCapture::captureLoop, this);
-    std::cout << "[AudioCapture] WASAPI Loopback Audio streaming started (48kHz Stereo)" << std::endl;
+    std::cout << "[AudioCapture] WASAPI Loopback started (" << m_pwfx->nSamplesPerSec
+              << " Hz Stereo)" << std::endl;
 }
 
 void AudioCapture::stop() {
@@ -103,6 +104,7 @@ void AudioCapture::captureLoop() {
          reinterpret_cast<WAVEFORMATEXTENSIBLE*>(m_pwfx)->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
 
     const int channels = m_pwfx->nChannels;
+    const uint32_t sampleRate = m_pwfx->nSamplesPerSec;
 
     while (m_running) {
         UINT32 packetLength = 0;
@@ -110,7 +112,7 @@ void AudioCapture::captureLoop() {
         if (FAILED(hr)) break;
 
         if (packetLength == 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
             continue;
         }
 
@@ -122,12 +124,10 @@ void AudioCapture::captureLoop() {
             hr = m_captureClient->GetBuffer(&pData, &numFrames, &flags, nullptr, nullptr);
             if (FAILED(hr)) break;
 
-            if (numFrames > 0) {
+            if (numFrames > 0 && !(flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
                 pcmOut.resize(numFrames * 2);
 
-                if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-                    std::fill(pcmOut.begin(), pcmOut.end(), 0);
-                } else if (isFloat) {
+                if (isFloat) {
                     const float* fData = reinterpret_cast<const float*>(pData);
                     for (UINT32 i = 0; i < numFrames; ++i) {
                         float left = fData[i * channels + 0];
@@ -140,7 +140,6 @@ void AudioCapture::captureLoop() {
                         pcmOut[i * 2 + 1] = static_cast<int16_t>(right * 32767.0f);
                     }
                 } else {
-                    // Standard 16-bit PCM
                     const int16_t* sData = reinterpret_cast<const int16_t*>(pData);
                     for (UINT32 i = 0; i < numFrames; ++i) {
                         pcmOut[i * 2 + 0] = sData[i * channels + 0];
@@ -149,7 +148,7 @@ void AudioCapture::captureLoop() {
                 }
 
                 if (m_callback) {
-                    m_callback(reinterpret_cast<const uint8_t*>(pcmOut.data()), pcmOut.size() * sizeof(int16_t));
+                    m_callback(reinterpret_cast<const uint8_t*>(pcmOut.data()), pcmOut.size() * sizeof(int16_t), sampleRate, 2);
                 }
             }
 

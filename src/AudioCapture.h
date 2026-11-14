@@ -7,7 +7,7 @@
 #include <atomic>
 #include <functional>
 
-typedef std::function<void(const uint8_t* pcmData, size_t size)> AudioDataCallback;
+typedef std::function<void(const uint8_t* pcmData, size_t size, uint32_t sampleRate, uint16_t channels)> AudioDataCallback;
 
 class AudioCapture {
 public:
@@ -19,6 +19,7 @@ public:
     void stop();
 
     bool isRunning() const { return m_running.load(); }
+    uint32_t getSampleRate() const { return m_pwfx ? m_pwfx->nSamplesPerSec : 48000; }
 
 private:
     void captureLoop();

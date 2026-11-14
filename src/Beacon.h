@@ -6,7 +6,7 @@
 
 class Beacon {
 public:
-    Beacon(int httpPort = DEFAULT_PORT, int beaconPort = BEACON_PORT);
+    Beacon(int airplayPort = AIRPLAY_PORT, int beaconPort = BEACON_PORT);
     ~Beacon();
 
     bool start();

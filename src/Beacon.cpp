@@ -46,7 +46,7 @@ void Beacon::beaconLoop() {
     bcastAddr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
 
     char message[256];
-    int len = snprintf(message, sizeof(message), "WINMIRROR:%d:%s", m_httpPort, hostname);
+    int len = snprintf(message, sizeof(message), "WINMIRROR2:%d:%s", m_httpPort, hostname);
 
     while (m_running) {
         sendto(m_sock, message, len, 0, reinterpret_cast<sockaddr*>(&bcastAddr), sizeof(bcastAddr));

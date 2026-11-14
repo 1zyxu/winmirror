@@ -1,28 +1,26 @@
 #include "Common.h"
 #include "ScreenCapture.h"
 #include "Encoder.h"
-#include "HttpServer.h"
+#include "AirPlayServer.h"
+#include "BluetoothBridge.h"
 #include "Beacon.h"
 #include "Updater.h"
 #include "AudioCapture.h"
 
 #include <iostream>
 #include <iomanip>
+#include <sstream>
 #include <thread>
 #include <chrono>
 #include <iphlpapi.h>
 #include <mmsystem.h>
 #include <shellapi.h>
 
-#pragma comment(lib, "iphlpapi.lib")
-#pragma comment(lib, "winmm.lib")
-#pragma comment(lib, "shell32.lib")
-
 static std::atomic<bool> g_running{true};
 
 static BOOL WINAPI consoleCtrlHandler(DWORD signal) {
     if (signal == CTRL_C_EVENT || signal == CTRL_CLOSE_EVENT) {
-        std::cout << "\n\n[WinMirror] Stopping server..." << std::endl;
+        std::cout << "\n\n[WinMirror AirPlay] Stopping..." << std::endl;
         g_running = false;
         return TRUE;
     }
@@ -41,9 +39,7 @@ static bool isRunningAsAdmin() {
 }
 
 static void ensureAdminPrivileges(int argc, char* argv[]) {
-    if (isRunningAsAdmin()) {
-        return;
-    }
+    if (isRunningAsAdmin()) return;
 
     char exePath[MAX_PATH];
     GetModuleFileNameA(NULL, exePath, MAX_PATH);
@@ -60,12 +56,13 @@ static void ensureAdminPrivileges(int argc, char* argv[]) {
     }
 }
 
-static void printLocalIps(int port) {
-    std::cout << "========================================================" << std::endl;
-    std::cout << "  WINMIRROR Pro v" << WINMIRROR_VERSION << " -- 4K Ultra-Low Latency & Audio" << std::endl;
-    std::cout << "========================================================" << std::endl;
-    std::cout << "Available Endpoints (USB & LAN/Wi-Fi):" << std::endl;
+static std::string collectLocalIpsAndPrint(int port) {
+    std::cout << "==================================================================" << std::endl;
+    std::cout << "  WINMIRROR AirPlay v" << WINMIRROR_VERSION << " -- GPU HEVC/H264 HDR + Bluetooth" << std::endl;
+    std::cout << "==================================================================" << std::endl;
+    std::cout << "AirPlay Discovery Transports (USB-C / Router LAN / Wi-Fi / BT):" << std::endl;
 
+    std::ostringstream ipsCsv;
     ULONG bufLen = sizeof(IP_ADAPTER_INFO);
     std::vector<BYTE> buf(bufLen);
     PIP_ADAPTER_INFO pAdapter = reinterpret_cast<PIP_ADAPTER_INFO>(buf.data());
@@ -75,18 +72,22 @@ static void printLocalIps(int port) {
         pAdapter = reinterpret_cast<PIP_ADAPTER_INFO>(buf.data());
     }
 
+    bool firstIp = true;
     if (GetAdaptersInfo(pAdapter, &bufLen) == NO_ERROR) {
         while (pAdapter) {
             std::string ip = pAdapter->IpAddressList.IpAddress.String;
             if (ip != "0.0.0.0" && ip != "127.0.0.1") {
-                std::cout << "  -> http://" << ip << ":" << port
+                std::cout << "  -> airplay://" << ip << ":" << port
                           << " [" << pAdapter->Description << "]" << std::endl;
+                if (!firstIp) ipsCsv << ",";
+                ipsCsv << ip;
+                firstIp = false;
             }
             pAdapter = pAdapter->Next;
         }
     }
-    std::cout << "  -> http://localhost:" << port << " [Loopback / USB Port Forward]" << std::endl;
-    std::cout << "========================================================\n" << std::endl;
+    std::cout << "==================================================================\n" << std::endl;
+    return ipsCsv.str();
 }
 
 int main(int argc, char* argv[]) {
@@ -95,8 +96,7 @@ int main(int argc, char* argv[]) {
     SetConsoleCtrlHandler(consoleCtrlHandler, TRUE);
     timeBeginPeriod(1);
 
-    int port = DEFAULT_PORT;
-    float quality = 0.75f;
+    int port = AIRPLAY_PORT;
     int targetFps = 60;
     bool checkUpdate = true;
 
@@ -104,8 +104,6 @@ int main(int argc, char* argv[]) {
         std::string arg = argv[i];
         if (arg == "--port" && i + 1 < argc) {
             port = std::stoi(argv[++i]);
-        } else if (arg == "--quality" && i + 1 < argc) {
-            quality = std::stof(argv[++i]);
         } else if (arg == "--fps" && i + 1 < argc) {
             targetFps = std::stoi(argv[++i]);
         } else if (arg == "--no-update") {
@@ -122,7 +120,7 @@ int main(int argc, char* argv[]) {
         }).detach();
     }
 
-    printLocalIps(port);
+    std::string ipsCsv = collectLocalIpsAndPrint(port);
 
     ScreenCapture capture;
     if (!capture.init()) {
@@ -131,28 +129,48 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Acquire initial frame cleanly so exact pixel format (HDR float16 / RGB10 / BGRA8) is settled
+    for (int attempt = 0; attempt < 20 && !capture.acquireFrame(); ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    }
+
     Encoder encoder;
-    if (!encoder.init(quality)) {
-        std::cerr << "[Error] Failed to initialize WIC encoder!" << std::endl;
+    if (!encoder.init(capture.getD3DDevice(), capture.getD3DContext(),
+                      capture.getWidth(), capture.getHeight(),
+                      capture.getPixelFormat(), static_cast<uint32_t>(targetFps),
+                      capture.isHdrOutput())) {
+        std::cerr << "[Error] Failed to initialize Media Foundation H.264/HEVC Encoder!" << std::endl;
         timeEndPeriod(1);
         return 1;
     }
 
-    FrameBuffer frameBuffer;
     AudioBuffer audioBuffer;
+    AirPlayServer server(audioBuffer, port);
 
     AudioCapture audioCapture;
-    if (audioCapture.init([&audioBuffer](const uint8_t* pcm, size_t size) {
-        audioBuffer.push(pcm, size);
+    if (audioCapture.init([&audioBuffer, &server](const uint8_t* pcm, size_t size, uint32_t sr, uint16_t ch) {
+        audioBuffer.push(pcm, size, sr, ch);
+        server.notifyAudioAvailable();
     })) {
         audioCapture.start();
     } else {
-        std::cout << "[AudioCapture] Note: WASAPI loopback not available or muted." << std::endl;
+        std::cout << "[AudioCapture] Note: WASAPI loopback not active." << std::endl;
     }
 
-    HttpServer server(frameBuffer, audioBuffer, port);
+    BluetoothBridge btBridge(port, [&encoder]() {
+        encoder.requestKeyframe();
+    });
+    bool btReady = btBridge.start(ipsCsv, encoder.getWidth(), encoder.getHeight(),
+                                  encoder.isHdrActive(), encoder.getEncoderName());
+
+    server.setStreamInfo(encoder.getWidth(), encoder.getHeight(), static_cast<uint16_t>(targetFps),
+                         encoder.getCodec(), encoder.getColorProfile(),
+                         audioCapture.getSampleRate(), btReady,
+                         [&encoder]() { encoder.requestKeyframe(); });
+
     if (!server.start()) {
-        std::cerr << "[Error] Failed to start HTTP server on port " << port << std::endl;
+        std::cerr << "[Error] Failed to start AirPlay server on port " << port << std::endl;
+        btBridge.stop();
         timeEndPeriod(1);
         return 1;
     }
@@ -160,58 +178,120 @@ int main(int argc, char* argv[]) {
     Beacon beacon(port);
     beacon.start();
 
-    std::cout << "[WinMirror] Ready & Streaming (Press Ctrl+C to stop)\n" << std::endl;
+    std::cout << "[AirPlay] Streaming Ready (Run winmirror_mac on Mac, Ctrl+C to stop)\n" << std::endl;
 
-    RawFrame rawFrame;
-    std::vector<uint8_t> jpegData;
+    auto startTime = std::chrono::steady_clock::now();
+    auto lastReport = startTime;
+    auto lastEncodeTime = startTime;
+    uint32_t encodedFrames = 0;
+    uint64_t frameSeq = 0;
 
-    auto lastReport = std::chrono::steady_clock::now();
-    uint32_t capturedFrames = 0;
+    const auto minFrameGap = std::chrono::microseconds(1000000 / targetFps);
+    const auto cursorTick = std::chrono::milliseconds(8); // 120Hz cursor responsiveness
 
-    const auto frameDuration = std::chrono::microseconds(1000000 / targetFps);
+    RawFrame cpuFallbackFrame;
+    std::vector<uint8_t> annexB;
+    std::vector<uint8_t> cursorBgra;
+    CursorPayload cursorMeta = {};
+
+    if (capture.pollCursor(cursorMeta, cursorBgra, true)) {
+        server.broadcastCursor(cursorMeta, cursorBgra);
+    }
 
     while (g_running) {
-        auto frameStart = std::chrono::steady_clock::now();
+        auto loopStart = std::chrono::steady_clock::now();
 
-        bool hasFrame = capture.capture(rawFrame);
-        if (hasFrame) {
-            if (encoder.encodeBgraToJpeg(rawFrame.bgra.data(), rawFrame.width, rawFrame.height, jpegData)) {
-                frameBuffer.push(std::move(jpegData), rawFrame.width, rawFrame.height);
-                capturedFrames++;
-            }
-        } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        // 1. Hardware mouse cursor tracking (120 Hz zero-lag cursor overlay)
+        if (capture.pollCursor(cursorMeta, cursorBgra, false)) {
+            server.broadcastCursor(cursorMeta, cursorBgra);
         }
 
+        // 2. Capture & GPU Hardware Video Encode (at up to targetFps)
+        if (loopStart - lastEncodeTime >= minFrameGap) {
+            bool gotNewScreen = capture.acquireFrame();
+            if (gotNewScreen) {
+                // Re-initialize encoder seamlessly if resolution or HDR mode switched (e.g. launching fullscreen game)
+                if ((capture.getWidth() & ~1u) != encoder.getWidth() ||
+                    (capture.getHeight() & ~1u) != encoder.getHeight() ||
+                    capture.getPixelFormat() != encoder.getSrcFormat()) {
+                    encoder.init(capture.getD3DDevice(), capture.getD3DContext(),
+                                 capture.getWidth(), capture.getHeight(),
+                                 capture.getPixelFormat(), static_cast<uint32_t>(targetFps),
+                                 capture.isHdrOutput());
+                    server.setStreamInfo(encoder.getWidth(), encoder.getHeight(), static_cast<uint16_t>(targetFps),
+                                         encoder.getCodec(), encoder.getColorProfile(),
+                                         audioCapture.getSampleRate(), btBridge.isRadioAvailable(),
+                                         [&encoder]() { encoder.requestKeyframe(); });
+                    btBridge.updateMetadata(ipsCsv, encoder.getWidth(), encoder.getHeight(),
+                                            encoder.isHdrActive(), encoder.getEncoderName());
+                }
+            }
+
+            if (server.getActiveClients() > 0 && (gotNewScreen || encoder.hasKeyframeRequest())) {
+                uint64_t ptsUs = std::chrono::duration_cast<std::chrono::microseconds>(loopStart - startTime).count();
+                bool isKey = false;
+                bool encoded = false;
+
+                if (capture.isDxgiActive() && capture.getGpuTexture()) {
+                    encoded = encoder.encodeGpuFrame(capture.getGpuTexture(), ptsUs, annexB, isKey);
+                }
+                if (!encoded && capture.copyCurrentFrameToBgra(cpuFallbackFrame)) {
+                    encoded = encoder.encodeBgraCpu(cpuFallbackFrame.bgra.data(),
+                                                    cpuFallbackFrame.width, cpuFallbackFrame.height,
+                                                    ptsUs, annexB, isKey);
+                }
+
+                if (encoded && !annexB.empty()) {
+                    auto pkt = std::make_shared<EncodedFrame>();
+                    pkt->data = std::move(annexB);
+                    pkt->width = encoder.getWidth();
+                    pkt->height = encoder.getHeight();
+                    pkt->ptsMs = static_cast<uint32_t>(ptsUs / 1000ULL);
+                    pkt->codec = static_cast<uint8_t>(encoder.getCodec());
+                    pkt->colorProfile = static_cast<uint8_t>(encoder.getColorProfile());
+                    pkt->isKeyframe = isKey;
+                    pkt->seq = ++frameSeq;
+
+                    server.broadcastVideo(std::move(pkt));
+                    encodedFrames++;
+                }
+                lastEncodeTime = loopStart;
+            }
+        }
+
+        // 3. Single-line live console status
         auto now = std::chrono::steady_clock::now();
         if (now - lastReport >= std::chrono::milliseconds(500)) {
             float elapsedSec = std::chrono::duration<float>(now - lastReport).count();
-            float currentFps = capturedFrames / elapsedSec;
+            float currentFps = encodedFrames / elapsedSec;
 
-            std::cout << "\r[WinMirror] Live FPS: " << std::fixed << std::setprecision(1) << std::setw(4) << currentFps
-                      << " | Viewers: " << server.getActiveClients()
-                      << " | GPU: " << (capture.isDxgiActive() ? "DXGI GPU" : "GDI")
-                      << " | Res: " << capture.getWidth() << "x" << capture.getHeight()
-                      << " | Audio: " << (audioCapture.isRunning() ? "Active" : "Off")
+            std::cout << "\r[AirPlay] " << std::fixed << std::setprecision(1) << std::setw(4) << currentFps
+                      << " FPS | " << (encoder.getCodec() == CODEC_HEVC ? "HEVC" : "H264")
+                      << (encoder.isHdrActive() ? " HDR10" : " SDR")
+                      << " | " << encoder.getWidth() << "x" << encoder.getHeight()
+                      << " | BT:" << btBridge.getStatusText()
+                      << " | Aud:" << (audioCapture.isRunning() ? (std::to_string(audioCapture.getSampleRate() / 1000) + "k") : "Off")
+                      << " | Viewers:" << server.getActiveClients()
                       << "   " << std::flush;
 
-            capturedFrames = 0;
+            encodedFrames = 0;
             lastReport = now;
         }
 
-        auto frameTime = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - frameStart);
-        if (frameTime < frameDuration) {
-            std::this_thread::sleep_for(frameDuration - frameTime);
+        auto spent = std::chrono::steady_clock::now() - loopStart;
+        if (spent < cursorTick) {
+            std::this_thread::sleep_for(cursorTick - spent);
         }
     }
 
     beacon.stop();
+    btBridge.stop();
     audioCapture.stop();
     server.stop();
     capture.cleanup();
     encoder.cleanup();
     timeEndPeriod(1);
 
-    std::cout << "\n[WinMirror] Shutdown complete." << std::endl;
+    std::cout << "\n[WinMirror AirPlay] Stopped." << std::endl;
     return 0;
 }

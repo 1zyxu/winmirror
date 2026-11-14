@@ -1,25 +1,96 @@
 #pragma once
 
 #include "Common.h"
-#include <wincodec.h>
+#include "ScreenCapture.h"
+#include <d3d11.h>
+#include <d3d11_1.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mftransform.h>
+#include <icodecapi.h>
+#include <string>
 #include <vector>
+#include <atomic>
 
 class Encoder {
 public:
     Encoder();
     ~Encoder();
 
-    bool init(float quality = 0.75f);
+    bool init(ID3D11Device* d3dDevice, ID3D11DeviceContext* d3dContext,
+              uint32_t width, uint32_t height, DXGI_FORMAT srcFormat,
+              uint32_t fps, bool isHdrDisplay);
     void cleanup();
 
-    bool encodeBgraToJpeg(const uint8_t* bgra, uint32_t width, uint32_t height, std::vector<uint8_t>& outJpeg);
+    // Encodes from GPU texture (zero-copy GPU VideoProcessor color space conversion) or CPU BGRA fallback.
+    bool encodeGpuFrame(ID3D11Texture2D* gpuSrcTex, uint64_t ptsUs,
+                        std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe);
+    bool encodeBgraCpu(const uint8_t* bgra, uint32_t width, uint32_t height, uint64_t ptsUs,
+                       std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe);
 
-    void setQuality(float q) { m_quality = (q < 0.1f) ? 0.1f : (q > 1.0f ? 1.0f : q); }
-    float getQuality() const { return m_quality; }
+    void requestKeyframe() { m_forceKeyframe.store(true); }
+    bool hasKeyframeRequest() const { return m_forceKeyframe.load(); }
+
+    uint32_t getWidth() const { return m_width; }
+    uint32_t getHeight() const { return m_height; }
+    VideoCodec getCodec() const { return m_codec; }
+    ColorProfile getColorProfile() const { return m_colorProfile; }
+    bool isHdrActive() const { return m_colorProfile == COLOR_HDR10_PQ; }
+    const std::string& getEncoderName() const { return m_encoderName; }
+    DXGI_FORMAT getSrcFormat() const { return m_srcFormat; }
 
 private:
-    float m_quality = 0.75f;
-    IWICImagingFactory* m_factory = nullptr;
-    bool m_coInitialized = false;
-    std::vector<uint8_t> m_bgrBuffer;
+    bool initVideoProcessor(DXGI_FORMAT srcFormat, bool useP010);
+    void cleanupVideoProcessor();
+
+    bool tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwareOnly, const char* label);
+    void cleanupMft();
+
+    bool convertGpuToPackedYuv(ID3D11Texture2D* gpuSrcTex, std::vector<uint8_t>& outYuv);
+    static void convertBgraToNv12Studio(const uint8_t* bgra, uint32_t width, uint32_t height, std::vector<uint8_t>& outNv12);
+
+    bool encodePackedYuv(const std::vector<uint8_t>& yuvData, uint64_t ptsUs,
+                         std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe);
+    bool collectSyncOutput(std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe);
+    bool pumpAsyncEvents(std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe, bool waitOutput);
+
+    ID3D11Device* m_d3dDevice = nullptr;      // non-owning
+    ID3D11DeviceContext* m_d3dContext = nullptr; // non-owning
+
+    uint32_t m_width = 0;
+    uint32_t m_height = 0;
+    uint32_t m_fps = 60;
+    DXGI_FORMAT m_srcFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+    bool m_isHdrSource = false;
+    bool m_useP010 = false;
+
+    VideoCodec m_codec = CODEC_H264;
+    ColorProfile m_colorProfile = COLOR_SDR_BT709;
+    std::string m_encoderName = "Uninitialized";
+    std::atomic<bool> m_forceKeyframe{true};
+
+    // D3D11 Video Processor (GPU HDR/SDR color conversion -> NV12/P010)
+    ID3D11VideoDevice* m_videoDevice = nullptr;
+    ID3D11VideoContext* m_videoContext = nullptr;
+    ID3D11VideoContext1* m_videoContext1 = nullptr;
+    ID3D11VideoProcessorEnumerator* m_vpEnum = nullptr;
+    ID3D11VideoProcessor* m_vp = nullptr;
+    ID3D11Texture2D* m_vpOutTex = nullptr;
+    ID3D11VideoProcessorOutputView* m_vpOutView = nullptr;
+    ID3D11Texture2D* m_vpStagingTex = nullptr;
+    bool m_hasVideoProcessor = false;
+
+    // Media Foundation Transform
+    bool m_mfStarted = false;
+    IMFTransform* m_mft = nullptr;
+    ICodecAPI* m_codecApi = nullptr;
+    IMFMediaEventGenerator* m_eventGen = nullptr;
+    bool m_isAsync = false;
+    int m_needInputCount = 0;
+    DWORD m_inStreamId = 0;
+    DWORD m_outStreamId = 0;
+    DWORD m_outBufSize = 0;
+
+    std::vector<uint8_t> m_yuvBuffer;
+    std::vector<uint8_t> m_seqHeader; // Cached SPS/PPS(/VPS) if needed
 };

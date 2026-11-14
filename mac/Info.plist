@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.winmirror.airplay</string>
+    <key>CFBundleName</key>
+    <string>WinMirror AirPlay</string>
+    <key>CFBundleVersion</key>
+    <string>2.0.0</string>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>WinMirror AirPlay uses Bluetooth to discover your Windows PC and establish an AirPlay-style control link.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>WinMirror AirPlay uses Wi-Fi/LAN/USB Bonjour discovery to stream low-latency 4K HDR video and audio from your Windows PC.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_winmirror._tcp</string>
+    </array>
+</dict>
+</plist>
