@@ -14,7 +14,6 @@
 #include <chrono>
 #include <iphlpapi.h>
 #include <mmsystem.h>
-#include <shellapi.h>
 
 static std::atomic<bool> g_running{true};
 
@@ -38,21 +37,11 @@ static bool isRunningAsAdmin() {
     return isAdmin == TRUE;
 }
 
-static void ensureAdminPrivileges(int argc, char* argv[]) {
-    if (isRunningAsAdmin()) return;
-
-    char exePath[MAX_PATH];
-    GetModuleFileNameA(NULL, exePath, MAX_PATH);
-
-    std::string args;
-    for (int i = 1; i < argc; ++i) {
-        args += "\"" + std::string(argv[i]) + "\" ";
-    }
-
-    std::cout << "[WinMirror] Elevating to Administrator..." << std::endl;
-    HINSTANCE hInst = ShellExecuteA(NULL, "runas", exePath, args.empty() ? NULL : args.c_str(), NULL, SW_SHOWNORMAL);
-    if ((INT_PTR)hInst > 32) {
-        exit(0);
+static void cleanupPreviousUpdateBinary() {
+    char exePath[MAX_PATH] = {};
+    if (GetModuleFileNameA(NULL, exePath, MAX_PATH) > 0) {
+        std::string oldExe = std::string(exePath) + ".old.exe";
+        DeleteFileA(oldExe.c_str());
     }
 }
 
@@ -91,7 +80,10 @@ static std::string collectLocalIpsAndPrint(int port) {
 }
 
 int main(int argc, char* argv[]) {
-    ensureAdminPrivileges(argc, argv);
+    cleanupPreviousUpdateBinary();
+    if (!isRunningAsAdmin()) {
+        std::cout << "[WinMirror] Note: Running without Administrator rights (some elevated apps may not mirror)." << std::endl;
+    }
 
     SetConsoleCtrlHandler(consoleCtrlHandler, TRUE);
     SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);

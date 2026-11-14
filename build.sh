@@ -11,7 +11,7 @@ fi
 
 build_win() {
     echo "==> Building winmirror.exe (Windows x86_64 AirPlay HEVC/H.264 HDR + Bluetooth)..."
-    "$ZIG" c++ -target x86_64-windows-gnu -O3 -std=c++17 \
+    "$ZIG" c++ -target x86_64-windows-gnu -O3 -std=c++17 -Wl,-s \
         src/main.cpp \
         src/ScreenCapture.cpp \
         src/Encoder.cpp \
@@ -21,8 +21,9 @@ build_win() {
         src/Beacon.cpp \
         src/Updater.cpp \
         -ld3d11 -ldxgi -lmfplat -lmf -lmfuuid -lwmcodecdspuuid -lole32 -loleaut32 \
-        -lgdi32 -luser32 -lws2_32 -lbthprops -lwinhttp -liphlpapi -lwinmm -lshell32 \
+        -lgdi32 -luser32 -ladvapi32 -lws2_32 -lbthprops -lwinhttp -liphlpapi -lwinmm \
         -o winmirror.exe
+    rm -f winmirror.pdb
     echo "==> Built winmirror.exe successfully!"
     ls -lh winmirror.exe
 }

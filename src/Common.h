@@ -7,6 +7,9 @@
 #define _WIN32_WINNT 0x0A00
 #endif
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -21,7 +24,7 @@
 #include <chrono>
 #include <memory>
 
-#define WINMIRROR_VERSION "2.0.4"
+#define WINMIRROR_VERSION "2.0.5"
 #define WINMIRROR_REPO "1zyxu/winmirror"
 #define AIRPLAY_PORT 7001
 #define BEACON_PORT 8889

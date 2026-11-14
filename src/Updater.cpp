@@ -245,19 +245,22 @@ bool Updater::downloadFile(const std::string& url, const std::string& outputPath
 
 void Updater::applyUpdateAndRestart(const std::string& newExePath) {
     char currentExe[MAX_PATH] = {};
-    GetModuleFileNameA(NULL, currentExe, MAX_PATH);
+    if (GetModuleFileNameA(NULL, currentExe, MAX_PATH) == 0) return;
 
-    std::ostringstream cmd;
-    cmd << "cmd.exe /c \"ping 127.0.0.1 -n 2 > nul & "
-        << "move /y \"" << newExePath << "\" \"" << currentExe << "\" & "
-        << "start \"WinMirror AirPlay\" \"" << currentExe << "\"\"";
+    // Windows permits renaming a running executable via MoveFileExA without spawning cmd.exe
+    std::string oldExe = std::string(currentExe) + ".old.exe";
+    if (!MoveFileExA(currentExe, oldExe.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        return;
+    }
+    if (!MoveFileExA(newExePath.c_str(), currentExe, MOVEFILE_REPLACE_EXISTING)) {
+        MoveFileExA(oldExe.c_str(), currentExe, MOVEFILE_REPLACE_EXISTING);
+        return;
+    }
 
     STARTUPINFOA si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
-    std::string cmdStr = cmd.str();
-
     std::cout << "[Updater] Applying update and restarting..." << std::endl;
-    if (CreateProcessA(NULL, &cmdStr[0], NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi)) {
+    if (CreateProcessA(currentExe, NULL, NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi)) {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         exit(0);
