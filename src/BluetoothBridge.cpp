@@ -147,18 +147,41 @@ void BluetoothBridge::stop() {
         closesocket(m_listenSock);
         m_listenSock = INVALID_SOCKET;
     }
+    {
+        std::lock_guard<std::mutex> lock(m_clientMutex);
+        if (m_clientSock != INVALID_SOCKET) {
+            shutdown(m_clientSock, SD_BOTH);
+            closesocket(m_clientSock);
+            m_clientSock = INVALID_SOCKET;
+        }
+    }
     if (m_thread.joinable()) {
         m_thread.join();
     }
 }
 
+void BluetoothBridge::sendToClient(const std::string& line) {
+    if (line.empty()) return;
+    std::lock_guard<std::mutex> lock(m_clientMutex);
+    if (m_clientSock != INVALID_SOCKET) {
+        send(m_clientSock, line.c_str(), static_cast<int>(line.size()), 0);
+    }
+}
+
 void BluetoothBridge::updateMetadata(const std::string& ipsCsv, uint32_t width, uint32_t height, bool isHdr, const std::string& codecName) {
-    std::lock_guard<std::mutex> lock(m_metaMutex);
-    m_ipsCsv = ipsCsv;
-    m_width = width;
-    m_height = height;
-    m_isHdr = isHdr;
-    m_codecName = codecName;
+    bool ipsChanged = false;
+    {
+        std::lock_guard<std::mutex> lock(m_metaMutex);
+        ipsChanged = (m_ipsCsv != ipsCsv);
+        m_ipsCsv = ipsCsv;
+        m_width = width;
+        m_height = height;
+        m_isHdr = isHdr;
+        m_codecName = codecName;
+    }
+    if (ipsChanged && m_btConnected.load()) {
+        sendToClient(buildHelloLine());
+    }
 }
 
 std::string BluetoothBridge::buildHelloLine() const {
@@ -193,9 +216,12 @@ void BluetoothBridge::serverLoop() {
             continue;
         }
 
+        {
+            std::lock_guard<std::mutex> lock(m_clientMutex);
+            m_clientSock = clientSock;
+        }
         m_btConnected = true;
-        std::string hello = buildHelloLine();
-        send(clientSock, hello.c_str(), static_cast<int>(hello.size()), 0);
+        sendToClient(buildHelloLine());
 
         char buf[512];
         while (m_running) {
@@ -206,15 +232,19 @@ void BluetoothBridge::serverLoop() {
             if (cmd.find("REQ_KEYFRAME") != std::string::npos && m_onKeyframeReq) {
                 m_onKeyframeReq();
             } else if (cmd.find("GET_INFO") != std::string::npos) {
-                std::string info = buildHelloLine();
-                send(clientSock, info.c_str(), static_cast<int>(info.size()), 0);
+                sendToClient(buildHelloLine());
             } else if (cmd.find("PING") != std::string::npos) {
-                const char* pong = "PONG\n";
-                send(clientSock, pong, 5, 0);
+                sendToClient("PONG\n");
             }
         }
 
-        closesocket(clientSock);
+        {
+            std::lock_guard<std::mutex> lock(m_clientMutex);
+            if (m_clientSock == clientSock) {
+                closesocket(m_clientSock);
+                m_clientSock = INVALID_SOCKET;
+            }
+        }
         m_btConnected = false;
     }
 }

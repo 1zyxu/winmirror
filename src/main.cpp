@@ -65,11 +65,13 @@ static const char* gpuModeTag(uint16_t flags) {
     return "CPU";
 }
 
-static std::string collectLocalIpsAndPrint(int port) {
-    std::cout << "==================================================================" << std::endl;
-    std::cout << "  WINMIRROR AirPlay v" << WINMIRROR_VERSION << " -- GPU HEVC/H264 HDR + Bluetooth" << std::endl;
-    std::cout << "==================================================================" << std::endl;
-    std::cout << "AirPlay Discovery Transports (USB-C / Router LAN / Wi-Fi / BT):" << std::endl;
+static std::string collectLocalIpsCsv(int port, bool printBanner) {
+    if (printBanner) {
+        std::cout << "==================================================================" << std::endl;
+        std::cout << "  WINMIRROR AirPlay v" << WINMIRROR_VERSION << " -- GPU HEVC/H264 HDR + Bluetooth" << std::endl;
+        std::cout << "==================================================================" << std::endl;
+        std::cout << "AirPlay Discovery Transports (USB-C / Router LAN / Wi-Fi / BT):" << std::endl;
+    }
 
     std::ostringstream ipsCsv;
     ULONG bufLen = sizeof(IP_ADAPTER_INFO);
@@ -86,8 +88,10 @@ static std::string collectLocalIpsAndPrint(int port) {
         while (pAdapter) {
             std::string ip = pAdapter->IpAddressList.IpAddress.String;
             if (ip != "0.0.0.0" && ip != "127.0.0.1") {
-                std::cout << "  -> airplay://" << ip << ":" << port
-                          << " [" << pAdapter->Description << "]" << std::endl;
+                if (printBanner) {
+                    std::cout << "  -> airplay://" << ip << ":" << port
+                              << " [" << pAdapter->Description << "]" << std::endl;
+                }
                 if (!firstIp) ipsCsv << ",";
                 ipsCsv << ip;
                 firstIp = false;
@@ -95,7 +99,9 @@ static std::string collectLocalIpsAndPrint(int port) {
             pAdapter = pAdapter->Next;
         }
     }
-    std::cout << "==================================================================\n" << std::endl;
+    if (printBanner) {
+        std::cout << "==================================================================\n" << std::endl;
+    }
     return ipsCsv.str();
 }
 
@@ -133,7 +139,7 @@ int main(int argc, char* argv[]) {
         }).detach();
     }
 
-    std::string ipsCsv = collectLocalIpsAndPrint(port);
+    std::string ipsCsv = collectLocalIpsCsv(port, true);
 
     ScreenCapture capture;
     if (!capture.init()) {
@@ -307,6 +313,7 @@ int main(int argc, char* argv[]) {
 
     auto startTime = std::chrono::steady_clock::now();
     auto lastReport = startTime;
+    auto lastIpRefresh = startTime;
     auto nextEncodeTime = startTime;
     uint32_t encodedFrames = 0;
     uint64_t encodedBytes = 0;
@@ -411,6 +418,15 @@ int main(int argc, char* argv[]) {
 
         // Single-line live console status
         auto now = std::chrono::steady_clock::now();
+        if (now - lastIpRefresh >= std::chrono::seconds(3)) {
+            std::string newIpsCsv = collectLocalIpsCsv(port, false);
+            if (newIpsCsv != ipsCsv) {
+                ipsCsv = newIpsCsv;
+                btBridge.updateMetadata(ipsCsv, encoder.getWidth(), encoder.getHeight(),
+                                        encoder.isHdrActive(), encoder.getEncoderName());
+            }
+            lastIpRefresh = now;
+        }
         if (now - lastReport >= std::chrono::milliseconds(500)) {
             float elapsedSec = std::chrono::duration<float>(now - lastReport).count();
             float currentFps = encodedFrames / elapsedSec;

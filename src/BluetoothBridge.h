@@ -24,6 +24,7 @@ private:
     void serverLoop();
     void detectPairedDevices();
     std::string buildHelloLine() const;
+    void sendToClient(const std::string& line);
 
     int m_mediaPort;
     std::function<void()> m_onKeyframeReq;
@@ -32,6 +33,8 @@ private:
     std::atomic<bool> m_btConnected{false};
 
     SOCKET m_listenSock = INVALID_SOCKET;
+    std::mutex m_clientMutex;
+    SOCKET m_clientSock = INVALID_SOCKET;
     std::thread m_thread;
 
     mutable std::mutex m_metaMutex;

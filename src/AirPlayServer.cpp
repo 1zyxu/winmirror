@@ -127,9 +127,18 @@ void AirPlayServer::acceptLoop() {
         int nodelay = 1;
         setsockopt(clientSock, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
 
-        // 256 KB send buffer prevents multi-second kernel bufferbloat over Wi-Fi so queue congestion triggers promptly
-        int sndbuf = 256 * 1024;
+        // 128 KB send buffer prevents kernel bufferbloat over Wi-Fi/USB so congestion drops trigger promptly
+        int sndbuf = 128 * 1024;
         setsockopt(clientSock, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&sndbuf), sizeof(sndbuf));
+
+        int tos = 0x88; // DSCP AF41 multimedia low-latency class (best-effort)
+        setsockopt(clientSock, IPPROTO_IP, IP_TOS, reinterpret_cast<const char*>(&tos), sizeof(tos));
+
+        DWORD sndTimeoutMs = 2000;
+        setsockopt(clientSock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&sndTimeoutMs), sizeof(sndTimeoutMs));
+
+        DWORD rcvTimeoutMs = 5000;
+        setsockopt(clientSock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&rcvTimeoutMs), sizeof(rcvTimeoutMs));
 
         auto session = std::make_shared<ClientSession>();
         session->sock = clientSock;
@@ -200,8 +209,8 @@ void AirPlayServer::broadcastVideo(std::shared_ptr<const EncodedFrame> frame) {
                     c->videoQueue.clear();
                 }
             }
-            if (c->videoQueue.size() > 4) {
-                // Tight 4-frame (~66ms) congestion cap so interactive games stay snappy
+            if (c->videoQueue.size() > 2) {
+                // Tight 2-frame (~33ms) congestion cap so interactive games stay snappy
                 c->videoQueue.clear();
                 if (!frame->isKeyframe) {
                     c->waitingForKeyframe = true;

@@ -11,9 +11,17 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <net/if_media.h>
+#include <ifaddrs.h>
+#include <poll.h>
 #include <netinet/tcp.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <cerrno>
+
+#include "../src/TransportPolicy.h"
 
 #include <string>
 #include <vector>
@@ -316,7 +324,7 @@ static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObject
     if (self) {
         _sampleRate = 48000;
         _chunkBytes = (48000 / 50) * 4;
-        _pcmRing.reset((static_cast<size_t>(_sampleRate) * 4 * 80) / 1000);
+        _pcmRing.reset((static_cast<size_t>(_sampleRate) * 4 * 60) / 1000);
         _started = NO;
         _disposing = false;
         _alive = true;
@@ -1094,6 +1102,78 @@ static NSImage *sfSymbol(NSString *name) {
     return nil;
 }
 
+static bool isLocalUsbOrWiredInterfaceForIp(const std::string& targetIp, bool requireMatchingSubnet) {
+    if (!requireMatchingSubnet && isUsbOrLinkLocalIp(targetIp)) return true;
+
+    struct in_addr dst = {};
+    if (inet_pton(AF_INET, targetIp.c_str(), &dst) != 1) return false;
+
+    struct ifaddrs *ifap = nullptr;
+    if (getifaddrs(&ifap) != 0) return false;
+
+    int ctlSock = socket(AF_INET, SOCK_DGRAM, 0);
+    bool wired = false;
+    for (struct ifaddrs *ifa = ifap; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || !ifa->ifa_netmask) continue;
+        if (ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (!(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK)) continue;
+
+        uint32_t localIp = reinterpret_cast<const struct sockaddr_in *>(ifa->ifa_addr)->sin_addr.s_addr;
+        uint32_t mask = reinterpret_cast<const struct sockaddr_in *>(ifa->ifa_netmask)->sin_addr.s_addr;
+        if (mask == 0 || (localIp & mask) != (dst.s_addr & mask)) continue;
+
+        if (isUsbOrLinkLocalIp(targetIp) || std::strncmp(ifa->ifa_name, "bridge", 6) == 0) {
+            wired = true;
+            break;
+        }
+        if (ctlSock >= 0) {
+            struct ifmediareq ifmr = {};
+            std::strncpy(ifmr.ifm_name, ifa->ifa_name, IFNAMSIZ - 1);
+            if (ioctl(ctlSock, SIOCGIFMEDIA, &ifmr) == 0 && IFM_TYPE(ifmr.ifm_active) == IFM_ETHER) {
+                wired = true;
+                break;
+            }
+        }
+    }
+    if (ctlSock >= 0) close(ctlSock);
+    freeifaddrs(ifap);
+    return wired;
+}
+
+static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) {
+    struct sockaddr_in sa = {};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(static_cast<uint16_t>(port));
+    if (inet_pton(AF_INET, ip.c_str(), &sa.sin_addr) != 1) return -1.0;
+
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return -1.0;
+
+    int flags = fcntl(s, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(s, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    auto t0 = std::chrono::steady_clock::now();
+    int rc = connect(s, reinterpret_cast<sockaddr *>(&sa), sizeof(sa));
+    bool ok = (rc == 0);
+    if (!ok && errno == EINPROGRESS) {
+        struct pollfd pfd = { s, POLLOUT, 0 };
+        if (poll(&pfd, 1, timeoutMs) > 0 && (pfd.revents & POLLOUT)) {
+            int err = 0;
+            socklen_t len = sizeof(err);
+            if (getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0) {
+                ok = true;
+            }
+        }
+    }
+    double rttMs = ok
+        ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()
+        : -1.0;
+    close(s);
+    return rttMs;
+}
+
 @interface MirrorWindowController : NSObject <NSWindowDelegate, NSNetServiceDelegate, IOBluetoothRFCOMMChannelDelegate, NSMenuDelegate>
 @property (nonatomic, strong) NSWindow *window;
 @property (nonatomic, strong) AirPlayVideoView *videoView;
@@ -1119,12 +1199,18 @@ static NSImage *sfSymbol(NSString *name) {
 @property (nonatomic, assign) ColorProfile currentColor;
 @property (nonatomic, assign) double lastRttMs;
 @property (nonatomic, assign) BOOL btLinked;
+@property (nonatomic, assign) BOOL activeTransportIsUsb;
 @property (nonatomic, assign) uint16_t pcHelloFlags;
 @property (nonatomic, copy) NSString *pcHostName;
 @property (nonatomic, copy) NSString *activeTransportHost;
 
 - (void)addDiscoveredHost:(NSString *)ip port:(int)port source:(NSString *)src;
 - (std::string)pickTargetHost:(int &)outPort;
+- (BOOL)findBetterUsbTargetForCurrent:(const std::string &)currentHost
+                          currentPort:(int)currentPort
+                           currentRtt:(double)currentRttMs
+                              outHost:(std::string &)outHost
+                              outPort:(int &)outPort;
 - (void)updatePcAudioDevices:(NSString *)serialized;
 - (int)consumePendingPcAudioSource;
 - (void)requestKeyframeFromPc;
@@ -1140,6 +1226,7 @@ static NSImage *sfSymbol(NSString *name) {
     std::string _lineBuf;
     std::atomic<int> _pendingPcAudioSrc;
     std::atomic<bool> _pendingKeyReq;
+    std::atomic<bool> _shuttingDown;
 }
 
 - (instancetype)initWithCliHost:(NSString *)host port:(int)port {
@@ -1149,6 +1236,7 @@ static NSImage *sfSymbol(NSString *name) {
         _pcAudioDevices = [[NSMutableArray alloc] init];
         _pendingPcAudioSrc = -999;
         _pendingKeyReq = false;
+        _shuttingDown = false;
         _currentWidth = 1920;
         _currentHeight = 1080;
         _currentCodec = CODEC_H264;
@@ -1158,6 +1246,7 @@ static NSImage *sfSymbol(NSString *name) {
         _frameJitterMs = 0.0;
         _pcAudioRate = 48000;
         _btLinked = NO;
+        _activeTransportIsUsb = NO;
         _pcHostName = @"Searching (Bluetooth / LAN / USB)...";
         _activeTransportHost = @"Auto";
 
@@ -1166,6 +1255,7 @@ static NSImage *sfSymbol(NSString *name) {
             _cliPort = port;
             _hasCliHost = YES;
             _activeTransportHost = host;
+            [self addDiscoveredHost:host port:port source:@"CLI"];
         } else {
             _hasCliHost = NO;
         }
@@ -1222,24 +1312,96 @@ static NSImage *sfSymbol(NSString *name) {
 }
 
 - (std::string)pickTargetHost:(int &)outPort {
-    std::lock_guard<std::mutex> lock(_targetMutex);
-    if (_hasCliHost) {
-        outPort = _cliPort;
-        return _cliHost;
+    std::vector<std::pair<std::string, int>> targets;
+    {
+        std::lock_guard<std::mutex> lock(_targetMutex);
+        targets = _discoveredTargets;
+        if (_hasCliHost) {
+            bool found = false;
+            for (const auto &t : targets) {
+                if (t.first == _cliHost && t.second == _cliPort) { found = true; break; }
+            }
+            if (!found) targets.push_back({ _cliHost, _cliPort });
+        }
     }
-    if (!_discoveredTargets.empty()) {
-        // Prefer standard private LAN (192.168 / 10.) or USB over virtual VMware/VPN subnets
-        for (const auto &t : _discoveredTargets) {
-            if (t.first.rfind("192.168.", 0) == 0 || t.first.rfind("10.", 0) == 0) {
-                outPort = t.second;
-                return t.first;
+
+    if (targets.empty()) {
+        outPort = AIRPLAY_PORT;
+        return "192.168.0.105";
+    }
+    if (targets.size() == 1) {
+        outPort = targets.front().second;
+        return targets.front().first;
+    }
+
+    // Measure reachability + RTT and prioritize USB/wired (<1ms) over private Wi-Fi LAN
+    int bestScore = 20000000;
+    std::string bestHost = targets.front().first;
+    int bestPort = targets.front().second;
+    bool anyReachable = false;
+
+    for (const auto &t : targets) {
+        bool isUsb = isLocalUsbOrWiredInterfaceForIp(t.first, false);
+        double rttMs = probeTcpCandidate(t.first, t.second, 100);
+        int score = rankTransportScore(t.first, rttMs, isUsb);
+        if (rttMs >= 0.0) {
+            if (!anyReachable || score < bestScore) {
+                bestScore = score;
+                bestHost = t.first;
+                bestPort = t.second;
+                anyReachable = true;
+            }
+        } else if (!anyReachable) {
+            int staticScore = rankTransportScore(t.first, 50.0, isUsb);
+            if (staticScore < bestScore) {
+                bestScore = staticScore;
+                bestHost = t.first;
+                bestPort = t.second;
             }
         }
-        outPort = _discoveredTargets.front().second;
-        return _discoveredTargets.front().first;
     }
-    outPort = AIRPLAY_PORT;
-    return "192.168.0.105";
+
+    outPort = bestPort;
+    return bestHost;
+}
+
+- (BOOL)findBetterUsbTargetForCurrent:(const std::string &)currentHost
+                          currentPort:(int)currentPort
+                           currentRtt:(double)currentRttMs
+                              outHost:(std::string &)outHost
+                              outPort:(int &)outPort {
+    std::vector<std::pair<std::string, int>> targets;
+    {
+        std::lock_guard<std::mutex> lock(_targetMutex);
+        targets = _discoveredTargets;
+    }
+    bool currentIsUsb = isLocalUsbOrWiredInterfaceForIp(currentHost, true);
+    if (currentIsUsb) return NO;
+
+    int bestScore = 20000000;
+    std::string bestIp;
+    int bestP = currentPort;
+    for (const auto &t : targets) {
+        if (t.first == currentHost) continue;
+        // Require an active matching local wired/USB interface on macOS before probing so Wi-Fi never stalls
+        if (!isLocalUsbOrWiredInterfaceForIp(t.first, true)) continue;
+        double rttMs = probeTcpCandidate(t.first, t.second, 80);
+        if (rttMs < 0.0) continue;
+        if (shouldAutoSwitchTransport(currentHost, false, currentRttMs, t.first, true, rttMs)) {
+            int sc = rankTransportScore(t.first, rttMs, true);
+            if (bestIp.empty() || sc < bestScore) {
+                bestScore = sc;
+                bestIp = t.first;
+                bestP = t.second;
+            }
+        }
+    }
+    if (!bestIp.empty()) {
+        outHost = bestIp;
+        outPort = bestP;
+        return YES;
+    }
+    return NO;
 }
 
 - (void)startBluetoothDiscovery {
@@ -1250,30 +1412,43 @@ static NSImage *sfSymbol(NSString *name) {
     IOBluetoothSDPUUID *targetUuid = [IOBluetoothSDPUUID uuidWithBytes:uuidBytes length:16];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        NSArray *paired = [IOBluetoothDevice pairedDevices];
-        for (IOBluetoothDevice *dev in paired) {
-            if (!dev) continue;
-            // Query SDP on paired computers cleanly
-            [dev performSDPQuery:nil];
-            usleep(600000);
+        bool firstPass = true;
+        while (!self->_shuttingDown.load()) {
+            if (!self.btLinked) {
+                NSArray *paired = [IOBluetoothDevice pairedDevices];
+                for (IOBluetoothDevice *dev in paired) {
+                    if (self->_shuttingDown.load() || self.btLinked) break;
+                    if (!dev) continue;
 
-            IOBluetoothSDPServiceRecord *rec = [dev getServiceRecordForUUID:targetUuid];
-            if (!rec) continue;
-
-            BluetoothRFCOMMChannelID chanId = 0;
-            if ([rec getRFCOMMChannelID:&chanId] == kIOReturnSuccess && chanId > 0) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    IOBluetoothRFCOMMChannel *ch = nil;
-                    if ([dev openRFCOMMChannelSync:&ch withChannelID:chanId delegate:self] == kIOReturnSuccess && ch) {
-                        self.btChannel = ch;
-                        self.btLinked = YES;
-                        const char *req = "GET_INFO\n";
-                        [ch writeSync:const_cast<char *>(req) length:9];
-                        [self refreshTitle];
+                    IOBluetoothSDPServiceRecord *rec = [dev getServiceRecordForUUID:targetUuid];
+                    if (!rec && (firstPass || [dev isConnected])) {
+                        [dev performSDPQuery:nil];
+                        usleep(400000);
+                        rec = [dev getServiceRecordForUUID:targetUuid];
                     }
-                });
-                break;
+                    if (!rec) continue;
+
+                    BluetoothRFCOMMChannelID chanId = 0;
+                    if ([rec getRFCOMMChannelID:&chanId] == kIOReturnSuccess && chanId > 0) {
+                        __block BOOL opened = NO;
+                        dispatch_sync(dispatch_get_main_queue(), ^{
+                            if (self->_shuttingDown.load()) return;
+                            IOBluetoothRFCOMMChannel *ch = nil;
+                            if ([dev openRFCOMMChannelSync:&ch withChannelID:chanId delegate:self] == kIOReturnSuccess && ch) {
+                                self.btChannel = ch;
+                                self.btLinked = YES;
+                                static char reqCmd[] = "GET_INFO\n";
+                                [ch writeAsync:reqCmd length:9 refcon:nullptr];
+                                [self refreshTitle];
+                                opened = YES;
+                            }
+                        });
+                        if (opened) break;
+                    }
+                }
+                firstPass = false;
             }
+            sleep(5);
         }
     });
 }
@@ -1608,6 +1783,12 @@ static NSImage *sfSymbol(NSString *name) {
 
 - (void)requestKeyframeFromPc {
     _pendingKeyReq.store(true);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.btLinked && self.btChannel) {
+            static char keyCmd[] = "REQ_KEYFRAME\n";
+            [self.btChannel writeAsync:keyCmd length:13 refcon:nullptr];
+        }
+    });
 }
 
 - (BOOL)consumePendingKeyframeReq {
@@ -1621,7 +1802,8 @@ static NSImage *sfSymbol(NSString *name) {
 - (void)refreshTitle {
     NSString *codecStr = (_currentCodec == CODEC_HEVC) ? @"HEVC" : @"H.264";
     NSString *hdrStr = (_currentColor == COLOR_HDR10_PQ) ? @"HDR10" : @"SDR";
-    NSString *btStr = _btLinked ? @"BT + LAN" : @"LAN/USB";
+    NSString *linkStr = _activeTransportIsUsb ? @"USB" : @"Wi-Fi";
+    NSString *btStr = _btLinked ? [NSString stringWithFormat:@"BT + %@", linkStr] : linkStr;
 
     NSString *gpuStr = @"CPU";
     BOOL hasNvidia = (_pcHelloFlags & HELLO_FLAG_NVIDIA) != 0;
@@ -1692,6 +1874,7 @@ static NSImage *sfSymbol(NSString *name) {
 }
 
 - (void)windowWillClose:(NSNotification *)notification {
+    _shuttingDown.store(true);
     [self.audioPlayer stop];
     if (self.btChannel) {
         [self.btChannel closeChannel];
@@ -1776,9 +1959,19 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
     std::vector<uint8_t> payloadBuf;
     payloadBuf.reserve(4 * 1024 * 1024);
 
+    std::string preferredHost;
+    int preferredPort = AIRPLAY_PORT;
+
     while (*running) {
         int port = AIRPLAY_PORT;
-        std::string host = [controller pickTargetHost:port];
+        std::string host;
+        if (!preferredHost.empty()) {
+            host = std::move(preferredHost);
+            preferredHost.clear();
+            port = preferredPort;
+        } else {
+            host = [controller pickTargetHost:port];
+        }
 
         int sock = socket(AF_INET, SOCK_STREAM, 0);
         if (sock < 0) {
@@ -1789,8 +1982,14 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
         int nodelay = 1;
         setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
-        int rcvbuf = 512 * 1024;
+        int rcvbuf = 256 * 1024;
         setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
+        int svcType = NET_SERVICE_TYPE_VI;
+        setsockopt(sock, SOL_SOCKET, SO_NET_SERVICE_TYPE, &svcType, sizeof(svcType));
+
+        int tos = 0x88; // DSCP AF41 multimedia low-latency class (best-effort)
+        setsockopt(sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
 
         struct timeval tv = { 3, 0 };
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -1802,13 +2001,16 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
 
         if (connect(sock, reinterpret_cast<sockaddr *>(&saddr), sizeof(saddr)) < 0) {
             close(sock);
-            usleep(400000);
+            usleep(350000);
             continue;
         }
 
+        bool currentIsUsb = isLocalUsbOrWiredInterfaceForIp(host, false);
         NSString *connectedHostNs = [NSString stringWithUTF8String:host.c_str()];
         dispatch_async(dispatch_get_main_queue(), ^{
             controller.activeTransportHost = connectedHostNs;
+            controller.activeTransportIsUsb = currentIsUsb ? YES : NO;
+            [controller refreshTitle];
         });
 
         struct VideoDecodeQueue {
@@ -1912,6 +2114,8 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
         });
 
         auto lastPing = std::chrono::steady_clock::now();
+        auto lastUsbUpgradeCheck = lastPing;
+        bool switchingTransport = false;
 
         while (*running) {
             int reqAudioIdx = [controller consumePendingPcAudioSource];
@@ -1941,6 +2145,33 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
                 ping.extra1 = msNow;
                 send(sock, &ping, sizeof(ping), 0);
                 lastPing = now;
+            }
+
+            // Auto-upgrade from Wi-Fi to wired USB when plugged in mid-session
+            if (!currentIsUsb && (now - lastUsbUpgradeCheck >= std::chrono::seconds(5))) {
+                lastUsbUpgradeCheck = now;
+                std::string betterHost;
+                int betterPort = port;
+                if ([controller findBetterUsbTargetForCurrent:host
+                                                  currentPort:port
+                                                   currentRtt:controller.lastRttMs
+                                                      outHost:betterHost
+                                                      outPort:betterPort]) {
+                    preferredHost = betterHost;
+                    preferredPort = betterPort;
+                    switchingTransport = true;
+                    break;
+                }
+            }
+
+            struct pollfd pfd = { sock, POLLIN, 0 };
+            int pr = poll(&pfd, 1, 15);
+            if (pr < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (pr == 0) {
+                continue;
             }
 
             PacketHeader hdr = {};
@@ -2000,7 +2231,7 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
                                 vq.dropCount += static_cast<uint32_t>(vq.queue.size());
                                 vq.queue.clear();
                             }
-                        } else if (vq.queue.size() >= 3) {
+                        } else if (vq.queue.size() >= 2) {
                             vq.dropCount += static_cast<uint32_t>(vq.queue.size()) + 1;
                             vq.queue.clear();
                             vq.waitingKeyframe = true;
@@ -2066,11 +2297,12 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
             decodeThread.join();
         }
         decoder.cleanup();
-        usleep(250000);
+        usleep(switchingTransport ? 30000 : 250000);
     }
 }
 
 int main(int argc, const char *argv[]) {
+    setvbuf(stdout, nullptr, _IONBF, 0);
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
