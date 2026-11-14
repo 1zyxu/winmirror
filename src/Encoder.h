@@ -56,6 +56,7 @@ public:
         uint32_t base = computeTargetBitrateMbps(m_width, m_height, m_fps, m_useP010, m_codec == CODEC_HEVC);
         return std::max<uint32_t>(12u, (base * static_cast<uint32_t>(m_bitrateScalePct.load())) / 100u);
     }
+    int getBitrateScalePct() const { return m_bitrateScalePct.load(); }
     const std::string& getEncoderName() const { return m_encoderName; }
     DXGI_FORMAT getSrcFormat() const { return m_srcFormat; }
 

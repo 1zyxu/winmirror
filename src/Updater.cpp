@@ -295,7 +295,7 @@ void Updater::applyUpdateAndRestart(const std::string& newExePath) {
     STARTUPINFOA si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
     std::cout << "[Updater] Applying update and restarting..." << std::endl;
-    if (CreateProcessA(currentExe, nullptr, nullptr, nullptr, FALSE, CREATE_NEW_CONSOLE, nullptr, nullptr, &si, &pi)) {
+    if (CreateProcessA(currentExe, nullptr, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         exit(0);

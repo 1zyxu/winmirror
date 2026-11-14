@@ -17,9 +17,10 @@ build_win() {
         -o winmirror_rt.dll
     rm -f winmirror_rt.pdb
 
-    echo "==> Building winmirror.exe (Windows x86_64 AirPlay HEVC/H.264 HDR + Bluetooth)..."
-    "$ZIG" c++ -target x86_64-windows-gnu -O3 -std=c++17 -Wl,-s \
+    echo "==> Building winmirror.exe (Windows x86_64 GUI + HEVC/H.264 200 Mbps HDR + Bluetooth)..."
+    "$ZIG" c++ -target x86_64-windows-gnu -O3 -std=c++17 -Wl,-s -Wl,--subsystem,windows \
         src/main.cpp \
+        src/GuiWindow.cpp \
         src/ScreenCapture.cpp \
         src/Encoder.cpp \
         src/AudioCapture.cpp \
@@ -28,7 +29,7 @@ build_win() {
         src/Beacon.cpp \
         src/Updater.cpp \
         -ld3d11 -ldxgi -lmfplat -lmf -lmfuuid -lwmcodecdspuuid -lole32 -loleaut32 \
-        -lgdi32 -luser32 -ladvapi32 -lws2_32 -lbthprops -lwinhttp -liphlpapi -lwinmm \
+        -lgdi32 -luser32 -lshell32 -ladvapi32 -lws2_32 -lbthprops -lwinhttp -liphlpapi -lwinmm \
         -o winmirror.exe
     rm -f winmirror.pdb winmirror_rt.pdb WinMirrorRuntime.lib main.lib winmirror_rt.lib *.exp
     echo "==> Built winmirror_rt.dll + winmirror.exe successfully!"

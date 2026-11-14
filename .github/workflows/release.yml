@@ -29,6 +29,7 @@ jobs:
             /OUT:winmirror_rt.dll
           cl.exe /nologo /O2 /MT /GL /std:c++17 /EHsc `
             src\main.cpp `
+            src\GuiWindow.cpp `
             src\ScreenCapture.cpp `
             src\Encoder.cpp `
             src\AudioCapture.cpp `
@@ -37,9 +38,9 @@ jobs:
             src\Beacon.cpp `
             src\Updater.cpp `
             src\winmirror.res `
-            /link /LTCG /OPT:REF /OPT:ICF `
+            /link /SUBSYSTEM:WINDOWS /LTCG /OPT:REF /OPT:ICF `
             d3d11.lib dxgi.lib dxguid.lib mfplat.lib mf.lib mfuuid.lib wmcodecdspuuid.lib `
-            ole32.lib oleaut32.lib gdi32.lib user32.lib advapi32.lib ws2_32.lib bthprops.lib winhttp.lib iphlpapi.lib winmm.lib `
+            ole32.lib oleaut32.lib gdi32.lib user32.lib shell32.lib advapi32.lib ws2_32.lib bthprops.lib winhttp.lib iphlpapi.lib winmm.lib `
             /OUT:winmirror.exe
           Compress-Archive -Path winmirror.exe, winmirror_rt.dll -DestinationPath winmirror-windows.zip -Force
 

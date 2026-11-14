@@ -634,7 +634,7 @@ bool Encoder::configureMftTypes(const GUID& outputSubtype, bool wantP010, UINT32
         if (!m_codecApi) return;
         setCodecBool(m_codecApi, CODECAPI_AVLowLatencyMode, true);
         setCodecBool(m_codecApi, CODECAPI_AVEncCommonRealTime, true);
-        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonQualityVsSpeed, 30);
+        setCodecUint32(m_codecApi, CODECAPI_AVEncCommonQualityVsSpeed, 40);
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR);
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonMeanBitRate, bitrate);
         setCodecUint32(m_codecApi, CODECAPI_AVEncCommonBufferSize, bitrate / 8);
@@ -868,9 +868,9 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
 
         MFT_OUTPUT_STREAM_INFO outStreamInfo = {};
         if (SUCCEEDED(m_mft->GetOutputStreamInfo(m_outStreamId, &outStreamInfo))) {
-            m_outBufSize = outStreamInfo.cbSize > 0 ? outStreamInfo.cbSize : (1024 * 1024);
+            m_outBufSize = outStreamInfo.cbSize > 0 ? outStreamInfo.cbSize : (2 * 1024 * 1024);
         } else {
-            m_outBufSize = 1024 * 1024;
+            m_outBufSize = 2 * 1024 * 1024;
         }
 
         // Extract optional sequence header if provided before streaming starts

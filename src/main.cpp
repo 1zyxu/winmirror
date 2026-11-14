@@ -8,10 +8,13 @@
 #include "Updater.h"
 #include "AudioCapture.h"
 #include "WinMirrorRuntime.h"
+#include "GuiWindow.h"
 
 #include <iostream>
 #include <iomanip>
 #include <sstream>
+#include <streambuf>
+#include <cstdlib>
 #include <thread>
 #include <chrono>
 #include <condition_variable>
@@ -19,6 +22,7 @@
 #include <algorithm>
 #include <iphlpapi.h>
 #include <mmsystem.h>
+#include <shellapi.h>
 
 // Signal NVIDIA Optimus and AMD Switchable Graphics drivers to expose the discrete GPU
 extern "C" {
@@ -27,6 +31,39 @@ extern "C" {
 }
 
 static std::atomic<bool> g_running{true};
+static std::atomic<bool> g_unlimitedFpsFlag{false};
+static std::atomic<bool> g_hasVddState{false};
+static std::atomic<bool> g_installingVdd{false};
+static std::atomic<uint64_t> g_stateChangedSeq{0};
+static WinMirrorGui* g_trayCleanupGui = nullptr;
+
+class GuiLogStreamBuf : public std::streambuf {
+public:
+    explicit GuiLogStreamBuf(WinMirrorGui* gui) : m_gui(gui) {}
+protected:
+    int overflow(int ch) override {
+        if (ch == EOF) return 0;
+        char c = static_cast<char>(ch);
+        std::lock_guard<std::mutex> lock(m_mtx);
+        if (c == '\r') {
+            m_line.clear();
+            return ch;
+        }
+        if (c == '\n') {
+            if (!m_line.empty() && m_line.rfind("[Stream]", 0) != 0 && m_gui) {
+                m_gui->setStatusBanner(m_line);
+            }
+            m_line.clear();
+        } else if (m_line.size() < 220) {
+            m_line.push_back(c);
+        }
+        return ch;
+    }
+private:
+    WinMirrorGui* m_gui;
+    std::mutex m_mtx;
+    std::string m_line;
+};
 
 static BOOL WINAPI consoleCtrlHandler(DWORD signal) {
     if (signal == CTRL_C_EVENT || signal == CTRL_CLOSE_EVENT) {
@@ -155,7 +192,9 @@ static bool asciiContainsIC(const char* hay, const char* needle) {
     return h.find(n) != std::string::npos;
 }
 
-static std::string collectLocalIpsCsv(int port, bool printBanner) {
+static std::string collectLocalIpsCsv(int port, bool printBanner,
+                                      std::string* outSummary = nullptr,
+                                      std::string* outPrimaryAddr = nullptr) {
     if (printBanner) {
         std::cout << "==================================================================" << std::endl;
         std::cout << "  WINMIRROR AirPlay v" << WINMIRROR_VERSION << " -- GPU HEVC/H264 HDR + Bluetooth" << std::endl;
@@ -222,6 +261,9 @@ static std::string collectLocalIpsCsv(int port, bool printBanner) {
         [](const NetEndpoint& a, const NetEndpoint& b) { return a.priority < b.priority; });
 
     std::ostringstream ipsCsv;
+    std::ostringstream summary;
+    std::string primaryAddr;
+    int shownSummary = 0;
     for (size_t i = 0; i < endpoints.size(); ++i) {
         if (printBanner) {
             std::cout << "  -> [" << endpoints[i].tag << "] airplay://" << endpoints[i].ip << ":" << port
@@ -229,6 +271,25 @@ static std::string collectLocalIpsCsv(int port, bool printBanner) {
         }
         if (i > 0) ipsCsv << ",";
         ipsCsv << endpoints[i].ip;
+        if (endpoints[i].priority < 4) {
+            if (primaryAddr.empty()) {
+                primaryAddr = endpoints[i].ip + ":" + std::to_string(port);
+            }
+            if (shownSummary < 3) {
+                if (shownSummary > 0) summary << "  |  ";
+                summary << endpoints[i].tag << " " << endpoints[i].ip << ":" << port;
+                shownSummary++;
+            }
+        }
+    }
+    if (primaryAddr.empty() && !endpoints.empty()) {
+        primaryAddr = endpoints[0].ip + ":" + std::to_string(port);
+    }
+    if (outSummary) {
+        *outSummary = summary.str().empty() ? primaryAddr : summary.str();
+    }
+    if (outPrimaryAddr) {
+        *outPrimaryAddr = primaryAddr;
     }
     if (printBanner) {
         std::cout << "==================================================================\n" << std::endl;
@@ -236,9 +297,10 @@ static std::string collectLocalIpsCsv(int port, bool printBanner) {
     return ipsCsv.str();
 }
 
-int main(int argc, char* argv[]) {
+static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui* gui) {
     cleanupPreviousUpdateBinary();
-    if (!isRunningAsAdmin()) {
+    bool isAdmin = isRunningAsAdmin();
+    if (!isAdmin) {
         std::cout << "[WinMirror] Note: Running without Administrator rights (some elevated apps may not mirror)." << std::endl;
     }
 
@@ -253,12 +315,12 @@ int main(int argc, char* argv[]) {
     bool installVdd = false;
     bool updateOnly = false;
 
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--port" && i + 1 < argc) {
-            port = std::stoi(argv[++i]);
-        } else if (arg == "--fps" && i + 1 < argc) {
-            cliFps = parseCliFps(argv[++i]);
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string& arg = args[i];
+        if (arg == "--port" && i + 1 < args.size()) {
+            port = std::stoi(args[++i]);
+        } else if (arg == "--fps" && i + 1 < args.size()) {
+            cliFps = parseCliFps(args[++i]);
         } else if (arg == "--no-update") {
             checkUpdate = false;
         } else if (arg == "--update-only") {
@@ -283,7 +345,8 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    std::string ipsCsv = collectLocalIpsCsv(port, !checkOnly && !installOnly && !installVdd);
+    std::string netSummary, primaryAddr;
+    std::string ipsCsv = collectLocalIpsCsv(port, !checkOnly && !installOnly && !installVdd, &netSummary, &primaryAddr);
 
     if (checkUpdate || installOnly || installVdd) {
         Updater::ensureCompanionDll(exeDir);
@@ -306,6 +369,19 @@ int main(int argc, char* argv[]) {
         printPreflightReport(preflightRep, true);
     } else {
         std::cout << "[Preflight] Runtime DLL winmirror_rt.dll not loaded (built-in 1ms timer active)." << std::endl;
+    }
+    g_hasVddState.store(preflightRep.hasVddDriver != 0);
+
+    if (gui) {
+        WinMirrorStatus initSt;
+        initSt.isAdmin = isAdmin;
+        initSt.hasVdd = g_hasVddState.load();
+        initSt.dllLoaded = rtLoaded;
+        initSt.dllVersion = rtLoaded ? preflightRep.runtimeVersion : "";
+        initSt.endpointsSummary = netSummary;
+        initSt.primaryConnectAddr = primaryAddr;
+        initSt.statusBanner = "Initializing GPU screen capture & 200 Mbps NVENC encoder...";
+        gui->updateStatus(initSt);
     }
 
     auto shutdownTimerAndRuntime = [&]() {
@@ -501,9 +577,10 @@ int main(int argc, char* argv[]) {
         server.broadcastCursor(initCursorMeta, initCursorBgra);
     }
 
+    g_unlimitedFpsFlag.store(unlimitedFps);
+    std::atomic<uint32_t> curTargetFpsAtomic{targetFps};
+
     // Decoupled high-priority Capture + Cursor thread so NVENC/PCIe stalls never block DXGI ReleaseFrame or mouse input
-    uint32_t dxgiWaitMs = (targetFps > 60 || unlimitedFps) ? 1u : 4u;
-    const auto minCapGap = std::chrono::microseconds(unlimitedFps ? 0 : (750000 / targetFps));
     std::thread captureThread([&]() {
         HANDLE hCapMmcss = rt.enterMmcss(L"Games");
         std::vector<uint8_t> curBgra;
@@ -518,10 +595,14 @@ int main(int argc, char* argv[]) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(16));
                 continue;
             }
+            bool unlimNow = g_unlimitedFpsFlag.load();
+            uint32_t fpsNow = std::max<uint32_t>(15u, curTargetFpsAtomic.load());
+            auto minCapGap = std::chrono::microseconds(unlimNow ? 0 : (750000ULL / fpsNow));
+            uint32_t dxgiWaitMs = (fpsNow > 60 || unlimNow) ? 1u : 4u;
             // Avoid lapping encodeThread or double-copying 200+ Hz game frames on the shared D3D11 context
             auto capNow = std::chrono::steady_clock::now();
             if ((localSeq > frameShare.consumedSeq.load() + 1) ||
-                (!unlimitedFps && (capNow - lastAcqTime) < minCapGap)) {
+                (!unlimNow && (capNow - lastAcqTime) < minCapGap)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
@@ -549,14 +630,15 @@ int main(int argc, char* argv[]) {
     uint64_t encodedBytes = 0;
     uint64_t frameSeq = 0;
     uint64_t lastEncodedSeq = 0;
+    uint64_t seenStateSeq = g_stateChangedSeq.load();
     uint32_t lastSentW = encoder.getWidth();
     uint32_t lastSentH = encoder.getHeight();
     VideoCodec lastSentCodec = encoder.getCodec();
     ColorProfile lastSentColor = encoder.getColorProfile();
     uint16_t lastSentFlags = buildHelloFlags(btReady, capture, encoder, unlimitedFps);
 
-    const auto minFrameGap = std::chrono::microseconds(1000000 / targetFps);
-    const auto cvWaitBudget = std::chrono::milliseconds((targetFps > 60 || unlimitedFps) ? 4 : 16);
+    auto minFrameGap = std::chrono::microseconds(1000000 / targetFps);
+    auto cvWaitBudget = std::chrono::milliseconds((targetFps > 60 || unlimitedFps) ? 4 : 16);
 
     auto syncStreamMetadata = [&]() {
         uint16_t flagsNow = buildHelloFlags(btBridge.isRadioAvailable(), capture, encoder, unlimitedFps);
@@ -579,6 +661,47 @@ int main(int argc, char* argv[]) {
         }
     };
 
+    auto pushGuiSnapshot = [&](float curFps, float curMbps) {
+        if (!gui) return;
+        uint16_t hflags = buildHelloFlags(btBridge.isRadioAvailable(), capture, encoder, unlimitedFps);
+        WinMirrorStatus st;
+        st.streamingReady = true;
+        st.isAdmin = isAdmin;
+        st.hasVdd = g_hasVddState.load();
+        st.installingVdd = g_installingVdd.load();
+        st.unlimitedFps = unlimitedFps;
+        st.hdrActive = encoder.isHdrActive();
+        st.isHevc = (encoder.getCodec() == CODEC_HEVC);
+        st.dllLoaded = rtLoaded;
+        st.audioActive = audioCapture.isRunning();
+        st.btReady = btBridge.isRadioAvailable();
+        st.btConnected = btBridge.isBtClientConnected();
+        st.clients = server.getActiveClients();
+        st.bitrateScalePct = encoder.getBitrateScalePct();
+        st.width = encoder.getWidth();
+        st.height = encoder.getHeight();
+        st.monitorHz = monitorHz;
+        st.targetFps = targetFps;
+        st.targetMbps = encoder.getTargetBitrateMbps();
+        st.audioRate = audioCapture.getSampleRate();
+        st.actualFps = curFps;
+        st.actualMbps = curMbps;
+        st.gpuMode = gpuModeTag(hflags);
+        st.encoderName = encoder.getEncoderName();
+        st.captureName = capture.getAdapterName();
+        st.pixelFormat = capture.getPixelFormatName();
+        st.audioName = audioCapture.getActiveDeviceName();
+        st.btStatus = btBridge.getStatusText();
+        st.endpointsSummary = netSummary;
+        st.primaryConnectAddr = primaryAddr;
+        st.dllVersion = rtLoaded ? preflightRep.runtimeVersion : "";
+        st.statusBanner = st.clients > 0
+            ? ("Streaming live to Mac at up to " + std::to_string(st.targetMbps) + " Mbps.")
+            : "Ready - Launch WinMirror on Mac to connect (USB / 5GHz Wi-Fi / BT).";
+        gui->updateStatus(st);
+    };
+    pushGuiSnapshot(0.0f, 0.0f);
+
     auto emitEncoded = [&](std::vector<uint8_t>& pktData, bool isKey, uint64_t ptsUs) {
         encodedBytes += pktData.size();
         auto pkt = std::make_shared<EncodedFrame>();
@@ -597,6 +720,19 @@ int main(int argc, char* argv[]) {
     };
 
     while (g_running) {
+        bool wantUnlim = g_unlimitedFpsFlag.load();
+        if (wantUnlim != unlimitedFps) {
+            unlimitedFps = wantUnlim;
+            bool dummy = false;
+            targetFps = resolveTargetFps(unlimitedFps ? -1 : (cliFps < 0 ? 0 : cliFps), monitorHz, dummy);
+            curTargetFpsAtomic.store(targetFps);
+            minFrameGap = std::chrono::microseconds(1000000 / targetFps);
+            cvWaitBudget = std::chrono::milliseconds((targetFps > 60 || unlimitedFps) ? 4 : 16);
+            nextEncodeTime = std::chrono::steady_clock::now();
+            syncStreamMetadata();
+            pushGuiSnapshot(0.0f, 0.0f);
+        }
+
         bool hasClients = (server.getActiveClients() > 0);
         if (!hasClients) {
             std::this_thread::sleep_for(std::chrono::milliseconds(40));
@@ -652,34 +788,42 @@ int main(int argc, char* argv[]) {
             syncStreamMetadata();
         }
 
-        // Single-line live console status
         auto now = std::chrono::steady_clock::now();
         if (now - lastIpRefresh >= std::chrono::seconds(3)) {
-            std::string newIpsCsv = collectLocalIpsCsv(port, false);
-            if (newIpsCsv != ipsCsv) {
+            std::string newSummary, newPrimary;
+            std::string newIpsCsv = collectLocalIpsCsv(port, false, &newSummary, &newPrimary);
+            if (newIpsCsv != ipsCsv || newSummary != netSummary) {
                 ipsCsv = newIpsCsv;
+                netSummary = newSummary;
+                primaryAddr = newPrimary;
                 btBridge.updateMetadata(ipsCsv, encoder.getWidth(), encoder.getHeight(),
                                         encoder.isHdrActive(), encoder.getEncoderName());
             }
             lastIpRefresh = now;
         }
-        if (now - lastReport >= std::chrono::milliseconds(500)) {
-            float elapsedSec = std::chrono::duration<float>(now - lastReport).count();
+        uint64_t stateNow = g_stateChangedSeq.load();
+        if (stateNow != seenStateSeq || now - lastReport >= std::chrono::milliseconds(400)) {
+            float elapsedSec = std::max(0.05f, std::chrono::duration<float>(now - lastReport).count());
             float currentFps = encodedFrames / elapsedSec;
             float currentMbps = (encodedBytes * 8.0f) / (elapsedSec * 1000000.0f);
 
-            uint16_t hflags = buildHelloFlags(btBridge.isRadioAvailable(), capture, encoder, unlimitedFps);
-            std::cout << "\r[Stream] " << std::fixed << std::setprecision(1) << std::setw(4) << currentFps
-                      << " FPS | " << std::setw(4) << currentMbps << " Mbps | "
-                      << (encoder.getCodec() == CODEC_HEVC ? "HEVC" : "H264")
-                      << " [" << gpuModeTag(hflags) << "] "
-                      << (encoder.isHdrActive() ? "HDR10" : "SDR")
-                      << " | " << encoder.getWidth() << "x" << encoder.getHeight()
-                      << " | Aud:" << (audioCapture.isRunning() ? (std::to_string(audioCapture.getSampleRate() / 1000) + "k") : "Off")
-                      << " | BT:" << btBridge.getStatusText()
-                      << " | Clients:" << server.getActiveClients()
-                      << "   " << std::flush;
+            if (!gui) {
+                uint16_t hflags = buildHelloFlags(btBridge.isRadioAvailable(), capture, encoder, unlimitedFps);
+                std::cout << "\r[Stream] " << std::fixed << std::setprecision(1) << std::setw(4) << currentFps
+                          << " FPS | " << std::setw(4) << currentMbps << " Mbps | "
+                          << (encoder.getCodec() == CODEC_HEVC ? "HEVC" : "H264")
+                          << " [" << gpuModeTag(hflags) << "] "
+                          << (encoder.isHdrActive() ? "HDR10" : "SDR")
+                          << " | " << encoder.getWidth() << "x" << encoder.getHeight()
+                          << " | Aud:" << (audioCapture.isRunning() ? (std::to_string(audioCapture.getSampleRate() / 1000) + "k") : "Off")
+                          << " | BT:" << btBridge.getStatusText()
+                          << " | Clients:" << server.getActiveClients()
+                          << "   " << std::flush;
+            } else {
+                pushGuiSnapshot(currentFps, currentMbps);
+            }
 
+            seenStateSeq = stateNow;
             encodedFrames = 0;
             encodedBytes = 0;
             lastReport = now;
@@ -701,4 +845,116 @@ int main(int argc, char* argv[]) {
 
     std::cout << "\n[WinMirror AirPlay] Stopped." << std::endl;
     return 0;
+}
+
+static std::vector<std::string> parseWinCmdArgs() {
+    int wargc = 0;
+    LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    std::vector<std::string> args;
+    if (!wargv) {
+        args.push_back("winmirror.exe");
+        return args;
+    }
+    args.reserve(static_cast<size_t>(wargc));
+    for (int i = 0; i < wargc; ++i) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, nullptr, 0, nullptr, nullptr);
+        std::string s(len > 1 ? static_cast<size_t>(len - 1) : 0, '\0');
+        if (len > 1) {
+            WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, &s[0], len, nullptr, nullptr);
+        }
+        args.push_back(std::move(s));
+    }
+    LocalFree(wargv);
+    return args;
+}
+
+int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
+    std::vector<std::string> args = parseWinCmdArgs();
+    bool cliMode = false;
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "--check" || args[i] == "--install" ||
+            args[i] == "--install-vdd" || args[i] == "--update-only") {
+            cliMode = true;
+            break;
+        }
+    }
+
+    if (cliMode) {
+        if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+            FILE* fpOut = nullptr;
+            FILE* fpErr = nullptr;
+            freopen_s(&fpOut, "CONOUT$", "w", stdout);
+            freopen_s(&fpErr, "CONOUT$", "w", stderr);
+        }
+        return runWinMirrorEngine(args, nullptr);
+    }
+
+    WinMirrorGui gui;
+    if (!gui.createAndShow()) {
+        return runWinMirrorEngine(args, nullptr);
+    }
+    g_trayCleanupGui = &gui;
+    std::atexit([]() { if (g_trayCleanupGui) g_trayCleanupGui->removeTrayIcon(); });
+
+    GuiLogStreamBuf logBuf(&gui);
+    std::streambuf* oldCout = std::cout.rdbuf(&logBuf);
+    std::streambuf* oldCerr = std::cerr.rdbuf(&logBuf);
+
+    std::mutex vddMtx;
+    std::thread vddThread;
+    gui.setActions(
+        [&]() {
+            g_unlimitedFpsFlag.store(!g_unlimitedFpsFlag.load());
+            g_stateChangedSeq++;
+        },
+        [&]() {
+            if (g_installingVdd.load()) return;
+            if (!isRunningAsAdmin()) {
+                gui.setStatusBanner("Administrator rights required to install the 4K HDR Virtual Display Driver.");
+                return;
+            }
+            if (!WinMirrorRuntimeApi::instance().isLoaded()) {
+                gui.setStatusBanner("Runtime DLL winmirror_rt.dll not loaded.");
+                return;
+            }
+            std::lock_guard<std::mutex> lock(vddMtx);
+            if (vddThread.joinable()) vddThread.join();
+            g_installingVdd.store(true);
+            g_stateChangedSeq++;
+            gui.setStatusBanner("Downloading & installing 4K HDR Virtual Display Driver...");
+            vddThread = std::thread([&gui]() {
+                std::wstring exeDir = Updater::getExecutableDir();
+                wchar_t exePathW[MAX_PATH] = {};
+                GetModuleFileNameW(nullptr, exePathW, MAX_PATH);
+                bool ok = installVirtualDisplayDriver(exeDir);
+                WmPreflightReport rep = {};
+                WinMirrorRuntimeApi::instance().runPreflight(exePathW, true, rep);
+                g_hasVddState.store(ok || rep.hasVddDriver != 0);
+                g_installingVdd.store(false);
+                g_stateChangedSeq++;
+                gui.setStatusBanner(ok
+                    ? "4K HDR Driver installed! Enable HDR/4K in Windows Display Settings."
+                    : "Virtual Display Driver installation did not complete cleanly.");
+            });
+        },
+        [&]() {
+            g_running = false;
+        }
+    );
+
+    std::thread engineThread([&]() {
+        runWinMirrorEngine(args, &gui);
+    });
+
+    int rc = gui.runMessageLoop();
+    g_running = false;
+    if (engineThread.joinable()) engineThread.join();
+    {
+        std::lock_guard<std::mutex> lock(vddMtx);
+        if (vddThread.joinable()) vddThread.join();
+    }
+    std::cout.rdbuf(oldCout);
+    std::cerr.rdbuf(oldCerr);
+    g_trayCleanupGui = nullptr;
+    return rc;
 }
