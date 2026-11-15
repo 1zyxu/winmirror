@@ -1,4 +1,5 @@
 #include "Updater.h"
+#include "UpdaterLogic.h"
 #include "WinMirrorRuntime.h"
 #include <windows.h>
 #include <winhttp.h>
@@ -26,13 +27,7 @@ std::string toUtf8(const std::wstring& wstr) {
     return result;
 }
 
-std::string trimVersion(const std::string& v) {
-    size_t start = 0;
-    while (start < v.size() && (v[start] == 'v' || v[start] == 'V' || v[start] == ' ')) {
-        start++;
-    }
-    return v.substr(start);
-}
+using updater_logic::trimVersion;
 
 bool openWinHttpGet(const std::wstring& host, INTERNET_PORT port, const std::wstring& path, bool https,
                     HINTERNET& outSession, HINTERNET& outConnect, HINTERNET& outRequest, const wchar_t* extraHeaders) {
@@ -42,7 +37,7 @@ bool openWinHttpGet(const std::wstring& host, INTERNET_PORT port, const std::wst
 
     DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
     WinHttpSetOption(outSession, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
-    WinHttpSetTimeouts(outSession, 3000, 4000, 4000, 15000);
+    WinHttpSetTimeouts(outSession, 2500, 2500, 3000, 12000);
 
     outConnect = WinHttpConnect(outSession, host.c_str(), port, 0);
     if (!outConnect) { WinHttpCloseHandle(outSession); outSession = nullptr; return false; }
@@ -94,15 +89,7 @@ std::wstring Updater::getExecutableDir() {
 }
 
 bool Updater::isNewerVersion(const std::string& remote, const std::string& local) {
-    std::string r = trimVersion(remote);
-    std::string l = trimVersion(local);
-    int rMajor = 0, rMinor = 0, rPatch = 0;
-    int lMajor = 0, lMinor = 0, lPatch = 0;
-    std::sscanf(r.c_str(), "%d.%d.%d", &rMajor, &rMinor, &rPatch);
-    std::sscanf(l.c_str(), "%d.%d.%d", &lMajor, &lMinor, &lPatch);
-    if (rMajor != lMajor) return rMajor > lMajor;
-    if (rMinor != lMinor) return rMinor > lMinor;
-    return rPatch > lPatch;
+    return updater_logic::isNewerVersion(remote, local);
 }
 
 bool Updater::fetchReleaseJson(const std::string& repo, const std::string& tagOrLatest, std::string& outJson) {
@@ -133,35 +120,18 @@ bool Updater::fetchReleaseJson(const std::string& repo, const std::string& tagOr
 }
 
 std::string Updater::parseJsonStringField(const std::string& json, const std::string& key) {
-    std::string needle = "\"" + key + "\":";
-    size_t pos = json.find(needle);
-    if (pos == std::string::npos) return {};
-    size_t start = json.find('"', pos + needle.size());
-    if (start == std::string::npos) return {};
-    size_t end = json.find('"', start + 1);
-    if (end == std::string::npos) return {};
-    return json.substr(start + 1, end - start - 1);
+    return updater_logic::parseJsonStringField(json, key);
+}
+
+bool Updater::isValidPeHeader(const uint8_t* bytes, size_t len) {
+    return updater_logic::isValidPeHeader(bytes, len);
 }
 
 std::string Updater::findAssetDownloadUrl(const std::string& json, const std::string& assetSubstr) {
-    size_t searchPos = 0;
-    for (;;) {
-        size_t urlPos = json.find("\"browser_download_url\":", searchPos);
-        if (urlPos == std::string::npos) break;
-        size_t urlStart = json.find('"', urlPos + 23);
-        if (urlStart == std::string::npos) break;
-        size_t urlEnd = json.find('"', urlStart + 1);
-        if (urlEnd == std::string::npos) break;
-        std::string cand = json.substr(urlStart + 1, urlEnd - urlStart - 1);
-        if (cand.find(assetSubstr) != std::string::npos) {
-            return cand;
-        }
-        searchPos = urlEnd + 1;
-    }
-    return {};
+    return updater_logic::findAssetDownloadUrl(json, assetSubstr);
 }
 
-bool Updater::downloadFileW(const std::string& url, const std::wstring& outputPath) {
+bool Updater::downloadFileW(const std::string& url, const std::wstring& outputPath, bool verifyPeHeader) {
     URL_COMPONENTS urlComp = {};
     urlComp.dwStructSize = sizeof(urlComp);
     wchar_t hostName[256] = {};
@@ -191,6 +161,8 @@ bool Updater::downloadFileW(const std::string& url, const std::wstring& outputPa
 
     DWORD dwSize = 0;
     size_t totalBytes = 0;
+    uint8_t peMagic[2] = {};
+    size_t peHave = 0;
     bool writeOk = true;
     do {
         dwSize = 0;
@@ -198,6 +170,13 @@ bool Updater::downloadFileW(const std::string& url, const std::wstring& outputPa
         std::vector<char> buf(dwSize);
         DWORD dwDownloaded = 0;
         if (WinHttpReadData(hRequest, buf.data(), dwSize, &dwDownloaded) && dwDownloaded > 0) {
+            for (DWORD k = 0; k < dwDownloaded && peHave < 2; ++k) {
+                peMagic[peHave++] = static_cast<uint8_t>(buf[k]);
+            }
+            if (verifyPeHeader && peHave == 2 && !isValidPeHeader(peMagic, peHave)) {
+                writeOk = false;
+                break;
+            }
             DWORD written = 0;
             if (!WriteFile(hFile, buf.data(), dwDownloaded, &written, nullptr) || written != dwDownloaded) {
                 writeOk = false;
@@ -209,7 +188,8 @@ bool Updater::downloadFileW(const std::string& url, const std::wstring& outputPa
 
     CloseHandle(hFile);
     closeWinHttp(hSession, hConnect, hRequest);
-    if (!writeOk || totalBytes <= 1024) {
+    const size_t minBytes = verifyPeHeader ? 4096u : 1024u;
+    if (!writeOk || totalBytes <= minBytes || (verifyPeHeader && !isValidPeHeader(peMagic, peHave))) {
         DeleteFileW(outputPath.c_str());
         return false;
     }
@@ -245,7 +225,7 @@ bool Updater::ensureCompanionDll(const std::wstring& exeDir) {
     }
 
     std::wstring tmpDll = dllPath + L".tmp";
-    if (!downloadFileW(dllUrl, tmpDll)) {
+    if (!downloadFileW(dllUrl, tmpDll, true)) {
         std::cerr << "[Updater] Could not download winmirror_rt.dll yet (continuing with built-in fallback)." << std::endl;
         return false;
     }
@@ -280,25 +260,24 @@ bool Updater::downloadVirtualDisplayPackage(const std::wstring& outputZipPath) {
 }
 
 void Updater::applyUpdateAndRestart(const std::string& newExePath) {
-    char currentExe[MAX_PATH] = {};
-    if (GetModuleFileNameA(nullptr, currentExe, MAX_PATH) == 0) return;
+    wchar_t currentExe[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, currentExe, MAX_PATH) == 0) return;
 
-    std::string oldExe = std::string(currentExe) + ".old.exe";
-    if (!MoveFileExA(currentExe, oldExe.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+    std::wstring newExeW = toWide(newExePath);
+    std::wstring oldExe = std::wstring(currentExe) + L".old.exe";
+    if (!MoveFileExW(currentExe, oldExe.c_str(), MOVEFILE_REPLACE_EXISTING)) {
         return;
     }
-    if (!MoveFileExA(newExePath.c_str(), currentExe, MOVEFILE_REPLACE_EXISTING)) {
-        MoveFileExA(oldExe.c_str(), currentExe, MOVEFILE_REPLACE_EXISTING);
+    if (!MoveFileExW(newExeW.c_str(), currentExe, MOVEFILE_REPLACE_EXISTING)) {
+        MoveFileExW(oldExe.c_str(), currentExe, MOVEFILE_REPLACE_EXISTING);
         return;
     }
 
-    STARTUPINFOA si = { sizeof(si) };
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
+    STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
     std::cout << "[Updater] Applying update and restarting..." << std::endl;
-    if (CreateProcessA(currentExe, nullptr, nullptr, nullptr, FALSE,
-                       CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr, nullptr, &si, &pi)) {
+    if (CreateProcessW(currentExe, nullptr, nullptr, nullptr, FALSE,
+                       DETACHED_PROCESS, nullptr, nullptr, &si, &pi)) {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         exit(0);
@@ -339,7 +318,7 @@ bool Updater::checkForUpdates(bool autoInstall) {
         std::wstring dllDest = getExecutableDir() + L"\\winmirror_rt.dll";
         std::wstring dllTmp = dllDest + L".update";
         WinMirrorRuntimeApi::instance().unload();
-        if (downloadFileW(dllUrl, dllTmp)) {
+        if (downloadFileW(dllUrl, dllTmp, true)) {
             if (!MoveFileExW(dllTmp.c_str(), dllDest.c_str(), MOVEFILE_REPLACE_EXISTING)) {
                 DeleteFileW(dllTmp.c_str());
             } else {
@@ -348,17 +327,18 @@ bool Updater::checkForUpdates(bool autoInstall) {
         }
     }
 
-    char currentExe[MAX_PATH] = {};
-    GetModuleFileNameA(nullptr, currentExe, MAX_PATH);
-    std::string tempExe = std::string(currentExe) + ".update.exe";
+    wchar_t currentExeW[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, currentExeW, MAX_PATH);
+    std::wstring tempExeW = std::wstring(currentExeW) + L".update.exe";
+    std::string tempExe = toUtf8(tempExeW);
 
     std::cout << "[Updater] Downloading update from " << exeUrl << "..." << std::endl;
-    if (downloadFileW(exeUrl, toWide(tempExe))) {
+    if (downloadFileW(exeUrl, tempExeW, true)) {
         std::cout << "[Updater] Update downloaded successfully (" << tempExe << ")." << std::endl;
         applyUpdateAndRestart(tempExe);
         return true;
     } else {
-        DeleteFileA(tempExe.c_str());
+        DeleteFileW(tempExeW.c_str());
         std::cerr << "[Updater] Failed to download update." << std::endl;
         return false;
     }

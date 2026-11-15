@@ -39,7 +39,6 @@ build_win() {
 build_mac() {
     echo "==> Building winmirror_mac + WinMirror.app + WinMirror.dmg (macOS arm64 VideoToolbox HDR + CoreAudio + IOBluetooth)..."
     clang++ -O3 -std=c++17 \
-        -Wl,-sectcreate,__TEXT,__info_plist,mac/Info.plist \
         -framework Cocoa -framework QuartzCore -framework VideoToolbox \
         -framework AVFoundation -framework CoreMedia -framework CoreVideo \
         -framework AudioToolbox -framework CoreAudio -framework IOBluetooth \

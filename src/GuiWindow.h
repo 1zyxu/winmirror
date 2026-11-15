@@ -4,6 +4,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <vector>
 
 struct WinMirrorStatus {
     bool streamingReady = false;
@@ -42,8 +43,10 @@ struct WinMirrorStatus {
     std::string btStatus = "Initializing";
     std::string endpointsSummary;
     std::string primaryConnectAddr;
+    std::string connectedHost;
+    std::vector<AirPlayTarget> receivers;
     std::string dllVersion;
-    std::string statusBanner = "Starting WinMirror Game AirPlay engine...";
+    std::string statusBanner = "Searching for AirPlay receivers...";
 };
 
 class WinMirrorGui {
@@ -51,10 +54,11 @@ public:
     WinMirrorGui();
     ~WinMirrorGui();
 
-    void setActions(std::function<void()> onToggleUnlimitedFps,
-                    std::function<void()> onToggleGameBoost,
-                    std::function<void()> onInstallVdd,
-                    std::function<void()> onQuit);
+    void setActions(std::function<void()> onQuit,
+                    std::function<void(const AirPlayTarget&)> onSelectTarget = nullptr,
+                    std::function<void(const std::string&)> onConnectIp = nullptr,
+                    std::function<void()> onRefresh = nullptr,
+                    std::function<void()> onCheckUpdate = nullptr);
 
     bool createAndShow();
     void updateStatus(const WinMirrorStatus& st);
@@ -68,40 +72,58 @@ private:
     LRESULT handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
     void paintWindow(HWND hwnd);
-    void drawButton(const DRAWITEMSTRUCT* dis);
-    void layoutChildren();
+    void ensureCanvas(HDC refDc, int w, int h);
+    void ensureTextScratch(HDC refDc, int w, int h);
+    void releaseBitmaps();
+    void drawTextGlass(const RECT& r, HFONT font, struct GlassColor col, const std::wstring& txt, UINT fmt);
     void rebuildFonts();
+    int hitTestButton(POINT pt) const;
+    int hitTestReceiverRow(POINT pt, size_t maxRows) const;
+    void invokeButtonAction(int btnId);
+    void appendIpCharsFromClipboard();
     void addTrayIcon();
     void showFromTray();
-    void hideToTray();
     void showTrayContextMenu();
     void copyPrimaryAddress();
 
     HWND m_hwnd = nullptr;
-    HWND m_btnFps = nullptr;
-    HWND m_btnBoost = nullptr;
-    HWND m_btnVdd = nullptr;
-    HWND m_btnCopy = nullptr;
-    HWND m_btnTray = nullptr;
-
     HICON m_appIcon = nullptr;
     HFONT m_fontTitle = nullptr;
-    HFONT m_fontMetric = nullptr;
+    HFONT m_fontRow = nullptr;
     HFONT m_fontLabel = nullptr;
     HFONT m_fontBody = nullptr;
     HFONT m_fontSmall = nullptr;
 
+    HDC m_canvasDc = nullptr;
+    HBITMAP m_canvasBmp = nullptr;
+    HGDIOBJ m_canvasOldBmp = nullptr;
+    uint32_t* m_canvasPx = nullptr;
+    int m_canvasW = 0;
+    int m_canvasH = 0;
+
+    HDC m_scratchDc = nullptr;
+    HBITMAP m_scratchBmp = nullptr;
+    HGDIOBJ m_scratchOldBmp = nullptr;
+    uint32_t* m_scratchPx = nullptr;
+    int m_scratchW = 0;
+    int m_scratchH = 0;
+
     UINT m_dpi = 96;
+    bool m_glassBlurActive = false;
     bool m_trayAdded = false;
-    bool m_hiddenToTray = false;
-    bool m_copiedFlash = false;
+    bool m_ipFocused = false;
+    bool m_caretOn = true;
     int m_hoverBtnId = 0;
+    int m_pressedBtnId = 0;
+    int m_hoverRowIdx = -1;
+    std::string m_manualIp;
 
     std::mutex m_mtx;
     WinMirrorStatus m_status;
 
-    std::function<void()> m_onToggleUnlimited;
-    std::function<void()> m_onToggleGameBoost;
-    std::function<void()> m_onInstallVdd;
     std::function<void()> m_onQuit;
+    std::function<void(const AirPlayTarget&)> m_onSelectTarget;
+    std::function<void(const std::string&)> m_onConnectIp;
+    std::function<void()> m_onRefresh;
+    std::function<void()> m_onCheckUpdate;
 };

@@ -24,7 +24,7 @@
 #include <chrono>
 #include <memory>
 
-#define WINMIRROR_VERSION "2.2.0"
+#define WINMIRROR_VERSION "2.3.0"
 #define WINMIRROR_REPO "1zyxu/winmirror"
 #define AIRPLAY_PORT 7001
 #define BEACON_PORT 8889
@@ -56,7 +56,8 @@ enum PacketType : uint16_t {
     PACKET_TYPE_PONG          = 0x06,
     PACKET_TYPE_KEYFRAME_REQ  = 0x07,
     PACKET_TYPE_AUDIO_DEVICES = 0x08,
-    PACKET_TYPE_SET_AUDIO_SRC = 0x09
+    PACKET_TYPE_SET_AUDIO_SRC = 0x09,
+    PACKET_TYPE_GOODBYE       = 0x0A
 };
 
 enum HelloFlags : uint16_t {
@@ -119,4 +120,13 @@ struct AudioPacket {
     std::vector<uint8_t> pcm;
     uint32_t sampleRate = 48000;
     uint16_t channels = 2;
+};
+
+struct AirPlayTarget {
+    std::string name;
+    std::string ip;
+    int port = 7002;
+    bool isLaptop = true;
+    bool isDirectObs = false;
+    bool isConnected = false;
 };

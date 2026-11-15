@@ -667,7 +667,7 @@ static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObject
         };
 
         _lobbyTitle = [makeLabel(NSMakeRect(24, 174, 452, 26), 19.0, NSFontWeightSemibold,
-                                 [NSColor whiteColor], @"WinMirror AirPlay v2.2.0") retain];
+                                 [NSColor whiteColor], @"WinMirror AirPlay v2.3.0") retain];
         _lobbySub = [makeLabel(NSMakeRect(24, 150, 452, 18), 12.0, NSFontWeightRegular,
                                [NSColor colorWithCalibratedRed:0.55 green:0.60 blue:0.68 alpha:1.0],
                                @"Game Screen Low-Latency Receiver  |  Max 200 Mbps HEVC HDR10") retain];
@@ -1430,7 +1430,7 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
                                               styleMask:style
                                                 backing:NSBackingStoreBuffered
                                                   defer:NO];
-        [_window setTitle:@"WinMirror AirPlay v2.2.0 | Game Receiver Ready"];
+        [_window setTitle:@"WinMirror AirPlay v2.3.0 | Game Receiver Ready"];
         [_window setBackgroundColor:[NSColor colorWithCalibratedRed:0.051 green:0.067 blue:0.090 alpha:1.0]];
         [_window setMinSize:NSMakeSize(800, 450)];
         [_window setDelegate:self];
@@ -1613,6 +1613,11 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
     return NO;
 }
 
+- (BOOL)hasDiscoveredTargets {
+    std::lock_guard<std::mutex> lock(_targetMutex);
+    return !_discoveredTargets.empty() || _hasCliHost;
+}
+
 - (void)startBluetoothDiscovery {
     static const uint8_t uuidBytes[16] = {
         0x8F, 0x4A, 0x2C, 0x10, 0x7B, 0x3E, 0x4E, 0x91,
@@ -1621,13 +1626,15 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
     IOBluetoothSDPUUID *targetUuid = [IOBluetoothSDPUUID uuidWithBytes:uuidBytes length:16];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        int passCount = 0;
+        // Let UDP LAN/USB discovery connect first without 2.4GHz Bluetooth radio contention
+        sleep(2);
         while (!self->_shuttingDown.load()) {
-            if (!self.btLinked) {
+            // shortcut: skip BT RFCOMM probing once LAN/USB target is discovered or streaming so main thread and Wi-Fi never stall
+            if (!self.btLinked && !self.videoView.streamingActive && ![self hasDiscoveredTargets]) {
                 NSArray *paired = [IOBluetoothDevice pairedDevices];
                 for (IOBluetoothDevice *dev in paired) {
-                    if (self->_shuttingDown.load() || self.btLinked) break;
-                    if (!dev) continue;
+                    if (self->_shuttingDown.load() || self.btLinked || self.videoView.streamingActive || [self hasDiscoveredTargets]) break;
+                    if (!dev || ![dev isConnected]) continue;
 
                     auto findRec = [&](IOBluetoothDevice *d) -> IOBluetoothSDPServiceRecord * {
                         IOBluetoothSDPServiceRecord *r = [d getServiceRecordForUUID:targetUuid];
@@ -1642,12 +1649,6 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
                     };
 
                     IOBluetoothSDPServiceRecord *rec = findRec(dev);
-                    // Rate-limit SDP sweeps on shared 2.4GHz Wi-Fi/BT combo radios to prevent Wi-Fi stalls.
-                    if (!rec && (passCount == 0 || (passCount % 6 == 0))) {
-                        [dev performSDPQuery:nil];
-                        usleep(400000);
-                        rec = findRec(dev);
-                    }
                     if (!rec) continue;
 
                     BluetoothRFCOMMChannelID chanId = 0;
@@ -1668,7 +1669,6 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
                         if (opened) break;
                     }
                 }
-                passCount++;
             }
             sleep(5);
         }
@@ -1778,7 +1778,7 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
     _statusItem = [[[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength] retain];
     if (_statusItem.button) {
         _statusItem.button.title = @"WM";
-        _statusItem.button.toolTip = @"WinMirror AirPlay v2.2.0";
+        _statusItem.button.toolTip = @"WinMirror AirPlay v2.3.0";
     }
     NSMenu *sbMenu = [[[NSMenu alloc] initWithTitle:@"WinMirror"] autorelease];
     NSMenuItem *sbShow = [[[NSMenuItem alloc] initWithTitle:@"Focus Receiver Window"
@@ -2299,7 +2299,7 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
         int tos = 0x88; // DSCP AF41 multimedia low-latency class (best-effort)
         setsockopt(sock, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
 
-        struct timeval tv = { 2, 0 };
+        struct timeval tv = { 5, 0 };
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         sockaddr_in saddr = {};
@@ -2307,11 +2307,28 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
         saddr.sin_port = htons(static_cast<uint16_t>(port));
         inet_pton(AF_INET, host.c_str(), &saddr.sin_addr);
 
-        if (connect(sock, reinterpret_cast<sockaddr *>(&saddr), sizeof(saddr)) < 0) {
-            close(sock);
-            usleep(350000);
-            continue;
+        int fl = fcntl(sock, F_GETFL, 0);
+        if (fl >= 0) fcntl(sock, F_SETFL, fl | O_NONBLOCK);
+        int rc = connect(sock, reinterpret_cast<sockaddr *>(&saddr), sizeof(saddr));
+        if (rc < 0) {
+            bool connected = false;
+            if (errno == EINPROGRESS) {
+                struct pollfd cpfd = { sock, POLLOUT, 0 };
+                if (poll(&cpfd, 1, 800) > 0 && (cpfd.revents & POLLOUT)) {
+                    int soErr = 0;
+                    socklen_t soLen = sizeof(soErr);
+                    if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &soErr, &soLen) == 0 && soErr == 0) {
+                        connected = true;
+                    }
+                }
+            }
+            if (!connected) {
+                close(sock);
+                usleep(200000);
+                continue;
+            }
         }
+        if (fl >= 0) fcntl(sock, F_SETFL, fl & ~O_NONBLOCK);
 
         bool currentIsUsb = isLocalUsbOrWiredInterfaceForIp(host, false);
         NSString *connectedHostNs = [NSString stringWithUTF8String:host.c_str()];
@@ -2380,17 +2397,20 @@ static void mediaStreamLoop(MirrorWindowController *controller, std::atomic<bool
                         avgDecodeMs = (avgDecodeMs <= 0.001) ? decDurMs : (avgDecodeMs * 0.85 + decDurMs * 0.15);
                         decodedFpsFrames++;
                         totalFrames++;
+                        if (totalFrames == 1) {
+                            dispatch_async(dispatch_get_main_queue(), ^{
+                                controller.videoView.streamingActive = YES;
+                            });
+                        }
                         if (presentFrame) {
                             lastPresentTime = std::chrono::steady_clock::now();
                         }
                     } else {
                         vq.dropCount++;
-                        if (totalFrames > 0) {
-                            auto now = std::chrono::steady_clock::now();
-                            if (now - lastDecodeErrKeyReq >= std::chrono::milliseconds(500)) {
-                                lastDecodeErrKeyReq = now;
-                                [controller requestKeyframeFromPc];
-                            }
+                        auto now = std::chrono::steady_clock::now();
+                        if (now - lastDecodeErrKeyReq >= std::chrono::milliseconds(500)) {
+                            lastDecodeErrKeyReq = now;
+                            [controller requestKeyframeFromPc];
                         }
                     }
                 }

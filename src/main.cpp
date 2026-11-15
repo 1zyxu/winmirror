@@ -16,10 +16,11 @@
 #include <streambuf>
 #include <cstdlib>
 #include <thread>
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
-#include <cctype>
-#include <algorithm>
+#include <optional>
 #include <iphlpapi.h>
 #include <mmsystem.h>
 #include <shellapi.h>
@@ -38,6 +39,10 @@ static std::atomic<bool> g_hasVddState{false};
 static std::atomic<bool> g_installingVdd{false};
 static std::atomic<uint64_t> g_captureSkips{0};
 static std::atomic<uint64_t> g_stateChangedSeq{0};
+static std::mutex g_actionMtx;
+static std::optional<AirPlayTarget> g_pendingTarget;
+static std::string g_pendingManualIp;
+static bool g_rescanPending = false;
 static WinMirrorGui* g_trayCleanupGui = nullptr;
 
 static void applyGameProcessBoost(bool enable) {
@@ -113,11 +118,15 @@ static bool isRunningAsAdmin() {
 }
 
 static void cleanupPreviousUpdateBinary() {
-    char exePath[MAX_PATH] = {};
-    if (GetModuleFileNameA(NULL, exePath, MAX_PATH) > 0) {
-        std::string oldExe = std::string(exePath) + ".old.exe";
-        DeleteFileA(oldExe.c_str());
+    wchar_t exePath[MAX_PATH] = {};
+    if (GetModuleFileNameW(NULL, exePath, MAX_PATH) > 0) {
+        std::wstring base(exePath);
+        DeleteFileW((base + L".old.exe").c_str());
+        DeleteFileW((base + L".update.exe").c_str());
     }
+    std::wstring dllBase = Updater::getExecutableDir() + L"\\winmirror_rt.dll";
+    DeleteFileW((dllBase + L".tmp").c_str());
+    DeleteFileW((dllBase + L".update").c_str());
 }
 
 static uint16_t buildHelloFlags(bool btReady, const ScreenCapture& /*cap*/, const Encoder& enc, bool unlimitedFps) {
@@ -349,6 +358,8 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
             port = std::stoi(args[++i]);
         } else if (arg == "--fps" && i + 1 < args.size()) {
             cliFps = parseCliFps(args[++i]);
+        } else if (arg == "--update") {
+            checkUpdate = true;
         } else if (arg == "--no-update") {
             checkUpdate = false;
         } else if (arg == "--update-only") {
@@ -380,6 +391,9 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
         Updater::ensureCompanionDll(exeDir);
     }
     if (checkUpdate && !checkOnly && !installVdd) {
+        if (gui) {
+            gui->setStatusBanner(std::string("Checking GitHub (") + WINMIRROR_REPO + ") for updates...");
+        }
         Updater::checkForUpdates(true);
     }
 
@@ -701,6 +715,14 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
         }
     };
 
+    std::string tempBanner;
+    auto tempBannerUntil = std::chrono::steady_clock::now();
+    auto setTempBanner = [&](const std::string& msg, int seconds = 6) {
+        tempBanner = msg;
+        tempBannerUntil = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+        if (gui) gui->setStatusBanner(msg);
+    };
+
     auto pushGuiSnapshot = [&](float curFps, float curMbps) {
         if (!gui) return;
         uint16_t hflags = buildHelloFlags(btBridge.isRadioAvailable(), capture, encoder, unlimitedFps);
@@ -741,10 +763,17 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
         st.btStatus = btBridge.getStatusText();
         st.endpointsSummary = netSummary;
         st.primaryConnectAddr = primaryAddr;
+        st.connectedHost = server.getConnectedHost();
+        st.receivers = beacon.getTargetsSnapshot(st.connectedHost);
         st.dllVersion = rtLoaded ? preflightRep.runtimeVersion : "";
-        st.statusBanner = st.clients > 0
-            ? (std::string("Streaming ") + (st.gameBoost ? "Game Boost " : "") + "live to Mac (up to " + std::to_string(st.targetMbps) + " Mbps).")
-            : "Ready - Open WinMirror.app on Mac to connect (USB / 5GHz Wi-Fi / BT).";
+        auto nowTs = std::chrono::steady_clock::now();
+        if (!tempBanner.empty() && nowTs < tempBannerUntil) {
+            st.statusBanner = tempBanner;
+        } else {
+            st.statusBanner = st.clients > 0
+                ? (std::string("Mirroring live (Video + Audio) - click active row to disconnect."))
+                : "Click a device above to mirror (Video + Audio), or enter Mac IP.";
+        }
         gui->updateStatus(st);
     };
     pushGuiSnapshot(0.0f, 0.0f);
@@ -795,6 +824,73 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
         }
 
         bool hasClients = (server.getActiveClients() > 0);
+        {
+            std::optional<AirPlayTarget> targetReq;
+            std::string manualIpReq;
+            bool rescanNow = false;
+            {
+                std::lock_guard<std::mutex> aLock(g_actionMtx);
+                targetReq = std::move(g_pendingTarget);
+                g_pendingTarget.reset();
+                manualIpReq = std::move(g_pendingManualIp);
+                g_pendingManualIp.clear();
+                rescanNow = g_rescanPending;
+                g_rescanPending = false;
+            }
+            if (rescanNow) {
+                beacon.triggerRescan();
+                setTempBanner("Scanning LAN for AirPlay devices and Mac OBS...", 4);
+                pushGuiSnapshot(0.0f, 0.0f);
+            }
+            if (targetReq.has_value()) {
+                const auto& tgt = *targetReq;
+                if (tgt.isConnected) {
+                    server.disconnectAllClients();
+                    hasClients = false;
+                    setTempBanner("Disconnected from " + tgt.name + ".");
+                } else {
+                    if (hasClients) {
+                        server.disconnectAllClients();
+                        hasClients = false;
+                    }
+                    int tryPort = tgt.isDirectObs ? tgt.port : 7002;
+                    if (server.connectToReceiver(tgt.ip, tryPort)) {
+                        hasClients = true;
+                        notifyKeyframe();
+                        setTempBanner("Connected to " + tgt.name + " (Video + Audio)!");
+                    } else if (!tgt.isDirectObs) {
+                        setTempBanner(tgt.isLaptop
+                            ? (tgt.name + ": Open OBS with AirPlay source on Mac, or check Mac firewall.")
+                            : (tgt.name + " requires Apple FairPlay PIN. Open OBS on Mac to mirror."));
+                    } else {
+                        setTempBanner("Could not reach OBS on " + tgt.ip + ":" + std::to_string(tryPort));
+                    }
+                }
+                pushGuiSnapshot(0.0f, 0.0f);
+            } else if (!manualIpReq.empty()) {
+                std::string host = manualIpReq;
+                int manualPort = 7002;
+                auto colonPos = host.rfind(':');
+                if (colonPos != std::string::npos) {
+                    int parsedPort = std::atoi(host.substr(colonPos + 1).c_str());
+                    if (parsedPort > 0 && parsedPort <= 65535) manualPort = parsedPort;
+                    host = host.substr(0, colonPos);
+                }
+                if (hasClients) {
+                    server.disconnectAllClients();
+                    hasClients = false;
+                }
+                beacon.setManualReceiverIp(host, manualPort);
+                if (server.connectToReceiver(host, manualPort)) {
+                    hasClients = true;
+                    notifyKeyframe();
+                    setTempBanner("Connected to " + host + ":" + std::to_string(manualPort) + " (Video + Audio)!");
+                } else {
+                    setTempBanner("Could not connect to " + host + ":" + std::to_string(manualPort) + " - check OBS is running.");
+                }
+                pushGuiSnapshot(0.0f, 0.0f);
+            }
+        }
         if (!hasClients) {
             std::this_thread::sleep_for(std::chrono::milliseconds(40));
             nextEncodeTime = std::chrono::steady_clock::now();
@@ -963,66 +1059,81 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     std::streambuf* oldCout = std::cout.rdbuf(&logBuf);
     std::streambuf* oldCerr = std::cerr.rdbuf(&logBuf);
 
-    std::mutex vddMtx;
-    std::thread vddThread;
+    std::mutex engineJoinMtx;
+    std::mutex updateMtx;
+    std::thread updateThread;
+    std::atomic<bool> checkingUpdate{false};
+    std::thread engineThread;
+
+    auto joinEngineSafe = [&]() {
+        std::lock_guard<std::mutex> jLock(engineJoinMtx);
+        if (engineThread.joinable()) engineThread.join();
+    };
+
     gui.setActions(
         [&]() {
-            g_unlimitedFpsFlag.store(!g_unlimitedFpsFlag.load());
-            g_stateChangedSeq++;
-        },
-        [&]() {
-            bool nextBoost = !g_gameBoostFlag.load();
-            g_gameBoostFlag.store(nextBoost);
-            g_stateChangedSeq++;
-            gui.setStatusBanner(nextBoost
-                ? "Game Boost ENABLED: High Priority + EcoQoS Off + Low-Latency NVENC VBV."
-                : "Game Boost balanced mode enabled.");
-        },
-        [&]() {
-            if (g_installingVdd.load()) return;
-            if (!isRunningAsAdmin()) {
-                gui.setStatusBanner("Administrator rights required to install the 4K HDR Virtual Display Driver.");
-                return;
-            }
-            if (!WinMirrorRuntimeApi::instance().isLoaded()) {
-                gui.setStatusBanner("Runtime DLL winmirror_rt.dll not loaded.");
-                return;
-            }
-            std::lock_guard<std::mutex> lock(vddMtx);
-            if (vddThread.joinable()) vddThread.join();
-            g_installingVdd.store(true);
-            g_stateChangedSeq++;
-            gui.setStatusBanner("Downloading & installing 4K HDR Virtual Display Driver...");
-            vddThread = std::thread([&gui]() {
-                std::wstring exeDir = Updater::getExecutableDir();
-                wchar_t exePathW[MAX_PATH] = {};
-                GetModuleFileNameW(nullptr, exePathW, MAX_PATH);
-                bool ok = installVirtualDisplayDriver(exeDir);
-                WmPreflightReport rep = {};
-                WinMirrorRuntimeApi::instance().runPreflight(exePathW, true, rep);
-                g_hasVddState.store(ok || rep.hasVddDriver != 0);
-                g_installingVdd.store(false);
-                g_stateChangedSeq++;
-                gui.setStatusBanner(ok
-                    ? "4K HDR Driver installed! Enable HDR/4K in Windows Display Settings."
-                    : "Virtual Display Driver installation did not complete cleanly.");
-            });
-        },
-        [&]() {
             g_running = false;
+        },
+        [&](const AirPlayTarget& target) {
+            {
+                std::lock_guard<std::mutex> aLock(g_actionMtx);
+                g_pendingTarget = target;
+                g_pendingManualIp.clear();
+            }
+            gui.setStatusBanner(target.isConnected
+                ? ("Disconnecting from " + target.name + "...")
+                : ("Connecting to " + target.name + " (" + target.ip + ")..."));
+            g_stateChangedSeq++;
+        },
+        [&](const std::string& ipText) {
+            {
+                std::lock_guard<std::mutex> aLock(g_actionMtx);
+                g_pendingManualIp = ipText;
+                g_pendingTarget.reset();
+            }
+            gui.setStatusBanner("Connecting to " + ipText + "...");
+            g_stateChangedSeq++;
+        },
+        [&]() {
+            {
+                std::lock_guard<std::mutex> aLock(g_actionMtx);
+                g_rescanPending = true;
+            }
+            gui.setStatusBanner("Scanning LAN for AirPlay devices...");
+            g_stateChangedSeq++;
+        },
+        [&]() {
+            if (checkingUpdate.exchange(true)) return;
+            std::lock_guard<std::mutex> lock(updateMtx);
+            if (updateThread.joinable()) updateThread.join();
+            gui.setStatusBanner(std::string("Checking GitHub (") + WINMIRROR_REPO + ") for updates...");
+            updateThread = std::thread([&]() {
+                bool hasNew = Updater::checkForUpdates(false);
+                if (hasNew) {
+                    gui.setStatusBanner("Update found! Stopping stream & installing...");
+                    g_running = false;
+                    joinEngineSafe();
+                    if (!Updater::checkForUpdates(true)) {
+                        gui.setStatusBanner("Update download failed. Please retry.");
+                    }
+                } else {
+                    gui.setStatusBanner(std::string("WinMirror v") + WINMIRROR_VERSION + " is up to date.");
+                }
+                checkingUpdate.store(false);
+            });
         }
     );
 
-    std::thread engineThread([&]() {
+    engineThread = std::thread([&]() {
         runWinMirrorEngine(args, &gui);
     });
 
     int rc = gui.runMessageLoop();
     g_running = false;
-    if (engineThread.joinable()) engineThread.join();
+    joinEngineSafe();
     {
-        std::lock_guard<std::mutex> lock(vddMtx);
-        if (vddThread.joinable()) vddThread.join();
+        std::lock_guard<std::mutex> lock(updateMtx);
+        if (updateThread.joinable()) updateThread.join();
     }
     std::cout.rdbuf(oldCout);
     std::cerr.rdbuf(oldCerr);

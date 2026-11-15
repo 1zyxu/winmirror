@@ -140,8 +140,11 @@ void AirPlayServer::acceptLoop() {
         DWORD rcvTimeoutMs = 5000;
         setsockopt(clientSock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&rcvTimeoutMs), sizeof(rcvTimeoutMs));
 
+        char ipBuf[64] = {};
+        inet_ntop(AF_INET, &clientAddr.sin_addr, ipBuf, sizeof(ipBuf));
         auto session = std::make_shared<ClientSession>();
         session->sock = clientSock;
+        session->peerIp = ipBuf;
         session->alive = true;
 
         {
@@ -152,6 +155,91 @@ void AirPlayServer::acceptLoop() {
 
         std::thread(&AirPlayServer::runClient, this, session).detach();
     }
+}
+
+bool AirPlayServer::connectToReceiver(const std::string& host, int port) {
+    if (!m_running || host.empty()) return false;
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return false;
+
+    u_long nonBlock = 1;
+    ioctlsocket(s, FIONBIO, &nonBlock);
+
+    sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<u_short>(port));
+    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) <= 0) {
+        closesocket(s);
+        return false;
+    }
+
+    int rc = connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    if (rc == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK) {
+        closesocket(s);
+        return false;
+    }
+    if (rc != 0) {
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(s, &wfds);
+        timeval tv = {1, 0};
+        if (select(0, nullptr, &wfds, nullptr, &tv) <= 0) {
+            closesocket(s);
+            return false;
+        }
+        int soErr = 0;
+        int len = sizeof(soErr);
+        if (getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soErr), &len) != 0 || soErr != 0) {
+            closesocket(s);
+            return false;
+        }
+    }
+
+    nonBlock = 0;
+    ioctlsocket(s, FIONBIO, &nonBlock);
+
+    int nodelay = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&nodelay), sizeof(nodelay));
+    int sndbuf = 256 * 1024;
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&sndbuf), sizeof(sndbuf));
+    int tos = 0x88;
+    setsockopt(s, IPPROTO_IP, IP_TOS, reinterpret_cast<const char*>(&tos), sizeof(tos));
+    DWORD sndTimeoutMs = 2000;
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&sndTimeoutMs), sizeof(sndTimeoutMs));
+    DWORD rcvTimeoutMs = 5000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&rcvTimeoutMs), sizeof(rcvTimeoutMs));
+
+    auto session = std::make_shared<ClientSession>();
+    session->sock = s;
+    session->peerIp = host;
+    session->alive = true;
+    {
+        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        m_clients.push_back(session);
+    }
+    m_activeClients++;
+    std::thread(&AirPlayServer::runClient, this, session).detach();
+    return true;
+}
+
+void AirPlayServer::disconnectAllClients() {
+    std::lock_guard<std::mutex> lock(m_clientsMutex);
+    for (auto& c : m_clients) {
+        {
+            std::lock_guard<std::mutex> ql(c->queueMutex);
+            c->sendGoodbye = true;
+            c->alive = false;
+        }
+        c->cv.notify_all();
+    }
+}
+
+std::string AirPlayServer::getConnectedHost() const {
+    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(m_clientsMutex));
+    for (const auto& c : m_clients) {
+        if (c->alive && !c->peerIp.empty()) return c->peerIp;
+    }
+    return {};
 }
 
 bool AirPlayServer::sendAll(SOCKET sock, const void* data, size_t len) {
@@ -451,7 +539,13 @@ void AirPlayServer::runClient(std::shared_ptr<ClientSession> session) {
                        session->hasAudioListPending || session->hasPongPending;
             });
 
-            if (!session->alive || !m_running) break;
+            if (!session->alive || !m_running) {
+                if (session->sendGoodbye && session->sock != INVALID_SOCKET) {
+                    sendPacket(session->sock, PACKET_TYPE_GOODBYE, 0, 0, 0, nullptr, 0);
+                    shutdown(session->sock, SD_BOTH);
+                }
+                break;
+            }
 
             if (session->hasHelloPending) {
                 session->hasHelloPending = false;

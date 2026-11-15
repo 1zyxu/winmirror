@@ -8,6 +8,8 @@
 *.dylib
 winmirror_mac
 winmirror_update.exe
+WinMirror.app/
+*.dmg
 vdd/
 
 # OS / Editor

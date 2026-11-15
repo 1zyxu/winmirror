@@ -1327,7 +1327,8 @@ bool ScreenCapture::pollCursor(CursorPayload& outMeta, std::vector<uint8_t>& out
     int relX = ci.ptScreenPos.x - m_screenLeft;
     int relY = ci.ptScreenPos.y - m_screenTop;
 
-    bool shapeChanged = (ci.hCursor != m_lastHCursor) || (forceBitmap && m_cachedCursorBgra.empty());
+    bool needBitmap = m_cachedCursorBgra.empty();
+    bool shapeChanged = (ci.hCursor != m_lastHCursor) || (visible && needBitmap);
     bool posChanged = (ci.ptScreenPos.x != m_lastCursorPos.x) ||
                       (ci.ptScreenPos.y != m_lastCursorPos.y) ||
                       (visible != m_lastCursorVisible);

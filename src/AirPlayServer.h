@@ -22,6 +22,9 @@ public:
 
     bool start();
     void stop();
+    bool connectToReceiver(const std::string& host, int port = 7002);
+    void disconnectAllClients();
+    std::string getConnectedHost() const;
 
     void broadcastVideo(std::shared_ptr<const EncodedFrame> frame);
     void broadcastCursor(const CursorPayload& meta, const std::vector<uint8_t>& bgra);
@@ -36,6 +39,7 @@ public:
 private:
     struct ClientSession {
         SOCKET sock = INVALID_SOCKET;
+        std::string peerIp;
         std::atomic<bool> alive{true};
         bool waitingForKeyframe = true;
 
@@ -50,6 +54,7 @@ private:
         bool hasHelloPending = false;
         bool hasAudioListPending = false;
         bool hasPongPending = false;
+        bool sendGoodbye = false;
         uint32_t pongExtra1 = 0;
         uint32_t pongExtra2 = 0;
         std::vector<uint8_t> txBuf;

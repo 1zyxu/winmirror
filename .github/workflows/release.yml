@@ -27,7 +27,7 @@ jobs:
             /link /LTCG /OPT:REF /OPT:ICF `
             user32.lib advapi32.lib winmm.lib ws2_32.lib `
             /OUT:winmirror_rt.dll
-          cl.exe /nologo /O2 /MT /GL /std:c++17 /EHsc `
+          cl.exe /nologo /O2 /MT /GL /std:c++17 /EHsc /utf-8 `
             src\main.cpp `
             src\GuiWindow.cpp `
             src\ScreenCapture.cpp `
