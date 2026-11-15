@@ -1,9 +1,9 @@
 #include "Updater.h"
 #include "UpdaterLogic.h"
+#include "SecProtect.h"
 #include "WinMirrorRuntime.h"
 #include <windows.h>
 #include <winhttp.h>
-#include <iostream>
 #include <vector>
 #include <cstdio>
 
@@ -29,10 +29,16 @@ std::string toUtf8(const std::wstring& wstr) {
 
 using updater_logic::trimVersion;
 
+std::string getUpdaterRepoSlug() {
+    return WM_OBF("1zyxu/winmirror");
+}
+
 bool openWinHttpGet(const std::wstring& host, INTERNET_PORT port, const std::wstring& path, bool https,
-                    HINTERNET& outSession, HINTERNET& outConnect, HINTERNET& outRequest, const wchar_t* extraHeaders) {
-    outSession = WinHttpOpen(L"WinMirror-Updater/2.1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                    HINTERNET& outSession, HINTERNET& outConnect, HINTERNET& outRequest, const std::wstring& extraHeaders) {
+    std::wstring ua = WM_OBF_W(L"WM-Client/2.4");
+    outSession = WinHttpOpen(ua.c_str(), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                              WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    wm_sec::wipeWString(ua);
     if (!outSession) return false;
 
     DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
@@ -54,7 +60,7 @@ bool openWinHttpGet(const std::wstring& host, INTERNET_PORT port, const std::wst
     DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
     WinHttpSetOption(outRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
 
-    std::wstring headers = extraHeaders ? std::wstring(extraHeaders) : L"User-Agent: WinMirror-Updater\r\n";
+    std::wstring headers = !extraHeaders.empty() ? extraHeaders : WM_OBF_W(L"User-Agent: WM-Client\r\n");
     BOOL ok = WinHttpSendRequest(outRequest, headers.c_str(), static_cast<DWORD>(headers.length()),
                                  WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
     if (ok) ok = WinHttpReceiveResponse(outRequest, nullptr);
@@ -93,16 +99,29 @@ bool Updater::isNewerVersion(const std::string& remote, const std::string& local
 }
 
 bool Updater::fetchReleaseJson(const std::string& repo, const std::string& tagOrLatest, std::string& outJson) {
+    wm_sec::enforceAntiReverse();
     outJson.clear();
-    std::wstring apiPath = L"/repos/" + toWide(repo) + L"/releases/" +
-                           ((tagOrLatest == "latest") ? L"latest" : (L"tags/" + toWide(tagOrLatest)));
+    std::wstring pPrefix = WM_OBF_W(L"/repos/");
+    std::wstring pRel = WM_OBF_W(L"/releases/");
+    std::wstring pLatest = WM_OBF_W(L"latest");
+    std::wstring pTags = WM_OBF_W(L"tags/");
+    std::wstring apiHost = WM_OBF_W(L"api.github.com");
+    std::wstring apiHdr = WM_OBF_W(L"User-Agent: WM-Client\r\nAccept: application/vnd.github.v3+json\r\n");
+
+    std::wstring apiPath = pPrefix + toWide(repo) + pRel +
+                           ((tagOrLatest == toUtf8(pLatest)) ? pLatest : (pTags + toWide(tagOrLatest)));
 
     HINTERNET hSession = nullptr, hConnect = nullptr, hRequest = nullptr;
-    if (!openWinHttpGet(L"api.github.com", INTERNET_DEFAULT_HTTPS_PORT, apiPath, true,
-                        hSession, hConnect, hRequest,
-                        L"User-Agent: WinMirror-Updater\r\nAccept: application/vnd.github.v3+json\r\n")) {
-        return false;
-    }
+    bool openOk = openWinHttpGet(apiHost, INTERNET_DEFAULT_HTTPS_PORT, apiPath, true,
+                                 hSession, hConnect, hRequest, apiHdr);
+    wm_sec::wipeWString(pPrefix);
+    wm_sec::wipeWString(pRel);
+    wm_sec::wipeWString(pLatest);
+    wm_sec::wipeWString(pTags);
+    wm_sec::wipeWString(apiHost);
+    wm_sec::wipeWString(apiHdr);
+    wm_sec::wipeWString(apiPath);
+    if (!openOk) return false;
 
     DWORD dwSize = 0;
     do {
@@ -132,6 +151,7 @@ std::string Updater::findAssetDownloadUrl(const std::string& json, const std::st
 }
 
 bool Updater::downloadFileW(const std::string& url, const std::wstring& outputPath, bool verifyPeHeader) {
+    wm_sec::enforceAntiReverse();
     URL_COMPONENTS urlComp = {};
     urlComp.dwStructSize = sizeof(urlComp);
     wchar_t hostName[256] = {};
@@ -148,7 +168,7 @@ bool Updater::downloadFileW(const std::string& url, const std::wstring& outputPa
 
     HINTERNET hSession = nullptr, hConnect = nullptr, hRequest = nullptr;
     if (!openWinHttpGet(hostName, urlComp.nPort, urlPath, urlComp.nScheme == INTERNET_SCHEME_HTTPS,
-                        hSession, hConnect, hRequest, L"User-Agent: WinMirror-Updater\r\n")) {
+                        hSession, hConnect, hRequest, L"")) {
         return false;
     }
 
@@ -197,43 +217,56 @@ bool Updater::downloadFileW(const std::string& url, const std::wstring& outputPa
 }
 
 bool Updater::ensureCompanionDll(const std::wstring& exeDir) {
-    std::wstring dllPath = exeDir + L"\\winmirror_rt.dll";
+    wm_sec::enforceAntiReverse();
+    std::wstring dllNameW = WM_OBF_W(L"\\winmirror_rt.dll");
+    std::wstring dllPath = exeDir + dllNameW;
+    wm_sec::wipeWString(dllNameW);
+
     std::string loadedVer;
     if (WinMirrorRuntimeApi::probeDllVersion(dllPath, loadedVer) && loadedVer == WINMIRROR_VERSION) {
         return true;
     }
 
-    std::cout << "[Updater] Runtime DLL (" << toUtf8(dllPath) << ") is "
-              << (loadedVer.empty() ? "missing" : ("v" + loadedVer + " != v" + WINMIRROR_VERSION))
-              << "; installing winmirror_rt.dll v" << WINMIRROR_VERSION << "..." << std::endl;
+    std::string repo = getUpdaterRepoSlug();
+    std::string dllAsset = WM_OBF("winmirror_rt.dll");
+    std::string tagKey = WM_OBF("tag_name");
+    std::string latestKey = WM_OBF("latest");
+    std::string exactTag = std::string("v") + WINMIRROR_VERSION;
 
     std::string dllUrl;
     std::string json;
-    std::string exactTag = std::string("v") + WINMIRROR_VERSION;
-    if (fetchReleaseJson(WINMIRROR_REPO, exactTag, json)) {
-        dllUrl = findAssetDownloadUrl(json, "winmirror_rt.dll");
+    if (fetchReleaseJson(repo, exactTag, json)) {
+        dllUrl = findAssetDownloadUrl(json, dllAsset);
     }
-    if (dllUrl.empty() && fetchReleaseJson(WINMIRROR_REPO, "latest", json)) {
-        std::string latestTag = parseJsonStringField(json, "tag_name");
+    if (dllUrl.empty() && fetchReleaseJson(repo, latestKey, json)) {
+        std::string latestTag = parseJsonStringField(json, tagKey);
         if (trimVersion(latestTag) == WINMIRROR_VERSION) {
-            dllUrl = findAssetDownloadUrl(json, "winmirror_rt.dll");
+            dllUrl = findAssetDownloadUrl(json, dllAsset);
         }
     }
     if (dllUrl.empty()) {
-        dllUrl = "https://github.com/" + std::string(WINMIRROR_REPO) +
-                 "/releases/download/" + exactTag + "/winmirror_rt.dll";
+        std::string ghBase = WM_OBF("https://github.com/");
+        std::string dlPath = WM_OBF("/releases/download/");
+        dllUrl = ghBase + repo + dlPath + exactTag + "/" + dllAsset;
+        wm_sec::wipeString(ghBase);
+        wm_sec::wipeString(dlPath);
     }
+    wm_sec::wipeString(repo);
+    wm_sec::wipeString(tagKey);
+    wm_sec::wipeString(latestKey);
 
-    std::wstring tmpDll = dllPath + L".tmp";
+    std::wstring tmpSuffix = WM_OBF_W(L".tmp");
+    std::wstring tmpDll = dllPath + tmpSuffix;
+    wm_sec::wipeWString(tmpSuffix);
     if (!downloadFileW(dllUrl, tmpDll, true)) {
-        std::cerr << "[Updater] Could not download winmirror_rt.dll yet (continuing with built-in fallback)." << std::endl;
+        wm_sec::wipeString(dllAsset);
         return false;
     }
+    wm_sec::wipeString(dllAsset);
 
     std::string verifiedVer;
     if (!WinMirrorRuntimeApi::probeDllVersion(tmpDll, verifiedVer) || verifiedVer != WINMIRROR_VERSION) {
         DeleteFileW(tmpDll.c_str());
-        std::cerr << "[Updater] Downloaded winmirror_rt.dll version mismatch (" << verifiedVer << ")." << std::endl;
         return false;
     }
 
@@ -241,30 +274,38 @@ bool Updater::ensureCompanionDll(const std::wstring& exeDir) {
         DeleteFileW(tmpDll.c_str());
         return false;
     }
-    std::cout << "[Updater] Installed winmirror_rt.dll v" << verifiedVer << " cleanly." << std::endl;
     return true;
 }
 
 bool Updater::downloadVirtualDisplayPackage(const std::wstring& outputZipPath) {
     std::string json;
-    if (!fetchReleaseJson("VirtualDrivers/Virtual-Display-Driver", "latest", json)) {
-        return false;
-    }
-    std::string zipUrl = findAssetDownloadUrl(json, "VDD.Control");
-    if (zipUrl.empty()) {
-        zipUrl = findAssetDownloadUrl(json, "VirtualDisplayDriver-x86.Driver.Only");
-    }
+    std::string vddRepo = WM_OBF("VirtualDrivers/Virtual-Display-Driver");
+    std::string latestKey = WM_OBF("latest");
+    bool fetched = fetchReleaseJson(vddRepo, latestKey, json);
+    wm_sec::wipeString(vddRepo);
+    wm_sec::wipeString(latestKey);
+    if (!fetched) return false;
+
+    std::string a1 = WM_OBF("VDD.Control");
+    std::string a2 = WM_OBF("VirtualDisplayDriver-x86.Driver.Only");
+    std::string zipUrl = findAssetDownloadUrl(json, a1);
+    if (zipUrl.empty()) zipUrl = findAssetDownloadUrl(json, a2);
+    wm_sec::wipeString(a1);
+    wm_sec::wipeString(a2);
     if (zipUrl.empty()) return false;
-    std::cout << "[Driver] Downloading Virtual Display Driver from " << zipUrl << "..." << std::endl;
     return downloadFileW(zipUrl, outputZipPath);
 }
 
 void Updater::applyUpdateAndRestart(const std::string& newExePath) {
+    wm_sec::enforceAntiReverse();
     wchar_t currentExe[MAX_PATH] = {};
     if (GetModuleFileNameW(nullptr, currentExe, MAX_PATH) == 0) return;
 
     std::wstring newExeW = toWide(newExePath);
-    std::wstring oldExe = std::wstring(currentExe) + L".old.exe";
+    std::wstring oldSuf = WM_OBF_W(L".old.exe");
+    std::wstring oldExe = std::wstring(currentExe) + oldSuf;
+    wm_sec::wipeWString(oldSuf);
+
     if (!MoveFileExW(currentExe, oldExe.c_str(), MOVEFILE_REPLACE_EXISTING)) {
         return;
     }
@@ -275,7 +316,6 @@ void Updater::applyUpdateAndRestart(const std::string& newExePath) {
 
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
-    std::cout << "[Updater] Applying update and restarting..." << std::endl;
     if (CreateProcessW(currentExe, nullptr, nullptr, nullptr, FALSE,
                        DETACHED_PROCESS, nullptr, nullptr, &si, &pi)) {
         CloseHandle(pi.hProcess);
@@ -284,62 +324,78 @@ void Updater::applyUpdateAndRestart(const std::string& newExePath) {
     }
 }
 
-bool Updater::checkForUpdates(bool autoInstall) {
-    std::cout << "[Updater] Checking for updates on GitHub (" << WINMIRROR_REPO << ")..." << std::endl;
+bool Updater::checkForUpdates(bool autoInstall, StatusCallback onStatus) {
+    wm_sec::enforceAntiReverse();
+    wm_sec::hideCurrentThread();
+    if (onStatus) onStatus("Checking for updates...");
+
+    std::string repo = getUpdaterRepoSlug();
+    std::string latestKey = WM_OBF("latest");
     std::string json;
-    if (!fetchReleaseJson(WINMIRROR_REPO, "latest", json)) {
-        std::cout << "[Updater] Could not reach GitHub releases or repository is private." << std::endl;
+    bool fetched = fetchReleaseJson(repo, latestKey, json);
+    wm_sec::wipeString(latestKey);
+    if (!fetched) {
+        wm_sec::wipeString(repo);
         return false;
     }
 
-    std::string latestTag = parseJsonStringField(json, "tag_name");
-    std::string exeUrl = findAssetDownloadUrl(json, "winmirror.exe");
-    std::string dllUrl = findAssetDownloadUrl(json, "winmirror_rt.dll");
-    if (exeUrl.empty() && !latestTag.empty()) {
-        exeUrl = "https://github.com/" + std::string(WINMIRROR_REPO) +
-                 "/releases/download/" + latestTag + "/winmirror.exe";
-    }
+    std::string tagKey = WM_OBF("tag_name");
+    std::string exeAsset = WM_OBF("winmirror.exe");
+    std::string dllAsset = WM_OBF("winmirror_rt.dll");
+    std::string latestTag = parseJsonStringField(json, tagKey);
+    std::string exeUrl = findAssetDownloadUrl(json, exeAsset);
+    std::string dllUrl = findAssetDownloadUrl(json, dllAsset);
+    wm_sec::wipeString(tagKey);
 
-    std::cout << "[Updater] Current version: v" << WINMIRROR_VERSION
-              << " | Latest release: " << latestTag << std::endl;
+    if (exeUrl.empty() && !latestTag.empty()) {
+        std::string ghBase = WM_OBF("https://github.com/");
+        std::string dlPath = WM_OBF("/releases/download/");
+        exeUrl = ghBase + repo + dlPath + latestTag + "/" + exeAsset;
+        wm_sec::wipeString(ghBase);
+        wm_sec::wipeString(dlPath);
+    }
+    wm_sec::wipeString(repo);
+    wm_sec::wipeString(exeAsset);
 
     if (!isNewerVersion(latestTag, WINMIRROR_VERSION)) {
-        std::cout << "[Updater] WinMirror is already up to date!" << std::endl;
+        wm_sec::wipeString(dllAsset);
         return false;
     }
 
-    std::cout << "[Updater] *** New update available: " << latestTag << "! ***" << std::endl;
     if (!autoInstall || exeUrl.empty()) {
-        std::cout << "[Updater] Download link: " << exeUrl << std::endl;
+        wm_sec::wipeString(dllAsset);
         return true;
     }
 
+    if (onStatus) onStatus("Downloading update " + latestTag + "...");
+
     if (!dllUrl.empty()) {
-        std::wstring dllDest = getExecutableDir() + L"\\winmirror_rt.dll";
-        std::wstring dllTmp = dllDest + L".update";
+        std::wstring updSuf = WM_OBF_W(L".update");
+        std::wstring dllDest = getExecutableDir() + L"\\" + toWide(dllAsset);
+        std::wstring dllTmp = dllDest + updSuf;
+        wm_sec::wipeWString(updSuf);
         WinMirrorRuntimeApi::instance().unload();
         if (downloadFileW(dllUrl, dllTmp, true)) {
             if (!MoveFileExW(dllTmp.c_str(), dllDest.c_str(), MOVEFILE_REPLACE_EXISTING)) {
                 DeleteFileW(dllTmp.c_str());
-            } else {
-                std::cout << "[Updater] Updated winmirror_rt.dll for " << latestTag << "." << std::endl;
             }
         }
     }
+    wm_sec::wipeString(dllAsset);
 
     wchar_t currentExeW[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, currentExeW, MAX_PATH);
-    std::wstring tempExeW = std::wstring(currentExeW) + L".update.exe";
+    std::wstring updExeSuf = WM_OBF_W(L".update.exe");
+    std::wstring tempExeW = std::wstring(currentExeW) + updExeSuf;
+    wm_sec::wipeWString(updExeSuf);
     std::string tempExe = toUtf8(tempExeW);
 
-    std::cout << "[Updater] Downloading update from " << exeUrl << "..." << std::endl;
     if (downloadFileW(exeUrl, tempExeW, true)) {
-        std::cout << "[Updater] Update downloaded successfully (" << tempExe << ")." << std::endl;
+        if (onStatus) onStatus("Installing " + latestTag + " & restarting...");
         applyUpdateAndRestart(tempExe);
         return true;
     } else {
         DeleteFileW(tempExeW.c_str());
-        std::cerr << "[Updater] Failed to download update." << std::endl;
         return false;
     }
 }

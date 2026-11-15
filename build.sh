@@ -11,14 +11,14 @@ fi
 
 build_win() {
     echo "==> Building winmirror_rt.dll (Windows x86_64 MMCSS / High-Res Timer / Driver Runtime)..."
-    "$ZIG" c++ -target x86_64-windows-gnu -shared -O3 -std=c++17 -Wl,-s \
+    "$ZIG" c++ -target x86_64-windows-gnu -shared -O3 -std=c++17 -fno-rtti -fno-ident -ffunction-sections -fdata-sections -Wl,-s -Wl,--gc-sections \
         src/WinMirrorRuntime.cpp \
         -luser32 -ladvapi32 -lwinmm -lws2_32 \
         -o winmirror_rt.dll
     rm -f winmirror_rt.pdb
 
     echo "==> Building winmirror.exe (Windows x86_64 GUI + HEVC/H.264 200 Mbps HDR + Bluetooth)..."
-    "$ZIG" c++ -target x86_64-windows-gnu -O3 -std=c++17 -Wl,-s -Wl,--subsystem,windows \
+    "$ZIG" c++ -target x86_64-windows-gnu -O3 -std=c++17 -fno-rtti -fno-ident -ffunction-sections -fdata-sections -Wl,-s -Wl,--gc-sections -Wl,--subsystem,windows \
         src/main.cpp \
         src/GuiWindow.cpp \
         src/ScreenCapture.cpp \

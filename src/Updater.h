@@ -1,11 +1,14 @@
 #pragma once
 
 #include "Common.h"
+#include <functional>
 #include <string>
 
 class Updater {
 public:
-    static bool checkForUpdates(bool autoInstall = true);
+    using StatusCallback = std::function<void(const std::string&)>;
+
+    static bool checkForUpdates(bool autoInstall = true, StatusCallback onStatus = nullptr);
     static bool ensureCompanionDll(const std::wstring& exeDir);
     static bool downloadVirtualDisplayPackage(const std::wstring& outputZipPath);
     static void applyUpdateAndRestart(const std::string& newExePath);

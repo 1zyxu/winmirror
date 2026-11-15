@@ -9,6 +9,7 @@
 #include "AudioCapture.h"
 #include "WinMirrorRuntime.h"
 #include "GuiWindow.h"
+#include "SecProtect.h"
 
 #include <iostream>
 #include <iomanip>
@@ -333,7 +334,8 @@ static std::string collectLocalIpsCsv(int port, bool printBanner,
     return ipsCsv.str();
 }
 
-static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui* gui) {
+static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui* gui, bool skipStartupUpdate = false) {
+    wm_sec::hideCurrentThread();
     cleanupPreviousUpdateBinary();
     bool isAdmin = isRunningAsAdmin();
     if (!isAdmin) {
@@ -390,11 +392,12 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
     if (checkUpdate || installOnly || installVdd) {
         Updater::ensureCompanionDll(exeDir);
     }
-    if (checkUpdate && !checkOnly && !installVdd) {
+    if (!skipStartupUpdate && checkUpdate && !checkOnly && !installVdd) {
         if (gui) {
-            gui->setStatusBanner(std::string("Checking GitHub (") + WINMIRROR_REPO + ") for updates...");
+            gui->setStatusBanner("Checking for updates...");
         }
-        Updater::checkForUpdates(true);
+        Updater::checkForUpdates(true, gui ? [&](const std::string& msg) { gui->setStatusBanner(msg); }
+                                           : Updater::StatusCallback{});
     }
 
     auto& rt = WinMirrorRuntimeApi::instance();
@@ -628,6 +631,7 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
 
     // Decoupled high-priority Capture + Cursor thread so NVENC/PCIe stalls never block DXGI ReleaseFrame or mouse input
     std::thread captureThread([&]() {
+        wm_sec::hideCurrentThread();
         HANDLE hCapMmcss = rt.enterMmcss(L"Games");
         std::vector<uint8_t> curBgra;
         CursorPayload curMeta = {};
@@ -949,6 +953,7 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
 
         auto now = std::chrono::steady_clock::now();
         if (now - lastIpRefresh >= std::chrono::seconds(3)) {
+            wm_sec::enforceAntiReverse();
             std::string newSummary, newPrimary;
             std::string newIpsCsv = collectLocalIpsCsv(port, false, &newSummary, &newPrimary);
             if (newIpsCsv != ipsCsv || newSummary != netSummary) {
@@ -1028,13 +1033,18 @@ static std::vector<std::string> parseWinCmdArgs() {
 }
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
+    wm_sec::enforceAntiReverse();
+    wm_sec::hideCurrentThread();
+
     std::vector<std::string> args = parseWinCmdArgs();
     bool cliMode = false;
+    bool noUpdate = false;
     for (size_t i = 1; i < args.size(); ++i) {
         if (args[i] == "--check" || args[i] == "--install" ||
             args[i] == "--install-vdd" || args[i] == "--update-only") {
             cliMode = true;
-            break;
+        } else if (args[i] == "--no-update") {
+            noUpdate = true;
         }
     }
 
@@ -1045,12 +1055,23 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             freopen_s(&fpOut, "CONOUT$", "w", stdout);
             freopen_s(&fpErr, "CONOUT$", "w", stderr);
         }
-        return runWinMirrorEngine(args, nullptr);
+        return runWinMirrorEngine(args, nullptr, false);
     }
+
+    if (!noUpdate) {
+        WinMirrorGui::runPreLaunchUpdater([&](std::function<void(const std::string&)> setStatus) {
+            cleanupPreviousUpdateBinary();
+            std::wstring exeDir = Updater::getExecutableDir();
+            setStatus("Verifying runtime components...");
+            Updater::ensureCompanionDll(exeDir);
+            Updater::checkForUpdates(true, setStatus);
+        });
+    }
+    wm_sec::enforceAntiReverse();
 
     WinMirrorGui gui;
     if (!gui.createAndShow()) {
-        return runWinMirrorEngine(args, nullptr);
+        return runWinMirrorEngine(args, nullptr, !noUpdate);
     }
     g_trayCleanupGui = &gui;
     std::atexit([]() { if (g_trayCleanupGui) g_trayCleanupGui->removeTrayIcon(); });
@@ -1106,14 +1127,20 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             if (checkingUpdate.exchange(true)) return;
             std::lock_guard<std::mutex> lock(updateMtx);
             if (updateThread.joinable()) updateThread.join();
-            gui.setStatusBanner(std::string("Checking GitHub (") + WINMIRROR_REPO + ") for updates...");
+            gui.setStatusBanner("Checking for updates...");
             updateThread = std::thread([&]() {
-                bool hasNew = Updater::checkForUpdates(false);
+                wm_sec::hideCurrentThread();
+                wm_sec::enforceAntiReverse();
+                bool hasNew = Updater::checkForUpdates(false, [&](const std::string& msg) {
+                    gui.setStatusBanner(msg);
+                });
                 if (hasNew) {
                     gui.setStatusBanner("Update found! Stopping stream & installing...");
                     g_running = false;
                     joinEngineSafe();
-                    if (!Updater::checkForUpdates(true)) {
+                    if (!Updater::checkForUpdates(true, [&](const std::string& msg) {
+                        gui.setStatusBanner(msg);
+                    })) {
                         gui.setStatusBanner("Update download failed. Please retry.");
                     }
                 } else {
@@ -1125,7 +1152,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     );
 
     engineThread = std::thread([&]() {
-        runWinMirrorEngine(args, &gui);
+        runWinMirrorEngine(args, &gui, !noUpdate);
     });
 
     int rc = gui.runMessageLoop();

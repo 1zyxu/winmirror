@@ -60,6 +60,8 @@ public:
                     std::function<void()> onRefresh = nullptr,
                     std::function<void()> onCheckUpdate = nullptr);
 
+    static void runPreLaunchUpdater(std::function<void(std::function<void(const std::string&)>)> task);
+
     bool createAndShow();
     void updateStatus(const WinMirrorStatus& st);
     void setStatusBanner(const std::string& msg);

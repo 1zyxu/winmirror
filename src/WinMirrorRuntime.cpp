@@ -1,5 +1,6 @@
 #define WINMIRROR_RT_EXPORTS
 #include "Common.h"
+#include "SecProtect.h"
 #include "WinMirrorRuntime.h"
 
 #include <mmsystem.h>
@@ -49,26 +50,29 @@ bool checkAdminToken() {
 bool applyDirectXHighPerfGpuPref(const wchar_t* exePath) {
     if (!exePath || !exePath[0]) return false;
     HKEY hKey = nullptr;
+    std::wstring regPath = WM_OBF_W(L"Software\\Microsoft\\DirectX\\UserGpuPreferences");
     LONG rc = RegCreateKeyExW(
         HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\DirectX\\UserGpuPreferences",
+        regPath.c_str(),
         0, nullptr, REG_OPTION_NON_VOLATILE,
         KEY_READ | KEY_WRITE, nullptr, &hKey, nullptr);
+    wm_sec::wipeWString(regPath);
     if (rc != ERROR_SUCCESS || !hKey) return false;
 
-    const wchar_t* desired = L"GpuPreference=2;";
+    std::wstring desired = WM_OBF_W(L"GpuPreference=2;");
     wchar_t existing[64] = {};
     DWORD type = 0;
     DWORD byteLen = sizeof(existing);
     bool alreadyOk = (RegQueryValueExW(hKey, exePath, nullptr, &type,
                                        reinterpret_cast<LPBYTE>(existing), &byteLen) == ERROR_SUCCESS &&
-                      type == REG_SZ && _wcsicmp(existing, desired) == 0);
+                      type == REG_SZ && _wcsicmp(existing, desired.c_str()) == 0);
     bool ok = alreadyOk;
     if (!alreadyOk) {
-        DWORD writeBytes = static_cast<DWORD>((std::wcslen(desired) + 1) * sizeof(wchar_t));
+        DWORD writeBytes = static_cast<DWORD>((desired.size() + 1) * sizeof(wchar_t));
         ok = (RegSetValueExW(hKey, exePath, 0, REG_SZ,
-                              reinterpret_cast<const BYTE*>(desired), writeBytes) == ERROR_SUCCESS);
+                              reinterpret_cast<const BYTE*>(desired.c_str()), writeBytes) == ERROR_SUCCESS);
     }
+    wm_sec::wipeWString(desired);
     RegCloseKey(hKey);
     return ok;
 }
@@ -338,6 +342,8 @@ WM_RT_API void WM_LeaveMmcssTask(HANDLE taskHandle) {
 }
 
 WM_RT_API int WM_RunPreflightAndInstall(const wchar_t* exePath, int applyTweaks, WmPreflightReport* outReport) {
+    wm_sec::enforceAntiReverse();
+    wm_sec::hideCurrentThread();
     if (!outReport || outReport->structSize < sizeof(WmPreflightReport)) return 0;
     uint32_t sz = outReport->structSize;
     std::memset(outReport, 0, sz);
