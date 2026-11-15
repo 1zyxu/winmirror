@@ -73,6 +73,7 @@ private:
 
     bool initGdi();
     void cleanupGdi();
+    void cleanupGdiLocked();
     bool acquireGdi();
 
     static void initHalfTable();

@@ -41,6 +41,24 @@ inline bool isValidPeHeader(const uint8_t* bytes, size_t len) {
     return bytes && len >= 2 && bytes[0] == 'M' && bytes[1] == 'Z';
 }
 
+inline bool isUpdateTempFile(const std::string& filename) {
+    std::string lower;
+    lower.reserve(filename.size());
+    for (unsigned char c : filename) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<unsigned char>(c - 'A' + 'a');
+        lower.push_back(static_cast<char>(c));
+    }
+    auto endsWith = [&](const char* suf) -> bool {
+        size_t slen = std::char_traits<char>::length(suf);
+        return lower.size() >= slen && lower.compare(lower.size() - slen, slen, suf) == 0;
+    };
+    return endsWith(".old.exe") ||
+           endsWith(".update.exe") ||
+           endsWith(".dll.tmp") ||
+           endsWith(".dll.update") ||
+           lower == "vdd_driver.zip";
+}
+
 inline std::string findAssetDownloadUrl(const std::string& json, const std::string& assetSubstr) {
     size_t searchPos = 0;
     std::string fallback;

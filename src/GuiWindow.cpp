@@ -326,7 +326,7 @@ void drawTextToCanvas(uint32_t* canvasPx, int cw, int ch,
 }
 
 struct SplashState {
-    HWND hwnd = nullptr;
+    std::atomic<HWND> hwnd{nullptr};
     UINT dpi = 96;
     bool glass = false;
     bool done = false;
@@ -379,6 +379,7 @@ LRESULT CALLBACK splashWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             return 0;
         case WM_APP_SPLASH_DONE:
             st->done = true;
+            st->hwnd.store(nullptr);
             KillTimer(hwnd, TIMER_SPLASH_ANIM);
             DestroyWindow(hwnd);
             return 0;
@@ -434,6 +435,11 @@ LRESULT CALLBACK splashWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                 st->sh = sh;
             }
 
+            if (!st->canvasPx || !st->scratchPx) {
+                EndPaint(hwnd, &ps);
+                return 0;
+            }
+
             std::string statusCopy;
             {
                 std::lock_guard<std::mutex> lock(st->mtx);
@@ -444,12 +450,12 @@ LRESULT CALLBACK splashWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             glass::strokeRoundRect(st->canvasPx, w, h, 0.5f, 0.5f, w - 0.5f, h - 0.5f, scf(8, st->dpi), 1.0f, {180, 198, 255, 52});
             drawMirroringGlyph(st->canvasPx, w, h, scf(16, st->dpi), scf(18, st->dpi), st->dpi);
             drawTextToCanvas(st->canvasPx, w, h, st->scratchDc, st->scratchPx, st->sw, st->sh,
-                             { sc(46, st->dpi), sc(14, st->dpi), sc(240, st->dpi), sc(34, st->dpi) },
+                             { sc(46, st->dpi), sc(14, st->dpi), sc(165, st->dpi), sc(34, st->dpi) },
                              st->fTitle, {246, 248, 255, 255}, L"WinMirror",
                              DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             drawTextToCanvas(st->canvasPx, w, h, st->scratchDc, st->scratchPx, st->sw, st->sh,
-                             { sc(236, st->dpi), sc(14, st->dpi), sc(290, st->dpi), sc(34, st->dpi) },
-                             st->fSub, {158, 174, 212, 220}, L"v" L"" WINMIRROR_VERSION,
+                             { sc(165, st->dpi), sc(14, st->dpi), sc(290, st->dpi), sc(34, st->dpi) },
+                             st->fSub, {158, 174, 212, 220}, L"karnajitop \u2022 v" L"" WINMIRROR_VERSION,
                              DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
             drawTextToCanvas(st->canvasPx, w, h, st->scratchDc, st->scratchPx, st->sw, st->sh,
                              { sc(46, st->dpi), sc(35, st->dpi), sc(290, st->dpi), sc(54, st->dpi) },
@@ -470,7 +476,14 @@ LRESULT CALLBACK splashWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
             EndPaint(hwnd, &ps);
             return 0;
         }
+        case WM_CLOSE:
+            st->done = true;
+            st->hwnd.store(nullptr);
+            KillTimer(hwnd, TIMER_SPLASH_ANIM);
+            DestroyWindow(hwnd);
+            return 0;
         case WM_DESTROY:
+            st->hwnd.store(nullptr);
             KillTimer(hwnd, TIMER_SPLASH_ANIM);
             PostQuitMessage(0);
             return 0;
@@ -499,23 +512,24 @@ void WinMirrorGui::runPreLaunchUpdater(std::function<void(std::function<void(con
     wc.lpszClassName = cls.c_str();
     RegisterClassExW(&wc);
 
-    st.hwnd = CreateWindowExW(
+    HWND hSplash = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
         cls.c_str(), L"WinMirror",
         WS_OVERLAPPED | WS_CAPTION,
         CW_USEDEFAULT, CW_USEDEFAULT, SPLASH_W, SPLASH_H,
         nullptr, nullptr, hInst, &st);
+    st.hwnd.store(hSplash);
 
-    if (!st.hwnd) {
+    if (!hSplash) {
         if (task) task([](const std::string&) {});
         if (st.icon) DestroyIcon(st.icon);
         return;
     }
 
-    st.dpi = queryWindowDpi(st.hwnd);
+    st.dpi = queryWindowDpi(hSplash);
     st.fTitle = makeUiFont(10, st.dpi, FW_SEMIBOLD);
     st.fSub = makeUiFont(8, st.dpi, FW_NORMAL);
-    st.glass = enableGlassBackdrop(st.hwnd);
+    st.glass = enableGlassBackdrop(hSplash);
 
     int w = sc(SPLASH_W, st.dpi);
     int h = sc(SPLASH_H, st.dpi);
@@ -523,11 +537,11 @@ void WinMirrorGui::runPreLaunchUpdater(std::function<void(std::function<void(con
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     int posX = work.left + ((work.right - work.left) - w) / 2;
     int posY = work.top + ((work.bottom - work.top) - h) / 2;
-    SetWindowPos(st.hwnd, HWND_TOPMOST, posX, posY, w, h, SWP_FRAMECHANGED);
+    SetWindowPos(hSplash, HWND_TOPMOST, posX, posY, w, h, SWP_FRAMECHANGED);
 
-    ShowWindow(st.hwnd, SW_SHOW);
-    UpdateWindow(st.hwnd);
-    SetTimer(st.hwnd, TIMER_SPLASH_ANIM, 30, nullptr);
+    ShowWindow(hSplash, SW_SHOW);
+    UpdateWindow(hSplash);
+    SetTimer(hSplash, TIMER_SPLASH_ANIM, 30, nullptr);
 
     std::thread worker([&]() {
         wm_sec::hideCurrentThread();
@@ -537,10 +551,12 @@ void WinMirrorGui::runPreLaunchUpdater(std::function<void(std::function<void(con
                     std::lock_guard<std::mutex> lock(st.mtx);
                     st.statusText = msg;
                 }
-                if (st.hwnd) PostMessageW(st.hwnd, WM_APP_SPLASH_STATUS, 0, 0);
+                HWND hPost = st.hwnd.load();
+                if (hPost) PostMessageW(hPost, WM_APP_SPLASH_STATUS, 0, 0);
             });
         }
-        if (st.hwnd) PostMessageW(st.hwnd, WM_APP_SPLASH_DONE, 0, 0);
+        HWND hDone = st.hwnd.load();
+        if (hDone) PostMessageW(hDone, WM_APP_SPLASH_DONE, 0, 0);
     });
 
     MSG msg = {};
@@ -711,16 +727,17 @@ bool WinMirrorGui::createAndShow() {
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     const DWORD exStyle = WS_EX_APPWINDOW;
 
-    m_hwnd = CreateWindowExW(
+    HWND hMain = CreateWindowExW(
         exStyle, clsName.c_str(), L"Screen Mirroring", style,
         CW_USEDEFAULT, CW_USEDEFAULT, BASE_W, BASE_H,
         nullptr, nullptr, hInst, this);
     wm_sec::wipeWString(clsName);
-    if (!m_hwnd) return false;
+    m_hwnd.store(hMain);
+    if (!hMain) return false;
 
-    m_dpi = queryWindowDpi(m_hwnd);
+    m_dpi = queryWindowDpi(hMain);
     rebuildFonts();
-    m_glassBlurActive = enableGlassBackdrop(m_hwnd);
+    m_glassBlurActive = enableGlassBackdrop(hMain);
 
     int winW = sc(BASE_W, m_dpi);
     int winH = sc(BASE_H, m_dpi);
@@ -728,11 +745,11 @@ bool WinMirrorGui::createAndShow() {
     SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
     int posX = work.left + ((work.right - work.left) - winW) / 2;
     int posY = work.top + ((work.bottom - work.top) - winH) / 2;
-    SetWindowPos(m_hwnd, nullptr, posX, posY, winW, winH, SWP_NOZORDER | SWP_FRAMECHANGED);
+    SetWindowPos(hMain, nullptr, posX, posY, winW, winH, SWP_NOZORDER | SWP_FRAMECHANGED);
 
     addTrayIcon();
-    ShowWindow(m_hwnd, SW_SHOW);
-    UpdateWindow(m_hwnd);
+    ShowWindow(hMain, SW_SHOW);
+    UpdateWindow(hMain);
     return true;
 }
 
@@ -741,8 +758,9 @@ void WinMirrorGui::updateStatus(const WinMirrorStatus& st) {
         std::lock_guard<std::mutex> lock(m_mtx);
         m_status = st;
     }
-    if (m_hwnd) {
-        PostMessageW(m_hwnd, WM_APP_REFRESH, 0, 0);
+    HWND h = m_hwnd.load();
+    if (h) {
+        PostMessageW(h, WM_APP_REFRESH, 0, 0);
     }
 }
 
@@ -752,8 +770,9 @@ void WinMirrorGui::setStatusBanner(const std::string& msg) {
         std::lock_guard<std::mutex> lock(m_mtx);
         m_status.statusBanner = msg;
     }
-    if (m_hwnd) {
-        PostMessageW(m_hwnd, WM_APP_REFRESH, 0, 0);
+    HWND h = m_hwnd.load();
+    if (h) {
+        PostMessageW(h, WM_APP_REFRESH, 0, 0);
     }
 }
 
@@ -767,8 +786,9 @@ int WinMirrorGui::runMessageLoop() {
 }
 
 void WinMirrorGui::requestClose() {
-    if (m_hwnd) {
-        PostMessageW(m_hwnd, WM_CLOSE, 0, 0);
+    HWND h = m_hwnd.load();
+    if (h) {
+        PostMessageW(h, WM_CLOSE, 0, 0);
     }
 }
 
@@ -847,7 +867,7 @@ void WinMirrorGui::addTrayIcon() {
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_APP_TRAY;
     nid.hIcon = m_appIcon;
-    std::wcsncpy(nid.szTip, L"Screen Mirroring", ARRAYSIZE(nid.szTip) - 1);
+    std::wcsncpy(nid.szTip, L"WinMirror \u2014 by karnajitop", ARRAYSIZE(nid.szTip) - 1);
     m_trayAdded = (Shell_NotifyIconW(NIM_ADD, &nid) == TRUE);
 }
 
@@ -933,6 +953,10 @@ void WinMirrorGui::paintWindow(HWND hwnd) {
 
     ensureCanvas(screenDc, cw, ch);
     ensureTextScratch(screenDc, cw, sc(72, m_dpi));
+    if (!m_canvasPx || !m_scratchPx) {
+        EndPaint(hwnd, &ps);
+        return;
+    }
 
     WinMirrorStatus snap;
     {
@@ -940,9 +964,17 @@ void WinMirrorGui::paintWindow(HWND hwnd) {
         snap = m_status;
     }
 
-    glass::fillCanvasGlass(m_canvasPx, cw, ch, m_glassBlurActive ? 102 : 255);
-    glass::strokeRoundRect(m_canvasPx, cw, ch, 0.5f, 0.5f, cw - 0.5f, ch - 0.5f,
-                           scf(8, m_dpi), 1.0f, {178, 196, 255, 48});
+    size_t bgPixels = static_cast<size_t>(cw) * static_cast<size_t>(ch);
+    if (m_baseBgW != cw || m_baseBgH != ch || m_baseBgGlass != m_glassBlurActive || m_baseBg.size() != bgPixels) {
+        m_baseBg.resize(bgPixels);
+        glass::fillCanvasGlass(m_baseBg.data(), cw, ch, m_glassBlurActive ? 102 : 255);
+        glass::strokeRoundRect(m_baseBg.data(), cw, ch, 0.5f, 0.5f, cw - 0.5f, ch - 0.5f,
+                               scf(8, m_dpi), 1.0f, {178, 196, 255, 48});
+        m_baseBgW = cw;
+        m_baseBgH = ch;
+        m_baseBgGlass = m_glassBlurActive;
+    }
+    std::memcpy(m_canvasPx, m_baseBg.data(), bgPixels * sizeof(uint32_t));
 
     const GlassColor cWhite = {246, 248, 255, 255};
     const GlassColor cMuted = {166, 178, 208, 230};
@@ -956,7 +988,7 @@ void WinMirrorGui::paintWindow(HWND hwnd) {
                   m_fontTitle, cWhite, L"Screen Mirroring",
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     drawTextGlass({ sc(45, m_dpi), sc(29, m_dpi), sc(218, m_dpi), sc(44, m_dpi) },
-                  m_fontLabel, cMuted, L"AirPlay Zero-Latency",
+                  m_fontLabel, cMuted, L"AirPlay \u2022 by karnajitop",
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
     glass::fillRoundRectGrad(m_canvasPx, cw, ch,
@@ -1453,12 +1485,13 @@ LRESULT WinMirrorGui::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         }
         case WM_CLOSE:
             removeTrayIcon();
+            m_hwnd.store(nullptr);
             if (m_onQuit) m_onQuit();
             DestroyWindow(hwnd);
-            m_hwnd = nullptr;
             return 0;
         case WM_DESTROY:
             removeTrayIcon();
+            m_hwnd.store(nullptr);
             KillTimer(hwnd, TIMER_CARET_BLINK);
             PostQuitMessage(0);
             return 0;

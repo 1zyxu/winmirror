@@ -2,6 +2,7 @@
 #include "MdnsParser.h"
 #include <iphlpapi.h>
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 
 namespace {
@@ -11,6 +12,21 @@ struct LocalAdapter {
     uint32_t ipNet = 0;
     uint32_t maskNet = 0;
 };
+
+bool isVirtualAdapterDesc(const char* desc) {
+    if (!desc || !desc[0]) return false;
+    std::string lower(desc);
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    static const char* const kSkip[] = {
+        "vethernet", "hyper-v", "vmware", "virtualbox",
+        "wintun", "tailscale", "zerotier", "tap-", "wsl"
+    };
+    for (const char* pat : kSkip) {
+        if (lower.find(pat) != std::string::npos) return true;
+    }
+    return false;
+}
 
 std::vector<LocalAdapter> collectLocalAdapters() {
     std::vector<LocalAdapter> out;
@@ -23,6 +39,10 @@ std::vector<LocalAdapter> collectLocalAdapters() {
     }
     if (GetAdaptersInfo(pAdapter, &bufLen) == NO_ERROR) {
         while (pAdapter) {
+            if (isVirtualAdapterDesc(pAdapter->Description)) {
+                pAdapter = pAdapter->Next;
+                continue;
+            }
             const char* ipStr = pAdapter->IpAddressList.IpAddress.String;
             const char* maskStr = pAdapter->IpAddressList.IpMask.String;
             struct in_addr inIp = {}, inMask = {};

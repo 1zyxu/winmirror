@@ -364,10 +364,6 @@ void AudioCapture::stop() {
     if (!m_running) return;
     m_running = false;
 
-    if (m_audioClient) {
-        m_audioClient->Stop();
-    }
-
     if (m_thread.joinable()) {
         m_thread.join();
     }
@@ -465,7 +461,7 @@ void AudioCapture::captureLoop() {
             }
 
             if (numFrames > 0) {
-                if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
+                if (pData && !(flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
                     silentTailLeft = 3;
                     pcmOut.resize(numFrames * 2);
 

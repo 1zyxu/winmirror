@@ -6,6 +6,7 @@
 #include "BluetoothBridge.h"
 #include "Beacon.h"
 #include "Updater.h"
+#include "UpdaterLogic.h"
 #include "AudioCapture.h"
 #include "WinMirrorRuntime.h"
 #include "GuiWindow.h"
@@ -24,6 +25,7 @@
 #include <optional>
 #include <iphlpapi.h>
 #include <mmsystem.h>
+#include <objbase.h>
 #include <shellapi.h>
 
 // Signal NVIDIA Optimus and AMD Switchable Graphics drivers to expose the discrete GPU
@@ -118,17 +120,55 @@ static bool isRunningAsAdmin() {
     return isAdmin == TRUE;
 }
 
+static void deleteTempFileBestEffort(const std::wstring& path) {
+    if (path.empty()) return;
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        if (DeleteFileW(path.c_str())) return;
+        DWORD err = GetLastError();
+        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) return;
+        if (err != ERROR_ACCESS_DENIED && err != ERROR_SHARING_VIOLATION) break;
+        Sleep(60);
+    }
+    MoveFileExW(path.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+}
+
 static void cleanupPreviousUpdateBinary() {
     wchar_t exePath[MAX_PATH] = {};
     if (GetModuleFileNameW(NULL, exePath, MAX_PATH) > 0) {
         std::wstring base(exePath);
-        DeleteFileW((base + L".old.exe").c_str());
-        DeleteFileW((base + L".update.exe").c_str());
+        deleteTempFileBestEffort(base + L".old.exe");
+        deleteTempFileBestEffort(base + L".update.exe");
     }
-    std::wstring dllBase = Updater::getExecutableDir() + L"\\winmirror_rt.dll";
-    DeleteFileW((dllBase + L".tmp").c_str());
-    DeleteFileW((dllBase + L".update").c_str());
+    std::wstring exeDir = Updater::getExecutableDir();
+    std::wstring dllBase = exeDir + L"\\winmirror_rt.dll";
+    deleteTempFileBestEffort(dllBase + L".tmp");
+    deleteTempFileBestEffort(dllBase + L".update");
+    deleteTempFileBestEffort(exeDir + L"\\vdd_driver.zip");
+
+    WIN32_FIND_DATAW fd = {};
+    HANDLE hFind = FindFirstFileW((exeDir + L"\\*").c_str(), &fd);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            int len = WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, nullptr, 0, nullptr, nullptr);
+            if (len <= 1) continue;
+            std::string nameUtf8(static_cast<size_t>(len - 1), '\0');
+            WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, &nameUtf8[0], len, nullptr, nullptr);
+            if (updater_logic::isUpdateTempFile(nameUtf8)) {
+                deleteTempFileBestEffort(exeDir + L"\\" + fd.cFileName);
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
 }
+
+struct ComMtaScope {
+    HRESULT hr = E_FAIL;
+    ComMtaScope() : hr(CoInitializeEx(nullptr, COINIT_MULTITHREADED)) {}
+    ~ComMtaScope() {
+        if (SUCCEEDED(hr)) CoUninitialize();
+    }
+};
 
 static uint16_t buildHelloFlags(bool btReady, const ScreenCapture& /*cap*/, const Encoder& enc, bool unlimitedFps) {
     uint16_t f = btReady ? HELLO_FLAG_BT : 0;
@@ -335,6 +375,7 @@ static std::string collectLocalIpsCsv(int port, bool printBanner,
 }
 
 static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui* gui, bool skipStartupUpdate = false) {
+    ComMtaScope comScope;
     wm_sec::hideCurrentThread();
     cleanupPreviousUpdateBinary();
     bool isAdmin = isRunningAsAdmin();
@@ -631,6 +672,7 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
 
     // Decoupled high-priority Capture + Cursor thread so NVENC/PCIe stalls never block DXGI ReleaseFrame or mouse input
     std::thread captureThread([&]() {
+        ComMtaScope capCom;
         wm_sec::hideCurrentThread();
         HANDLE hCapMmcss = rt.enterMmcss(L"Games");
         std::vector<uint8_t> curBgra;
@@ -953,7 +995,6 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
 
         auto now = std::chrono::steady_clock::now();
         if (now - lastIpRefresh >= std::chrono::seconds(3)) {
-            wm_sec::enforceAntiReverse();
             std::string newSummary, newPrimary;
             std::string newIpsCsv = collectLocalIpsCsv(port, false, &newSummary, &newPrimary);
             if (newIpsCsv != ipsCsv || newSummary != netSummary) {
@@ -1138,6 +1179,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                     gui.setStatusBanner("Update found! Stopping stream & installing...");
                     g_running = false;
                     joinEngineSafe();
+                    gui.removeTrayIcon();
                     if (!Updater::checkForUpdates(true, [&](const std::string& msg) {
                         gui.setStatusBanner(msg);
                     })) {

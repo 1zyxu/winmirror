@@ -35,7 +35,7 @@ std::string getUpdaterRepoSlug() {
 
 bool openWinHttpGet(const std::wstring& host, INTERNET_PORT port, const std::wstring& path, bool https,
                     HINTERNET& outSession, HINTERNET& outConnect, HINTERNET& outRequest, const std::wstring& extraHeaders) {
-    std::wstring ua = WM_OBF_W(L"WM-Client/2.4");
+    std::wstring ua = WM_OBF_W(L"WM-Client/2.5");
     outSession = WinHttpOpen(ua.c_str(), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                              WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     wm_sec::wipeWString(ua);
@@ -43,7 +43,7 @@ bool openWinHttpGet(const std::wstring& host, INTERNET_PORT port, const std::wst
 
     DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
     WinHttpSetOption(outSession, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
-    WinHttpSetTimeouts(outSession, 2500, 2500, 3000, 12000);
+    WinHttpSetTimeouts(outSession, 1500, 2000, 2500, 10000);
 
     outConnect = WinHttpConnect(outSession, host.c_str(), port, 0);
     if (!outConnect) { WinHttpCloseHandle(outSession); outSession = nullptr; return false; }
@@ -307,10 +307,12 @@ void Updater::applyUpdateAndRestart(const std::string& newExePath) {
     wm_sec::wipeWString(oldSuf);
 
     if (!MoveFileExW(currentExe, oldExe.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(newExeW.c_str());
         return;
     }
     if (!MoveFileExW(newExeW.c_str(), currentExe, MOVEFILE_REPLACE_EXISTING)) {
         MoveFileExW(oldExe.c_str(), currentExe, MOVEFILE_REPLACE_EXISTING);
+        DeleteFileW(newExeW.c_str());
         return;
     }
 
@@ -320,7 +322,7 @@ void Updater::applyUpdateAndRestart(const std::string& newExePath) {
                        DETACHED_PROCESS, nullptr, nullptr, &si, &pi)) {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
-        exit(0);
+        ExitProcess(0);
     }
 }
 

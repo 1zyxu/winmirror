@@ -82,8 +82,8 @@ bool BluetoothBridge::start(const std::string& ipsCsv, uint32_t width, uint32_t 
         m_wsaStarted = (WSAStartup(MAKEWORD(2, 2), &wsaData) == 0);
     }
 
-    m_listenSock = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
-    if (m_listenSock == INVALID_SOCKET) {
+    SOCKET listenSock = socket(AF_BTH, SOCK_STREAM, BTHPROTO_RFCOMM);
+    if (listenSock == INVALID_SOCKET) {
         m_radioAvailable = false;
         return false;
     }
@@ -92,16 +92,14 @@ bool BluetoothBridge::start(const std::string& ipsCsv, uint32_t width, uint32_t 
     sa.addressFamily = AF_BTH;
     sa.port = BT_PORT_ANY;
 
-    if (bind(m_listenSock, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == SOCKET_ERROR) {
-        closesocket(m_listenSock);
-        m_listenSock = INVALID_SOCKET;
+    if (bind(listenSock, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == SOCKET_ERROR) {
+        closesocket(listenSock);
         return false;
     }
 
     int saLen = sizeof(sa);
-    if (getsockname(m_listenSock, reinterpret_cast<sockaddr*>(&sa), &saLen) == SOCKET_ERROR) {
-        closesocket(m_listenSock);
-        m_listenSock = INVALID_SOCKET;
+    if (getsockname(listenSock, reinterpret_cast<sockaddr*>(&sa), &saLen) == SOCKET_ERROR) {
+        closesocket(listenSock);
         return false;
     }
 
@@ -137,11 +135,12 @@ bool BluetoothBridge::start(const std::string& ipsCsv, uint32_t width, uint32_t 
         sdpErr = tryRegisterSdp(true);
     }
 
-    if (listen(m_listenSock, 4) == SOCKET_ERROR) {
-        closesocket(m_listenSock);
-        m_listenSock = INVALID_SOCKET;
+    if (listen(listenSock, 4) == SOCKET_ERROR) {
+        closesocket(listenSock);
         return false;
     }
+
+    m_listenSock.store(listenSock);
 
     std::cout << "[Bluetooth] Radio: " << m_radioName
               << " | RFCOMM Ch " << sa.port
@@ -159,9 +158,9 @@ bool BluetoothBridge::start(const std::string& ipsCsv, uint32_t width, uint32_t 
 void BluetoothBridge::stop() {
     m_running = false;
     m_btConnected = false;
-    if (m_listenSock != INVALID_SOCKET) {
-        closesocket(m_listenSock);
-        m_listenSock = INVALID_SOCKET;
+    SOCKET ls = m_listenSock.exchange(INVALID_SOCKET);
+    if (ls != INVALID_SOCKET) {
+        closesocket(ls);
     }
     {
         std::lock_guard<std::mutex> lock(m_clientMutex);
@@ -207,6 +206,7 @@ void BluetoothBridge::updateMetadata(const std::string& ipsCsv, uint32_t width, 
 std::string BluetoothBridge::buildHelloLine() const {
     char host[128] = "WindowsPC";
     gethostname(host, sizeof(host));
+    host[sizeof(host) - 1] = '\0';
 
     std::lock_guard<std::mutex> lock(m_metaMutex);
     std::ostringstream ss;
@@ -227,9 +227,11 @@ std::string BluetoothBridge::getStatusText() const {
 
 void BluetoothBridge::serverLoop() {
     while (m_running) {
+        SOCKET ls = m_listenSock.load();
+        if (ls == INVALID_SOCKET) break;
         SOCKADDR_BTH clientAddr = {};
         int addrLen = sizeof(clientAddr);
-        SOCKET clientSock = accept(m_listenSock, reinterpret_cast<sockaddr*>(&clientAddr), &addrLen);
+        SOCKET clientSock = accept(ls, reinterpret_cast<sockaddr*>(&clientAddr), &addrLen);
         if (clientSock == INVALID_SOCKET) {
             if (!m_running) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));

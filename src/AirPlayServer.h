@@ -61,16 +61,21 @@ private:
     };
 
     void acceptLoop();
+    bool launchClientWorker(std::shared_ptr<ClientSession> session);
+    void onClientWorkerDone();
     void runClient(std::shared_ptr<ClientSession> session);
     void clientRecvLoop(std::shared_ptr<ClientSession> session);
     static bool sendAll(SOCKET sock, const void* data, size_t len);
     static bool sendPacket(SOCKET sock, uint16_t type, uint16_t flags, uint32_t extra1, uint32_t extra2, const void* payload, uint32_t payloadSize, std::vector<uint8_t>* txScratch = nullptr);
 
     int m_port;
-    SOCKET m_listenSock = INVALID_SOCKET;
+    std::atomic<SOCKET> m_listenSock{INVALID_SOCKET};
     std::atomic<bool> m_running{false};
     std::atomic<int> m_activeClients{0};
     std::thread m_acceptThread;
+    std::mutex m_workerMutex;
+    std::condition_variable m_workerCv;
+    int m_workerCount = 0;
 
     std::mutex m_clientsMutex;
     std::vector<std::shared_ptr<ClientSession>> m_clients;

@@ -112,15 +112,8 @@ inline Fn resolveHiddenApi(const std::wstring& modName, const std::string& procN
 }
 
 inline void hideCurrentThread() {
-    using PfnNtSetInfoThread = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG);
-    std::wstring ntdll = WM_OBF_W(L"ntdll.dll");
-    std::string fnName = WM_OBF("NtSetInformationThread");
-    auto pSet = resolveHiddenApi<PfnNtSetInfoThread>(ntdll, fnName);
-    wipeWString(ntdll);
-    wipeString(fnName);
-    if (pSet) {
-        pSet(GetCurrentThread(), 0x11 /* ThreadHideFromDebugger */, nullptr, 0);
-    }
+    // Kept as a no-op: NtSetInformationThread(ThreadHideFromDebugger) terminates threads on
+    // benign internal COM/DXGI/MediaFoundation first-chance SEH exceptions in retail drivers.
 }
 
 inline bool isDebuggerAttached() {
@@ -166,30 +159,10 @@ inline bool isDebuggerAttached() {
             wipeString(fnQip);
             return true;
         }
-        HANDLE dbgObj = nullptr;
-        if (pQip(GetCurrentProcess(), 0x1E /* ProcessDebugObjectHandle */, &dbgObj, sizeof(dbgObj), nullptr) == 0 && dbgObj != nullptr) {
-            CloseHandle(dbgObj);
-            wipeWString(ntdll);
-            wipeString(fnQip);
-            return true;
-        }
-        ULONG noDebugInherit = 1;
-        if (pQip(GetCurrentProcess(), 0x1F /* ProcessDebugFlags */, &noDebugInherit, sizeof(noDebugInherit), nullptr) == 0 && noDebugInherit == 0) {
-            wipeWString(ntdll);
-            wipeString(fnQip);
-            return true;
-        }
     }
     wipeWString(ntdll);
     wipeString(fnQip);
 
-    CONTEXT ctx = {};
-    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    if (GetThreadContext(GetCurrentThread(), &ctx)) {
-        if ((ctx.Dr0 | ctx.Dr1 | ctx.Dr2 | ctx.Dr3) != 0) {
-            return true;
-        }
-    }
     return false;
 }
 

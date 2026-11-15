@@ -53,46 +53,48 @@ bool AirPlayServer::start() {
         return false;
     }
 
-    m_listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (m_listenSock == INVALID_SOCKET) {
+    SOCKET listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listenSock == INVALID_SOCKET) {
         std::cerr << "[AirPlayServer] socket() failed." << std::endl;
         return false;
     }
 
     int opt = 1;
-    setsockopt(m_listenSock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
+    setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&opt), sizeof(opt));
 
     sockaddr_in addr = {};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(static_cast<u_short>(m_port));
 
-    if (bind(m_listenSock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
+    if (bind(listenSock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
         std::cerr << "[AirPlayServer] bind() failed on port " << m_port << std::endl;
-        closesocket(m_listenSock);
-        m_listenSock = INVALID_SOCKET;
+        closesocket(listenSock);
         return false;
     }
 
-    if (listen(m_listenSock, 8) == SOCKET_ERROR) {
+    if (listen(listenSock, 8) == SOCKET_ERROR) {
         std::cerr << "[AirPlayServer] listen() failed." << std::endl;
-        closesocket(m_listenSock);
-        m_listenSock = INVALID_SOCKET;
+        closesocket(listenSock);
         return false;
     }
 
+    m_listenSock.store(listenSock);
     m_running = true;
     m_acceptThread = std::thread(&AirPlayServer::acceptLoop, this);
     return true;
 }
 
 void AirPlayServer::stop() {
-    if (!m_running) return;
-    m_running = false;
+    if (!m_running.exchange(false)) return;
 
-    if (m_listenSock != INVALID_SOCKET) {
-        closesocket(m_listenSock);
-        m_listenSock = INVALID_SOCKET;
+    SOCKET ls = m_listenSock.exchange(INVALID_SOCKET);
+    if (ls != INVALID_SOCKET) {
+        closesocket(ls);
+    }
+
+    if (m_acceptThread.joinable()) {
+        m_acceptThread.join();
     }
 
     {
@@ -100,25 +102,50 @@ void AirPlayServer::stop() {
         for (auto& c : m_clients) {
             c->alive = false;
             if (c->sock != INVALID_SOCKET) {
-                closesocket(c->sock);
-                c->sock = INVALID_SOCKET;
+                shutdown(c->sock, SD_BOTH);
             }
             c->cv.notify_all();
         }
     }
 
-    if (m_acceptThread.joinable()) {
-        m_acceptThread.join();
+    {
+        std::unique_lock<std::mutex> wlock(m_workerMutex);
+        m_workerCv.wait(wlock, [this]() { return m_workerCount == 0; });
     }
 
     WSACleanup();
 }
 
+bool AirPlayServer::launchClientWorker(std::shared_ptr<ClientSession> session) {
+    {
+        std::lock_guard<std::mutex> wlock(m_workerMutex);
+        if (!m_running) return false;
+        ++m_workerCount;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_clientsMutex);
+        m_clients.push_back(session);
+    }
+    m_activeClients++;
+    std::thread(&AirPlayServer::runClient, this, session).detach();
+    return true;
+}
+
+void AirPlayServer::onClientWorkerDone() {
+    {
+        std::lock_guard<std::mutex> wlock(m_workerMutex);
+        if (m_workerCount > 0) --m_workerCount;
+    }
+    m_workerCv.notify_all();
+}
+
 void AirPlayServer::acceptLoop() {
     while (m_running) {
+        SOCKET ls = m_listenSock.load();
+        if (ls == INVALID_SOCKET) break;
         sockaddr_in clientAddr = {};
         int addrLen = sizeof(clientAddr);
-        SOCKET clientSock = accept(m_listenSock, reinterpret_cast<sockaddr*>(&clientAddr), &addrLen);
+        SOCKET clientSock = accept(ls, reinterpret_cast<sockaddr*>(&clientAddr), &addrLen);
         if (clientSock == INVALID_SOCKET) {
             if (!m_running) break;
             continue;
@@ -147,13 +174,9 @@ void AirPlayServer::acceptLoop() {
         session->peerIp = ipBuf;
         session->alive = true;
 
-        {
-            std::lock_guard<std::mutex> lock(m_clientsMutex);
-            m_clients.push_back(session);
+        if (!launchClientWorker(session)) {
+            closesocket(clientSock);
         }
-        m_activeClients++;
-
-        std::thread(&AirPlayServer::runClient, this, session).detach();
     }
 }
 
@@ -213,12 +236,10 @@ bool AirPlayServer::connectToReceiver(const std::string& host, int port) {
     session->sock = s;
     session->peerIp = host;
     session->alive = true;
-    {
-        std::lock_guard<std::mutex> lock(m_clientsMutex);
-        m_clients.push_back(session);
+    if (!launchClientWorker(session)) {
+        closesocket(s);
+        return false;
     }
-    m_activeClients++;
-    std::thread(&AirPlayServer::runClient, this, session).detach();
     return true;
 }
 
@@ -475,6 +496,11 @@ void AirPlayServer::clientRecvLoop(std::shared_ptr<ClientSession> session) {
 }
 
 void AirPlayServer::runClient(std::shared_ptr<ClientSession> session) {
+    struct WorkerExitGuard {
+        AirPlayServer* self;
+        ~WorkerExitGuard() { self->onClientWorkerDone(); }
+    } exitGuard{this};
+
     // 1. Send initial HELLO + cached cursor + force fresh IDR keyframe
     HelloPayload hello = {};
     CursorPayload initCursor = {};

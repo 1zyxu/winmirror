@@ -1007,22 +1007,7 @@ void Encoder::convertBgraToNv12Studio(const uint8_t* bgra, uint32_t width, uint3
         }
     };
 
-    uint32_t nThreads = std::min(4u, std::max(1u, std::thread::hardware_concurrency()));
-    if (height < 240 || nThreads <= 1) {
-        convertRows(0, height);
-        return;
-    }
-
-    std::vector<std::thread> workers;
-    workers.reserve(nThreads - 1);
-    for (uint32_t t = 0; t + 1 < nThreads; ++t) {
-        uint32_t y0 = ((height * t) / nThreads) & ~1u;
-        uint32_t y1 = ((height * (t + 1)) / nThreads) & ~1u;
-        workers.emplace_back(convertRows, y0, y1);
-    }
-    uint32_t lastY0 = ((height * (nThreads - 1)) / nThreads) & ~1u;
-    convertRows(lastY0, height);
-    for (auto& w : workers) w.join();
+    convertRows(0, height);
 }
 
 bool Encoder::submitDxgiSurface(ID3D11Texture2D* tex, uint64_t ptsUs,

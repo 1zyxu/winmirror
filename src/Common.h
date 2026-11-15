@@ -24,7 +24,8 @@
 #include <chrono>
 #include <memory>
 
-#define WINMIRROR_VERSION "2.4.0"
+#define WINMIRROR_VERSION "2.5.0"
+#define WINMIRROR_PUBLISHER "karnajitop"
 #define AIRPLAY_PORT 7001
 #define BEACON_PORT 8889
 

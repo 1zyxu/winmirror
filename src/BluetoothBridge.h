@@ -32,7 +32,7 @@ private:
     std::atomic<bool> m_radioAvailable{false};
     std::atomic<bool> m_btConnected{false};
 
-    SOCKET m_listenSock = INVALID_SOCKET;
+    std::atomic<SOCKET> m_listenSock{INVALID_SOCKET};
     bool m_wsaStarted = false;
     std::mutex m_clientMutex;
     SOCKET m_clientSock = INVALID_SOCKET;

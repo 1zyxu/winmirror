@@ -149,12 +149,25 @@ bool checkNvencDriver() {
     return false;
 }
 
+HMODULE getAvrtModule() {
+    static HMODULE cached = []() -> HMODULE {
+        std::wstring dll = WM_OBF_W(L"avrt.dll");
+        HMODULE mod = LoadLibraryW(dll.c_str());
+        wm_sec::wipeWString(dll);
+        return mod;
+    }();
+    return cached;
+}
+
 bool checkMmcssSupport() {
-    HMODULE avrt = LoadLibraryW(L"avrt.dll");
+    HMODULE avrt = getAvrtModule();
     if (!avrt) return false;
-    bool ok = GetProcAddress(avrt, "AvSetMmThreadCharacteristicsW") != nullptr &&
-              GetProcAddress(avrt, "AvRevertMmThreadCharacteristics") != nullptr;
-    FreeLibrary(avrt);
+    std::string fnSetChar = WM_OBF("AvSetMmThreadCharacteristicsW");
+    std::string fnRevert = WM_OBF("AvRevertMmThreadCharacteristics");
+    bool ok = GetProcAddress(avrt, fnSetChar.c_str()) != nullptr &&
+              GetProcAddress(avrt, fnRevert.c_str()) != nullptr;
+    wm_sec::wipeString(fnSetChar);
+    wm_sec::wipeString(fnRevert);
     return ok;
 }
 
@@ -312,15 +325,19 @@ WM_RT_API void WM_DisableHighResTimer() {
 
 WM_RT_API HANDLE WM_EnterMmcssTask(const wchar_t* taskName) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-    HMODULE avrt = LoadLibraryW(L"avrt.dll");
+    HMODULE avrt = getAvrtModule();
     if (!avrt) return nullptr;
 
     using PFN_AvSetMmThreadCharacteristicsW = HANDLE (WINAPI*)(LPCWSTR, LPDWORD);
     using PFN_AvSetMmThreadPriority = BOOL (WINAPI*)(HANDLE, int);
+    std::string fnSetChar = WM_OBF("AvSetMmThreadCharacteristicsW");
+    std::string fnSetPrio = WM_OBF("AvSetMmThreadPriority");
     auto pSetChar = reinterpret_cast<PFN_AvSetMmThreadCharacteristicsW>(
-        GetProcAddress(avrt, "AvSetMmThreadCharacteristicsW"));
+        GetProcAddress(avrt, fnSetChar.c_str()));
     auto pSetPrio = reinterpret_cast<PFN_AvSetMmThreadPriority>(
-        GetProcAddress(avrt, "AvSetMmThreadPriority"));
+        GetProcAddress(avrt, fnSetPrio.c_str()));
+    wm_sec::wipeString(fnSetChar);
+    wm_sec::wipeString(fnSetPrio);
     if (!pSetChar) return nullptr;
 
     DWORD taskIdx = 0;
@@ -333,11 +350,13 @@ WM_RT_API HANDLE WM_EnterMmcssTask(const wchar_t* taskName) {
 
 WM_RT_API void WM_LeaveMmcssTask(HANDLE taskHandle) {
     if (!taskHandle) return;
-    HMODULE avrt = GetModuleHandleW(L"avrt.dll");
+    HMODULE avrt = getAvrtModule();
     if (!avrt) return;
     using PFN_AvRevertMmThreadCharacteristics = BOOL (WINAPI*)(HANDLE);
+    std::string fnRevert = WM_OBF("AvRevertMmThreadCharacteristics");
     auto pRevert = reinterpret_cast<PFN_AvRevertMmThreadCharacteristics>(
-        GetProcAddress(avrt, "AvRevertMmThreadCharacteristics"));
+        GetProcAddress(avrt, fnRevert.c_str()));
+    wm_sec::wipeString(fnRevert);
     if (pRevert) pRevert(taskHandle);
 }
 

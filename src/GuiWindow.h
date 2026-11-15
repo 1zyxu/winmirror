@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Common.h"
+#include <atomic>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -88,13 +89,18 @@ private:
     void showTrayContextMenu();
     void copyPrimaryAddress();
 
-    HWND m_hwnd = nullptr;
+    std::atomic<HWND> m_hwnd{nullptr};
     HICON m_appIcon = nullptr;
     HFONT m_fontTitle = nullptr;
     HFONT m_fontRow = nullptr;
     HFONT m_fontLabel = nullptr;
     HFONT m_fontBody = nullptr;
     HFONT m_fontSmall = nullptr;
+
+    std::vector<uint32_t> m_baseBg;
+    int m_baseBgW = 0;
+    int m_baseBgH = 0;
+    bool m_baseBgGlass = false;
 
     HDC m_canvasDc = nullptr;
     HBITMAP m_canvasBmp = nullptr;

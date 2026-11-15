@@ -1198,57 +1198,76 @@ bool ScreenCapture::acquireDxgi(uint32_t timeoutMs, bool requireLivePresent) {
 }
 
 bool ScreenCapture::copyCurrentFrameToBgra(RawFrame& outFrame) {
-    if (m_mode == CaptureMode::Gdi) {
-        if (!m_gdiBits || m_width == 0 || m_height == 0) return false;
-        outFrame.width = m_width;
-        outFrame.height = m_height;
-        outFrame.pitch = m_width * 4;
-        size_t totalBytes = static_cast<size_t>(m_width) * m_height * 4;
-        if (outFrame.bgra.size() != totalBytes) outFrame.bgra.resize(totalBytes);
-        memcpy(outFrame.bgra.data(), m_gdiBits, totalBytes);
-        return true;
-    }
-
+    ID3D11Device* dev = nullptr;
+    ID3D11DeviceContext* ctx = nullptr;
     ID3D11Texture2D* copyTex = nullptr;
+    ID3D11Texture2D* stagingTex = nullptr;
+    uint32_t frameW = 0;
+    uint32_t frameH = 0;
+    DXGI_FORMAT frameFmt = DXGI_FORMAT_B8G8R8A8_UNORM;
+
     {
         std::lock_guard<std::mutex> lock(m_snapMutex);
-        copyTex = m_gpuCopyTex[m_latestSlot.load()];
-        if (copyTex) copyTex->AddRef();
-    }
-    if (!copyTex || !m_d3dContext) {
-        if (copyTex) copyTex->Release();
-        return false;
-    }
+        if (m_mode == CaptureMode::Gdi) {
+            if (!m_gdiBits || m_width == 0 || m_height == 0) return false;
+            outFrame.width = m_width;
+            outFrame.height = m_height;
+            outFrame.pitch = m_width * 4;
+            size_t totalBytes = static_cast<size_t>(m_width) * m_height * 4;
+            if (outFrame.bgra.size() != totalBytes) outFrame.bgra.resize(totalBytes);
+            memcpy(outFrame.bgra.data(), m_gdiBits, totalBytes);
+            return true;
+        }
 
-    if (!m_stagingTexture) {
-        D3D11_TEXTURE2D_DESC desc = {};
-        desc.Width = m_width;
-        desc.Height = m_height;
-        desc.MipLevels = 1;
-        desc.ArraySize = 1;
-        desc.Format = m_format;
-        desc.SampleDesc.Count = 1;
-        desc.Usage = D3D11_USAGE_STAGING;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        if (FAILED(m_d3dDevice->CreateTexture2D(&desc, nullptr, &m_stagingTexture))) {
-            copyTex->Release();
+        if (!m_hasValidGpuFrame || !m_d3dDevice || !m_d3dContext || m_width == 0 || m_height == 0) {
             return false;
         }
+        copyTex = m_gpuCopyTex[m_latestSlot.load()];
+        if (!copyTex) return false;
+
+        if (!m_stagingTexture) {
+            D3D11_TEXTURE2D_DESC desc = {};
+            desc.Width = m_width;
+            desc.Height = m_height;
+            desc.MipLevels = 1;
+            desc.ArraySize = 1;
+            desc.Format = m_format;
+            desc.SampleDesc.Count = 1;
+            desc.Usage = D3D11_USAGE_STAGING;
+            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            if (FAILED(m_d3dDevice->CreateTexture2D(&desc, nullptr, &m_stagingTexture)) || !m_stagingTexture) {
+                return false;
+            }
+        }
+
+        dev = m_d3dDevice;
+        ctx = m_d3dContext;
+        stagingTex = m_stagingTexture;
+        dev->AddRef();
+        ctx->AddRef();
+        copyTex->AddRef();
+        stagingTex->AddRef();
+        frameW = m_width;
+        frameH = m_height;
+        frameFmt = m_format;
     }
 
-    m_d3dContext->CopyResource(m_stagingTexture, copyTex);
+    ctx->CopyResource(stagingTex, copyTex);
     copyTex->Release();
 
     D3D11_MAPPED_SUBRESOURCE mapped = {};
-    if (FAILED(m_d3dContext->Map(m_stagingTexture, 0, D3D11_MAP_READ, 0, &mapped))) {
+    if (FAILED(ctx->Map(stagingTex, 0, D3D11_MAP_READ, 0, &mapped))) {
+        stagingTex->Release();
+        ctx->Release();
+        dev->Release();
         return false;
     }
 
-    outFrame.width = m_width;
-    outFrame.height = m_height;
-    outFrame.pitch = m_width * 4;
+    outFrame.width = frameW;
+    outFrame.height = frameH;
+    outFrame.pitch = frameW * 4;
 
-    size_t totalBytes = static_cast<size_t>(m_width) * m_height * 4;
+    size_t totalBytes = static_cast<size_t>(frameW) * frameH * 4;
     if (outFrame.bgra.size() != totalBytes) {
         outFrame.bgra.resize(totalBytes);
     }
@@ -1256,11 +1275,11 @@ bool ScreenCapture::copyCurrentFrameToBgra(RawFrame& outFrame) {
     const uint8_t* srcRow = static_cast<const uint8_t*>(mapped.pData);
     uint8_t* dstRow = outFrame.bgra.data();
 
-    if (m_format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
-        for (uint32_t y = 0; y < m_height; ++y) {
+    if (frameFmt == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        for (uint32_t y = 0; y < frameH; ++y) {
             const HalfRGBA* srcPixel = reinterpret_cast<const HalfRGBA*>(srcRow);
             uint8_t* dstPixel = dstRow;
-            for (uint32_t x = 0; x < m_width; ++x) {
+            for (uint32_t x = 0; x < frameW; ++x) {
                 dstPixel[0] = s_halfToByteTable[srcPixel[x].b];
                 dstPixel[1] = s_halfToByteTable[srcPixel[x].g];
                 dstPixel[2] = s_halfToByteTable[srcPixel[x].r];
@@ -1268,13 +1287,13 @@ bool ScreenCapture::copyCurrentFrameToBgra(RawFrame& outFrame) {
                 dstPixel += 4;
             }
             srcRow += mapped.RowPitch;
-            dstRow += (m_width * 4);
+            dstRow += (frameW * 4);
         }
-    } else if (m_format == DXGI_FORMAT_R10G10B10A2_UNORM) {
-        for (uint32_t y = 0; y < m_height; ++y) {
+    } else if (frameFmt == DXGI_FORMAT_R10G10B10A2_UNORM) {
+        for (uint32_t y = 0; y < frameH; ++y) {
             const uint32_t* srcPixel = reinterpret_cast<const uint32_t*>(srcRow);
             uint8_t* dstPixel = dstRow;
-            for (uint32_t x = 0; x < m_width; ++x) {
+            for (uint32_t x = 0; x < frameW; ++x) {
                 uint32_t p = srcPixel[x];
                 dstPixel[0] = static_cast<uint8_t>(((p >> 20) & 0x3FF) >> 2); // B
                 dstPixel[1] = static_cast<uint8_t>(((p >> 10) & 0x3FF) >> 2); // G
@@ -1283,13 +1302,13 @@ bool ScreenCapture::copyCurrentFrameToBgra(RawFrame& outFrame) {
                 dstPixel += 4;
             }
             srcRow += mapped.RowPitch;
-            dstRow += (m_width * 4);
+            dstRow += (frameW * 4);
         }
-    } else if (m_format == DXGI_FORMAT_R8G8B8A8_UNORM || m_format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
-        for (uint32_t y = 0; y < m_height; ++y) {
+    } else if (frameFmt == DXGI_FORMAT_R8G8B8A8_UNORM || frameFmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
+        for (uint32_t y = 0; y < frameH; ++y) {
             const uint8_t* sp = srcRow;
             uint8_t* dp = dstRow;
-            for (uint32_t x = 0; x < m_width; ++x) {
+            for (uint32_t x = 0; x < frameW; ++x) {
                 dp[0] = sp[2]; // B
                 dp[1] = sp[1]; // G
                 dp[2] = sp[0]; // R
@@ -1298,18 +1317,21 @@ bool ScreenCapture::copyCurrentFrameToBgra(RawFrame& outFrame) {
                 dp += 4;
             }
             srcRow += mapped.RowPitch;
-            dstRow += (m_width * 4);
+            dstRow += (frameW * 4);
         }
     } else {
-        size_t rowBytes = static_cast<size_t>(m_width) * 4;
-        for (uint32_t y = 0; y < m_height; ++y) {
+        size_t rowBytes = static_cast<size_t>(frameW) * 4;
+        for (uint32_t y = 0; y < frameH; ++y) {
             memcpy(dstRow, srcRow, rowBytes);
             srcRow += mapped.RowPitch;
             dstRow += rowBytes;
         }
     }
 
-    m_d3dContext->Unmap(m_stagingTexture, 0);
+    ctx->Unmap(stagingTex, 0);
+    stagingTex->Release();
+    ctx->Release();
+    dev->Release();
     return true;
 }
 
@@ -1380,7 +1402,8 @@ bool ScreenCapture::pollCursor(CursorPayload& outMeta, std::vector<uint8_t>& out
 }
 
 bool ScreenCapture::initGdi() {
-    cleanupGdi();
+    std::lock_guard<std::mutex> lock(m_snapMutex);
+    cleanupGdiLocked();
 
     m_width = GetSystemMetrics(SM_CXSCREEN);
     m_height = GetSystemMetrics(SM_CYSCREEN);
@@ -1392,7 +1415,7 @@ bool ScreenCapture::initGdi() {
     if (!m_hdcScreen) return false;
 
     m_hdcMem = CreateCompatibleDC(m_hdcScreen);
-    if (!m_hdcMem) { cleanupGdi(); return false; }
+    if (!m_hdcMem) { cleanupGdiLocked(); return false; }
 
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -1403,20 +1426,26 @@ bool ScreenCapture::initGdi() {
     bmi.bmiHeader.biCompression = BI_RGB;
 
     m_hBitmap = CreateDIBSection(m_hdcScreen, &bmi, DIB_RGB_COLORS, &m_gdiBits, NULL, 0);
-    if (!m_hBitmap || !m_gdiBits) { cleanupGdi(); return false; }
+    if (!m_hBitmap || !m_gdiBits) { cleanupGdiLocked(); return false; }
 
     SelectObject(m_hdcMem, m_hBitmap);
     return true;
 }
 
-void ScreenCapture::cleanupGdi() {
+void ScreenCapture::cleanupGdiLocked() {
     if (m_hBitmap) { DeleteObject(m_hBitmap); m_hBitmap = nullptr; }
     if (m_hdcMem) { DeleteDC(m_hdcMem); m_hdcMem = nullptr; }
     if (m_hdcScreen) { ReleaseDC(NULL, m_hdcScreen); m_hdcScreen = nullptr; }
     m_gdiBits = nullptr;
 }
 
+void ScreenCapture::cleanupGdi() {
+    std::lock_guard<std::mutex> lock(m_snapMutex);
+    cleanupGdiLocked();
+}
+
 bool ScreenCapture::acquireGdi() {
+    std::lock_guard<std::mutex> lock(m_snapMutex);
     if (!m_hdcMem || !m_gdiBits) return false;
     return BitBlt(m_hdcMem, 0, 0, m_width, m_height, m_hdcScreen, 0, 0, SRCCOPY) == TRUE;
 }
