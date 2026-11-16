@@ -65,6 +65,7 @@ private:
     bool initDxgi(bool requireLiveOnly);
     bool initDxgiOnAdapter(IDXGIAdapter1* adapter, bool requireLivePresent, const RECT* primaryMonitorRect);
     bool acquireDxgi(uint32_t timeoutMs, bool requireLivePresent = false);
+    bool seedGpuTextureFromGdi();
 
     bool initWgc();
     bool initWgcOnAdapter(IDXGIAdapter1* adapter, HMONITOR hMon, const RECT& monRect);

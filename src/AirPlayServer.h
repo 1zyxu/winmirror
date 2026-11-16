@@ -42,6 +42,7 @@ private:
         std::string peerIp;
         std::atomic<bool> alive{true};
         bool waitingForKeyframe = true;
+        std::chrono::steady_clock::time_point lastKeyReqAt = std::chrono::steady_clock::now();
 
         std::mutex queueMutex;
         std::condition_variable cv;

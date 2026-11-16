@@ -32,8 +32,12 @@ public:
                        std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe);
     bool popPendingFrame(std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe);
 
-    void requestKeyframe() { m_forceKeyframe.store(true); }
+    void requestKeyframe() {
+        m_forceKeyframe.store(true);
+        m_awaitingKeyframe.store(true);
+    }
     bool hasKeyframeRequest() const { return m_forceKeyframe.load(); }
+    bool isAwaitingKeyframe() const { return m_forceKeyframe.load() || m_awaitingKeyframe.load(); }
     bool hasEmittedKeyframe() const { return m_hasEmittedKeyframe; }
     void notifyNetworkHealth(bool congested);
 
@@ -122,6 +126,7 @@ private:
     bool m_isNvidia = false;
     std::string m_encoderName = "Uninitialized";
     std::atomic<bool> m_forceKeyframe{true};
+    std::atomic<bool> m_awaitingKeyframe{true};
     std::atomic<int> m_bitrateScalePct{100};
     int m_appliedScalePct = 100;
     std::atomic<bool> m_gameLowLatency{true};
@@ -167,6 +172,7 @@ private:
     bool m_hasProducedOutput = false;
     bool m_hasEmittedKeyframe = false;
     uint32_t m_submittedWithoutOutput = 0;
+    uint32_t m_framesWithoutKey = 0;
     uint32_t m_waitTimeouts = 0;
 
     std::vector<uint8_t> m_yuvBuffer;

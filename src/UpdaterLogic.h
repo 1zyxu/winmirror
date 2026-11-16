@@ -54,8 +54,12 @@ inline bool isUpdateTempFile(const std::string& filename) {
     };
     return endsWith(".old.exe") ||
            endsWith(".update.exe") ||
+           endsWith(".exe.tmp") ||
+           endsWith(".exe.bak") ||
            endsWith(".dll.tmp") ||
            endsWith(".dll.update") ||
+           endsWith(".pdb") ||
+           lower == "winmirror_update.exe" ||
            lower == "vdd_driver.zip";
 }
 

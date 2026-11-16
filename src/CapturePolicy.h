@@ -3,9 +3,9 @@
 #include <cstdint>
 
 inline bool shouldAcceptDxgiFrame(uint64_t lastPresentTime, uint32_t accumulatedFrames,
-                                  bool hasValidGpuFrame, bool requireLivePresent) {
-    if (lastPresentTime != 0 || accumulatedFrames > 0) return true;
-    return !requireLivePresent && !hasValidGpuFrame;
+                                  bool /*hasValidGpuFrame*/, bool /*requireLivePresent*/) {
+    // Reject uninitialized zero/zero frames even on calm desktops so black DXGI buffers never stick
+    return lastPresentTime != 0 || accumulatedFrames > 0;
 }
 
 inline bool cooldownElapsedMs(uint64_t nowMs, uint64_t lastAttemptMs, uint64_t cooldownMs) {

@@ -402,15 +402,15 @@ bool ScreenCapture::initGpuCapture() {
         m_gpuReinitFails = 0;
         return true;
     }
-    // 2) Static DXGI Desktop Duplication avoids WGC DWM compositor throttling on hybrid GPUs/games
-    if (initDxgi(false)) {
-        m_mode = CaptureMode::Dxgi;
+    // 2) Try Windows.Graphics.Capture next on calm desktops so DWM gives real composited pixels
+    if (initWgc()) {
+        m_mode = CaptureMode::Wgc;
         m_gpuReinitFails = 0;
         return true;
     }
-    // 3) Fallback Windows.Graphics.Capture if DXGI is blocked (e.g. Optimus cross-adapter)
-    if (initWgc()) {
-        m_mode = CaptureMode::Wgc;
+    // 3) Static DXGI Desktop Duplication seeded with real GDI snapshot when WGC is unavailable
+    if (initDxgi(false)) {
+        m_mode = CaptureMode::Dxgi;
         m_gpuReinitFails = 0;
         return true;
     }
@@ -693,7 +693,11 @@ bool ScreenCapture::initDxgiOnAdapter(IDXGIAdapter1* adapter, bool requireLivePr
         dxgiOutput->Release();
 
         if (SUCCEEDED(hr) && m_duplication) {
-            for (int a = 0; a < 4 && !acquireDxgi(15, requireLivePresent); ++a) {}
+            const int maxProbes = requireLivePresent ? 6 : 3;
+            for (int a = 0; a < maxProbes && !acquireDxgi(15, requireLivePresent); ++a) {}
+            if (m_duplication && !m_hasValidGpuFrame && !requireLivePresent) {
+                seedGpuTextureFromGdi();
+            }
             if (m_duplication && m_hasValidGpuFrame) {
                 duplicated = true;
             } else {
@@ -1401,6 +1405,48 @@ bool ScreenCapture::pollCursor(CursorPayload& outMeta, std::vector<uint8_t>& out
     return true;
 }
 
+bool ScreenCapture::seedGpuTextureFromGdi() {
+    if (!m_d3dDevice || !m_d3dContext || m_isHdrOutput || m_width == 0 || m_height == 0) {
+        return false;
+    }
+    HDC hdcScreen = GetDC(NULL);
+    if (!hdcScreen) return false;
+    HDC hdcMem = CreateCompatibleDC(hdcScreen);
+    if (!hdcMem) {
+        ReleaseDC(NULL, hdcScreen);
+        return false;
+    }
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = static_cast<LONG>(m_width);
+    bmi.bmiHeader.biHeight = -static_cast<LONG>(m_height);
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bmp = CreateDIBSection(hdcScreen, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+    bool seeded = false;
+    if (bmp && bits) {
+        HGDIOBJ oldBmp = SelectObject(hdcMem, bmp);
+        if (BitBlt(hdcMem, 0, 0, static_cast<int>(m_width), static_cast<int>(m_height),
+                   hdcScreen, m_screenLeft, m_screenTop, SRCCOPY) &&
+            ensureGpuCopyTextures(m_width, m_height, DXGI_FORMAT_B8G8R8A8_UNORM)) {
+            int slot = 1 - m_latestSlot.load();
+            m_d3dContext->UpdateSubresource(m_gpuCopyTex[slot], 0, nullptr, bits, m_width * 4, 0);
+            m_d3dContext->Flush();
+            std::lock_guard<std::mutex> lock(m_snapMutex);
+            m_latestSlot.store(slot);
+            m_hasValidGpuFrame = true;
+            seeded = true;
+        }
+        SelectObject(hdcMem, oldBmp);
+    }
+    if (bmp) DeleteObject(bmp);
+    DeleteDC(hdcMem);
+    ReleaseDC(NULL, hdcScreen);
+    return seeded;
+}
+
 bool ScreenCapture::initGdi() {
     std::lock_guard<std::mutex> lock(m_snapMutex);
     cleanupGdiLocked();
@@ -1429,6 +1475,7 @@ bool ScreenCapture::initGdi() {
     if (!m_hBitmap || !m_gdiBits) { cleanupGdiLocked(); return false; }
 
     SelectObject(m_hdcMem, m_hBitmap);
+    BitBlt(m_hdcMem, 0, 0, m_width, m_height, m_hdcScreen, 0, 0, SRCCOPY);
     return true;
 }
 

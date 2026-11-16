@@ -316,6 +316,11 @@ void AirPlayServer::broadcastVideo(std::shared_ptr<const EncodedFrame> frame) {
             {
                 std::lock_guard<std::mutex> qlock(c->queueMutex);
                 if (c->waitingForKeyframe && !frame->isKeyframe) {
+                    auto nowTp = std::chrono::steady_clock::now();
+                    if (nowTp - c->lastKeyReqAt >= std::chrono::milliseconds(250)) {
+                        c->lastKeyReqAt = nowTp;
+                        anyKeyframeReq = true;
+                    }
                     continue;
                 }
                 if (frame->isKeyframe) {
@@ -538,6 +543,10 @@ void AirPlayServer::runClient(std::shared_ptr<ClientSession> session) {
     }
 
     if (session->alive && keyReq) {
+        {
+            std::lock_guard<std::mutex> qlock(session->queueMutex);
+            session->lastKeyReqAt = std::chrono::steady_clock::now();
+        }
         keyReq();
     }
 
@@ -554,6 +563,7 @@ void AirPlayServer::runClient(std::shared_ptr<ClientSession> session) {
         bool sendHello = false;
         bool sendAudioList = false;
         bool sendPong = false;
+        bool retryWaitingKey = false;
         uint32_t pongE1 = 0, pongE2 = 0;
 
         {
@@ -571,6 +581,13 @@ void AirPlayServer::runClient(std::shared_ptr<ClientSession> session) {
                     shutdown(session->sock, SD_BOTH);
                 }
                 break;
+            }
+            if (session->waitingForKeyframe) {
+                auto nowTp = std::chrono::steady_clock::now();
+                if (nowTp - session->lastKeyReqAt >= std::chrono::milliseconds(300)) {
+                    session->lastKeyReqAt = nowTp;
+                    retryWaitingKey = true;
+                }
             }
 
             if (session->hasHelloPending) {
@@ -600,6 +617,15 @@ void AirPlayServer::runClient(std::shared_ptr<ClientSession> session) {
                 videoFrame = std::move(session->videoQueue.front());
                 session->videoQueue.pop_front();
             }
+        }
+
+        if (retryWaitingKey) {
+            std::function<void()> retryFn;
+            {
+                std::lock_guard<std::mutex> ilock(m_infoMutex);
+                retryFn = m_onKeyframeReq;
+            }
+            if (retryFn) retryFn();
         }
 
         if (sendHello) {

@@ -59,6 +59,10 @@ static bool isNvidiaMftCandidate(IMFActivate* act, std::string& outFriendlyName)
     return containsInsensitive(vendorId, "10de") || containsInsensitive(outFriendlyName, "nvidia");
 }
 
+static bool isAnnexBStart(const uint8_t* d, size_t n) {
+    return d && n >= 4 && d[0] == 0 && d[1] == 0 && (d[2] == 1 || (d[2] == 0 && d[3] == 1));
+}
+
 static void inspectAnnexB(const uint8_t* data, size_t len, VideoCodec codec,
                           bool& hasParamSets, bool& hasIdr, std::vector<uint8_t>* outParamSets) {
     hasParamSets = false;
@@ -587,8 +591,9 @@ bool Encoder::initVideoProcessor(DXGI_FORMAT srcFormat, bool useP010) {
     hr = m_d3dDevice->CreateTexture2D(&outDesc, nullptr, &m_vpStagingTex);
     if (FAILED(hr) || !m_vpStagingTex) { cleanupVideoProcessor(); return false; }
 
-    // Disable auto contrast/sharpening so text & game UI stay clean
+    // Disable auto contrast/sharpening and force opaque alpha output so desktop pixels never blend black
     m_videoContext->VideoProcessorSetStreamAutoProcessingMode(m_vp, 0, FALSE);
+    m_videoContext->VideoProcessorSetOutputAlphaFillMode(m_vp, D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE_OPAQUE, 0);
 
     if (m_videoContext1) {
         DXGI_COLOR_SPACE_TYPE inSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
@@ -875,13 +880,16 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
             m_outBufSize = 2 * 1024 * 1024;
         }
 
-        // Extract optional sequence header if provided before streaming starts
+        // Extract optional sequence header if provided as Annex-B before streaming starts
         IMFMediaType* curOut = nullptr;
         if (SUCCEEDED(m_mft->GetOutputCurrentType(m_outStreamId, &curOut)) && curOut) {
             UINT32 hdrLen = 0;
-            if (SUCCEEDED(curOut->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &hdrLen)) && hdrLen > 0) {
-                m_seqHeader.resize(hdrLen);
-                curOut->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, m_seqHeader.data(), hdrLen, &hdrLen);
+            if (SUCCEEDED(curOut->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &hdrLen)) && hdrLen >= 4) {
+                std::vector<uint8_t> hdrBuf(hdrLen);
+                if (SUCCEEDED(curOut->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, hdrBuf.data(), hdrLen, &hdrLen)) &&
+                    isAnnexBStart(hdrBuf.data(), hdrLen)) {
+                    m_seqHeader = std::move(hdrBuf);
+                }
             }
             curOut->Release();
         }
@@ -898,6 +906,8 @@ bool Encoder::tryCreateMft(const GUID& outputSubtype, bool wantP010, bool hardwa
         }
         m_encoderName = hwName;
         m_forceKeyframe.store(true);
+        m_awaitingKeyframe.store(true);
+        m_framesWithoutKey = 0;
 
         for (UINT32 j = 0; j < count; ++j) ppActivate[j]->Release();
         CoTaskMemFree(ppActivate);
@@ -926,7 +936,10 @@ void Encoder::cleanupMft() {
     m_hasProducedOutput = false;
     m_hasEmittedKeyframe = false;
     m_submittedWithoutOutput = 0;
+    m_framesWithoutKey = 0;
     m_waitTimeouts = 0;
+    m_forceKeyframe.store(true);
+    m_awaitingKeyframe.store(true);
     m_seqHeader.clear();
     m_readyOutputs.clear();
 }
@@ -1141,12 +1154,17 @@ bool Encoder::encodeGpuFrame(ID3D11Texture2D* gpuSrcTex, uint64_t ptsUs,
 
 bool Encoder::encodeBgraCpu(const uint8_t* bgra, uint32_t width, uint32_t height, uint64_t ptsUs,
                             std::vector<uint8_t>& outAnnexB, bool& outIsKeyframe) {
-    if (!m_mft || !bgra || width != m_width || height != m_height || m_useP010) return false;
-    convertBgraToNv12Studio(bgra, width, height, m_yuvBuffer);
-    for (int attempt = 0; attempt < 4; ++attempt) {
+    if (!m_mft || !bgra || width != m_width || height != m_height) return false;
+    if (!m_useP010) {
+        convertBgraToNv12Studio(bgra, width, height, m_yuvBuffer);
+    }
+    for (int attempt = 0; attempt < 6; ++attempt) {
         if (!m_mft) return false;
-        if (m_useD3dManager) {
-            if (advanceFallback()) continue;
+        if (m_useD3dManager || m_useP010) {
+            if (advanceFallback()) {
+                if (!m_useP010) convertBgraToNv12Studio(bgra, width, height, m_yuvBuffer);
+                continue;
+            }
             return false;
         }
         if (!waitAsyncInputReady()) {
@@ -1178,7 +1196,16 @@ bool Encoder::popPendingFrame(std::vector<uint8_t>& outAnnexB, bool& outIsKeyfra
     m_readyOutputs.pop_front();
     if (!outAnnexB.empty()) {
         m_hasProducedOutput = true;
-        if (outIsKeyframe) m_hasEmittedKeyframe = true;
+        if (outIsKeyframe) {
+            m_hasEmittedKeyframe = true;
+            m_awaitingKeyframe.store(false);
+            m_framesWithoutKey = 0;
+        } else if (m_awaitingKeyframe.load()) {
+            if (++m_framesWithoutKey >= 3) {
+                m_forceKeyframe.store(true);
+                m_framesWithoutKey = 0;
+            }
+        }
         if (m_hasEmittedKeyframe) m_submittedWithoutOutput = 0;
         return true;
     }
@@ -1240,15 +1267,18 @@ bool Encoder::submitSampleToMft(IMFSample* sample, std::vector<uint8_t>& outAnne
         m_appliedGameLowLatency = wantLowLat;
     }
 
-    if ((m_forceKeyframe.exchange(false) || !m_hasEmittedKeyframe) && m_codecApi) {
+    const bool wantKey = m_forceKeyframe.load() || !m_hasEmittedKeyframe;
+    if (wantKey && m_codecApi) {
         setCodecUint32(m_codecApi, CODECAPI_AVEncVideoForceKeyFrame, 1);
     }
 
     HRESULT hr = m_mft->ProcessInput(m_inStreamId, sample, 0);
     sample->Release();
 
-    if (FAILED(hr)) {
-        // Async MFTs return MF_E_NOTACCEPTING while backpressured; drain outputs rather than falling back to CPU.
+    if (SUCCEEDED(hr)) {
+        m_forceKeyframe.store(false);
+    } else {
+        // Async MFTs return MF_E_NOTACCEPTING while backpressured; preserve m_forceKeyframe & drain outputs.
         if (hr == MF_E_NOTACCEPTING) {
             outInputAccepted = true;
             if (m_isAsync) {
@@ -1359,9 +1389,12 @@ bool Encoder::collectSyncOutput(std::vector<uint8_t>& outAnnexB, bool& outIsKeyf
                     }
                     if (SUCCEEDED(m_mft->SetOutputType(m_outStreamId, availOut, 0))) {
                         UINT32 hdrLen = 0;
-                        if (SUCCEEDED(availOut->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &hdrLen)) && hdrLen > 0) {
-                            m_seqHeader.resize(hdrLen);
-                            availOut->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, m_seqHeader.data(), hdrLen, &hdrLen);
+                        if (SUCCEEDED(availOut->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &hdrLen)) && hdrLen >= 4) {
+                            std::vector<uint8_t> hdrBuf(hdrLen);
+                            if (SUCCEEDED(availOut->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, hdrBuf.data(), hdrLen, &hdrLen)) &&
+                                isAnnexBStart(hdrBuf.data(), hdrLen)) {
+                                m_seqHeader = std::move(hdrBuf);
+                            }
                         }
                         setOk = true;
                     }
@@ -1390,15 +1423,14 @@ bool Encoder::collectSyncOutput(std::vector<uint8_t>& outAnnexB, bool& outIsKeyf
                     bool hasParamSets = false;
                     bool hasIdr = false;
                     std::vector<uint8_t> extractedParams;
-                    inspectAnnexB(pBytes, len, m_codec, hasParamSets, hasIdr,
-                                  m_seqHeader.empty() ? &extractedParams : nullptr);
+                    inspectAnnexB(pBytes, len, m_codec, hasParamSets, hasIdr, &extractedParams);
                     if (hasIdr) {
                         outIsKeyframe = true;
                     }
-                    if (m_seqHeader.empty() && !extractedParams.empty()) {
+                    if (!extractedParams.empty()) {
                         m_seqHeader = std::move(extractedParams);
                     }
-                    if (outIsKeyframe && !hasParamSets && !m_seqHeader.empty()) {
+                    if (outIsKeyframe && !hasParamSets && isAnnexBStart(m_seqHeader.data(), m_seqHeader.size())) {
                         outAnnexB.insert(outAnnexB.end(), m_seqHeader.begin(), m_seqHeader.end());
                     }
                     outAnnexB.insert(outAnnexB.end(), pBytes, pBytes + len);
@@ -1411,7 +1443,16 @@ bool Encoder::collectSyncOutput(std::vector<uint8_t>& outAnnexB, bool& outIsKeyf
 
         if (!outAnnexB.empty()) {
             m_hasProducedOutput = true;
-            if (outIsKeyframe) m_hasEmittedKeyframe = true;
+            if (outIsKeyframe) {
+                m_hasEmittedKeyframe = true;
+                m_awaitingKeyframe.store(false);
+                m_framesWithoutKey = 0;
+            } else if (m_awaitingKeyframe.load()) {
+                if (++m_framesWithoutKey >= 3) {
+                    m_forceKeyframe.store(true);
+                    m_framesWithoutKey = 0;
+                }
+            }
             if (m_hasEmittedKeyframe) m_submittedWithoutOutput = 0;
             return true;
         }

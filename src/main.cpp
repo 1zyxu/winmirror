@@ -897,6 +897,7 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
                 } else {
                     if (hasClients) {
                         server.disconnectAllClients();
+                        Sleep(25);
                         hasClients = false;
                     }
                     int tryPort = tgt.isDirectObs ? tgt.port : 7002;
@@ -952,14 +953,15 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
             {
                 std::unique_lock<std::mutex> lock(frameShare.mutex);
                 frameShare.cv.wait_for(lock, cvWaitBudget, [&]() {
-                    return !g_running || frameShare.seq != lastEncodedSeq || encoder.hasKeyframeRequest();
+                    return !g_running || frameShare.seq != lastEncodedSeq || encoder.isAwaitingKeyframe();
                 });
                 curSeq = frameShare.seq;
             }
             if (!g_running) break;
 
             bool gotNewScreen = (curSeq != lastEncodedSeq);
-            if (gotNewScreen || encoder.hasKeyframeRequest() || !encoder.hasEmittedKeyframe()) {
+            bool needKeyPump = encoder.isAwaitingKeyframe() || !encoder.hasEmittedKeyframe();
+            if (gotNewScreen || encoder.hasKeyframeRequest() || needKeyPump) {
                 lastEncodedSeq = curSeq;
                 frameShare.consumedSeq.store(curSeq);
 
@@ -972,6 +974,11 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
                     emitEncoded(annexB, isKey, ptsUs, encMs);
                 }
                 syncStreamMetadata();
+
+                if (!gotNewScreen && encoder.isAwaitingKeyframe()) {
+                    // Pace calm-desktop keyframe recovery cleanly so async MFT gets input without busy spinning
+                    std::this_thread::sleep_for(std::chrono::milliseconds(16));
+                }
 
                 if (!unlimitedFps && !gameBoost) {
                     // Drift-free fixed cadence without compounding encode latency into frame period
