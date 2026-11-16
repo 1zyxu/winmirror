@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Ultra-Low-Latency GPU Screen, Cursor & Audio Mirroring (Windows &rarr; macOS)</strong><br />
-  <code>v2.5.4</code> &bull; by <strong>karnajitop</strong>
+  <code>v2.5.5</code> &bull; by <strong>karnajitop</strong>
 </p>
 
 <p align="center">

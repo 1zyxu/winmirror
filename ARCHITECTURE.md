@@ -1,6 +1,6 @@
 # WinMirror System Architecture
 
-WinMirror (`v2.5.4`, publisher `karnajitop`) is a native C++ / Objective-C++ ultra-low-latency screen, audio, and cursor streaming system between a Windows host (`winmirror.exe` + `winmirror_rt.dll`) and a macOS receiver (`WinMirror.app` / OBS receiver).
+WinMirror (`v2.5.5`, publisher `karnajitop`) is a native C++ / Objective-C++ ultra-low-latency screen, audio, and cursor streaming system between a Windows host (`winmirror.exe` + `winmirror_rt.dll`) and a macOS receiver (`WinMirror.app` / OBS receiver).
 
 ---
 
@@ -123,7 +123,7 @@ sequenceDiagram
 - **Bluetooth RFCOMM:** Advertises WinMirror SDP UUID `{8F4A2C10-7B3E-4E91-9A02-574D49520001}` for out-of-band pairing metadata and interface negotiation.
 
 ### E. Windows UI, Runtime DLL & Anti-Reverse (`GuiWindow`, `WinMirrorRuntime`, `SecProtect`)
-- **Frameless Acrylic Chrome:** `WS_POPUP | WS_MINIMIZEBOX` main window and `WS_POPUP` splash window with `WM_NCCALCSIZE = 0`, `WM_NCPAINT = 0`, and `WM_NCACTIVATE = TRUE`, eliminating ghost native DWM title-bar icons while rendering a custom obsidian/crimson/white interface via Direct2D + DirectWrite (`GlassCanvas.h`).
+- **Frameless Acrylic Chrome:** `WS_POPUP | WS_MINIMIZEBOX | WS_SYSMENU` main window (`WS_POPUP` splash) with `WM_NCCALCSIZE = 0`, `WM_NCPAINT = 0`, and `WM_NCACTIVATE = TRUE`, explicit `WM_SETICON` (`ICON_BIG` / `ICON_SMALL`) taskbar icons, minimize-to-tray hiding (`ShowWindow(SW_HIDE)`), and 70%-transparent blurred Acrylic obsidian/crimson/white Direct2D/DirectWrite chrome (`GlassCanvas.h`).
 - **Privacy-First Display:** Receiver cards show friendly names and status (`OBS Receiver • Ready` / `AirPlay Receiver • Ready`), omitting raw LAN IP addresses from GUI panels and tray menus.
 - **Unified Branding:** Multi-resolution `src/app_icon.ico` (`16`–`256` px) embedded via `src/winmirror.rc`, Inno Setup `SetupIconFile`, and bilinear-sampled `48x48` `kAppIcon48` in `src/AppIconData.h` for header/splash/fallback icons.
 - **Companion Runtime (`winmirror_rt.dll`):** Applies `MMCSS` Pro Audio / Games scheduling, high-resolution multimedia timers, firewall exceptions (`TCP 7001`, `UDP 8889`), GPU registry preferences, and optional 4K 120/240Hz Virtual Display Driver provisioning (`--install-vdd`).

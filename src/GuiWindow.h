@@ -87,11 +87,13 @@ private:
     void invokeButtonAction(int btnId);
     void appendIpCharsFromClipboard();
     void addTrayIcon();
+    void hideToTray();
     void showFromTray();
     void showTrayContextMenu();
 
     std::atomic<HWND> m_hwnd{nullptr};
     HICON m_appIcon = nullptr;
+    HICON m_appIconSm = nullptr;
     HFONT m_fontTitle = nullptr;
     HFONT m_fontRow = nullptr;
     HFONT m_fontLabel = nullptr;

@@ -133,11 +133,25 @@ static void deleteTempFileBestEffort(const std::wstring& path) {
 }
 
 static void cleanupPreviousUpdateBinary() {
+    bool updatedNow = false;
     wchar_t exePath[MAX_PATH] = {};
     if (GetModuleFileNameW(NULL, exePath, MAX_PATH) > 0) {
         std::wstring base(exePath);
-        deleteTempFileBestEffort(base + L".old.exe");
+        std::wstring oldExe = base + L".old.exe";
+        if (GetFileAttributesW(oldExe.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            updatedNow = true;
+        }
+        deleteTempFileBestEffort(oldExe);
         deleteTempFileBestEffort(base + L".update.exe");
+    }
+    if (updatedNow) {
+        if (HMODULE sh32 = LoadLibraryW(L"shell32.dll")) {
+            using PfnShChangeNotify = void(WINAPI*)(LONG, UINT, LPCVOID, LPCVOID);
+            if (auto pNotify = reinterpret_cast<PfnShChangeNotify>(GetProcAddress(sh32, "SHChangeNotify"))) {
+                pNotify(0x08000000L /* SHCNE_ASSOCCHANGED */, 0x1000u /* SHCNF_FLUSHNOWAIT */, nullptr, nullptr);
+            }
+            FreeLibrary(sh32);
+        }
     }
     std::wstring exeDir = Updater::getExecutableDir();
     std::wstring dllBase = exeDir + L"\\winmirror_rt.dll";
