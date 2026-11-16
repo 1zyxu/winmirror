@@ -89,7 +89,6 @@ private:
     void addTrayIcon();
     void showFromTray();
     void showTrayContextMenu();
-    void copyPrimaryAddress();
 
     std::atomic<HWND> m_hwnd{nullptr};
     HICON m_appIcon = nullptr;

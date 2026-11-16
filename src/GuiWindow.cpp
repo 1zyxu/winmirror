@@ -242,7 +242,6 @@ constexpr int ID_BTN_MINIMIZE = 1003;
 constexpr int ID_BTN_CLOSE    = 1004;
 
 constexpr int ID_TRAY_OPEN    = 2001;
-constexpr int ID_TRAY_COPY_IP = 2002;
 constexpr int ID_TRAY_UPDATE  = 2003;
 constexpr int ID_TRAY_QUIT    = 2005;
 
@@ -590,6 +589,10 @@ LRESULT CALLBACK splashWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         case WM_NCCALCSIZE:
             if (wParam == TRUE) return 0;
             return DefWindowProcW(hwnd, msg, wParam, lParam);
+        case WM_NCPAINT:
+            return 0;
+        case WM_NCACTIVATE:
+            return TRUE;
         case WM_ERASEBKGND:
             return 1;
         case WM_TIMER:
@@ -743,7 +746,7 @@ void WinMirrorGui::runPreLaunchUpdater(std::function<void(std::function<void(con
     HWND hSplash = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
         cls.c_str(), L"WinMirror",
-        WS_OVERLAPPED | WS_CAPTION,
+        WS_POPUP,
         CW_USEDEFAULT, CW_USEDEFAULT, SPLASH_W, SPLASH_H,
         nullptr, nullptr, hInst, &st);
     st.hwnd.store(hSplash);
@@ -963,7 +966,7 @@ bool WinMirrorGui::createAndShow() {
     wc.lpszClassName = clsName.c_str();
     RegisterClassExW(&wc);
 
-    const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    const DWORD style = WS_POPUP | WS_MINIMIZEBOX;
     const DWORD exStyle = WS_EX_APPWINDOW;
 
     HWND hMain = CreateWindowExW(
@@ -1133,7 +1136,6 @@ void WinMirrorGui::showTrayContextMenu() {
     GetCursorPos(&pt);
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, ID_TRAY_OPEN, L"Open Screen Mirroring");
-    AppendMenuW(menu, MF_STRING, ID_TRAY_COPY_IP, L"Copy PC AirPlay IP");
     AppendMenuW(menu, MF_STRING, ID_TRAY_UPDATE, L"Check for Updates (v" L"" WINMIRROR_VERSION L")");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_TRAY_QUIT, L"Quit");
@@ -1145,40 +1147,11 @@ void WinMirrorGui::showTrayContextMenu() {
 
     if (cmd == ID_TRAY_OPEN) {
         showFromTray();
-    } else if (cmd == ID_TRAY_COPY_IP) {
-        copyPrimaryAddress();
     } else if (cmd == ID_TRAY_UPDATE) {
         if (m_onCheckUpdate) m_onCheckUpdate();
     } else if (cmd == ID_TRAY_QUIT) {
         requestClose();
     }
-}
-
-void WinMirrorGui::copyPrimaryAddress() {
-    std::string addr;
-    {
-        std::lock_guard<std::mutex> lock(m_mtx);
-        addr = m_status.primaryConnectAddr;
-    }
-    if (addr.empty()) addr = "127.0.0.1:7001";
-    std::wstring waddr = utf8ToWide(addr);
-    if (OpenClipboard(m_hwnd)) {
-        EmptyClipboard();
-        size_t bytes = (waddr.size() + 1) * sizeof(wchar_t);
-        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes);
-        if (hMem) {
-            void* p = GlobalLock(hMem);
-            if (p) {
-                memcpy(p, waddr.c_str(), bytes);
-                GlobalUnlock(hMem);
-                SetClipboardData(CF_UNICODETEXT, hMem);
-            } else {
-                GlobalFree(hMem);
-            }
-        }
-        CloseClipboard();
-    }
-    setStatusBanner("Copied PC AirPlay address: " + addr);
 }
 
 void WinMirrorGui::paintWindow(HWND hwnd) {
@@ -1360,9 +1333,9 @@ void WinMirrorGui::paintWindow(HWND hwnd) {
                               snap.isHevc ? L"HEVC" : L"H.264",
                               snap.audioActive ? L"Audio" : L"Muted");
             } else if (dev.isDirectObs) {
-                std::swprintf(subLine, ARRAYSIZE(subLine), L"OBS \u2022 %hs", dev.ip.c_str());
+                std::swprintf(subLine, ARRAYSIZE(subLine), L"OBS Receiver \u2022 Ready");
             } else {
-                std::swprintf(subLine, ARRAYSIZE(subLine), L"AirPlay \u2022 %hs", dev.ip.c_str());
+                std::swprintf(subLine, ARRAYSIZE(subLine), L"AirPlay Receiver \u2022 Ready");
             }
             drawTextGlass({ row.left + sc(50, m_dpi), row.top + sc(33, m_dpi),
                             row.right - sc(90, m_dpi), row.top + sc(53, m_dpi) },
@@ -1426,14 +1399,14 @@ void WinMirrorGui::paintWindow(HWND hwnd) {
         ipLabel = utf8ToWide(m_manualIp);
         if (m_ipFocused && m_caretOn) ipLabel += L"|";
     } else if (m_ipFocused) {
-        ipLabel = m_caretOn ? L"| Type Mac IP..." : L"  Type Mac IP...";
+        ipLabel = m_caretOn ? L"| Type host to connect..." : L"  Type host to connect...";
         ipTextCol = cMuted;
     } else {
-        std::string autoIp;
+        std::string autoName;
         for (const auto& t : snap.receivers) {
-            if (t.isDirectObs) { autoIp = t.ip; break; }
+            if (t.isDirectObs) { autoName = t.name; break; }
         }
-        ipLabel = !autoIp.empty() ? (L"Mac: " + utf8ToWide(autoIp)) : L"Enter Mac IP...";
+        ipLabel = !autoName.empty() ? (L"Ready: " + utf8ToWide(autoName)) : L"Type host to connect...";
         ipTextCol = cMuted;
     }
     drawTextGlass({ rcIp.left + sc(31, m_dpi), rcIp.top, rcIp.right - sc(10, m_dpi), rcIp.bottom },
@@ -1532,6 +1505,10 @@ LRESULT WinMirrorGui::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         case WM_NCCALCSIZE:
             if (wParam == TRUE) return 0;
             return DefWindowProcW(hwnd, msg, wParam, lParam);
+        case WM_NCPAINT:
+            return 0;
+        case WM_NCACTIVATE:
+            return TRUE;
         case WM_NCHITTEST: {
             POINT pt = { static_cast<int>(static_cast<short>(LOWORD(lParam))),
                          static_cast<int>(static_cast<short>(HIWORD(lParam))) };

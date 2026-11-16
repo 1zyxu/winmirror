@@ -818,7 +818,7 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
         } else {
             st.statusBanner = st.clients > 0
                 ? (std::string("Mirroring live (Video + Audio) - click active row to disconnect."))
-                : "Click a device above to mirror (Video + Audio), or enter Mac IP.";
+                : "Click a device above to start mirroring (Video + Audio).";
         }
         gui->updateStatus(st);
     };
@@ -910,7 +910,7 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
                             ? (tgt.name + ": Open OBS with AirPlay source on Mac, or check Mac firewall.")
                             : (tgt.name + " requires Apple FairPlay PIN. Open OBS on Mac to mirror."));
                     } else {
-                        setTempBanner("Could not reach OBS on " + tgt.ip + ":" + std::to_string(tryPort));
+                        setTempBanner("Could not reach " + tgt.name + " - check OBS is open on Mac.");
                     }
                 }
                 pushGuiSnapshot(0.0f, 0.0f);
@@ -931,9 +931,9 @@ static int runWinMirrorEngine(const std::vector<std::string>& args, WinMirrorGui
                 if (server.connectToReceiver(host, manualPort)) {
                     hasClients = true;
                     notifyKeyframe();
-                    setTempBanner("Connected to " + host + ":" + std::to_string(manualPort) + " (Video + Audio)!");
+                    setTempBanner("Connected to receiver (Video + Audio)!");
                 } else {
-                    setTempBanner("Could not connect to " + host + ":" + std::to_string(manualPort) + " - check OBS is running.");
+                    setTempBanner("Could not connect to receiver - check OBS is running.");
                 }
                 pushGuiSnapshot(0.0f, 0.0f);
             }
@@ -1110,9 +1110,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         WinMirrorGui::runPreLaunchUpdater([&](std::function<void(const std::string&)> setStatus) {
             cleanupPreviousUpdateBinary();
             std::wstring exeDir = Updater::getExecutableDir();
+            Updater::checkForUpdates(true, setStatus);
             setStatus("Verifying runtime components...");
             Updater::ensureCompanionDll(exeDir);
-            Updater::checkForUpdates(true, setStatus);
         });
     }
     wm_sec::enforceAntiReverse();
@@ -1151,7 +1151,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             }
             gui.setStatusBanner(target.isConnected
                 ? ("Disconnecting from " + target.name + "...")
-                : ("Connecting to " + target.name + " (" + target.ip + ")..."));
+                : ("Connecting to " + target.name + "..."));
             g_stateChangedSeq++;
         },
         [&](const std::string& ipText) {
@@ -1160,7 +1160,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                 g_pendingManualIp = ipText;
                 g_pendingTarget.reset();
             }
-            gui.setStatusBanner("Connecting to " + ipText + "...");
+            gui.setStatusBanner("Connecting to receiver...");
             g_stateChangedSeq++;
         },
         [&]() {

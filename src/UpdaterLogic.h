@@ -87,4 +87,18 @@ inline std::string findAssetDownloadUrl(const std::string& json, const std::stri
     return fallback;
 }
 
+inline std::string parseTagFromLocationUrl(const std::string& locationUrl) {
+    const std::string marker = "/tag/";
+    size_t pos = locationUrl.rfind(marker);
+    if (pos == std::string::npos) return {};
+    size_t start = pos + marker.size();
+    size_t end = start;
+    while (end < locationUrl.size() && locationUrl[end] != '/' &&
+           locationUrl[end] != '?' && locationUrl[end] != '#' &&
+           locationUrl[end] != '\r' && locationUrl[end] != '\n' && locationUrl[end] != ' ') {
+        ++end;
+    }
+    return (end > start) ? locationUrl.substr(start, end - start) : std::string{};
+}
+
 } // namespace updater_logic

@@ -3,6 +3,7 @@
 #include "SecProtect.h"
 #include "WinMirrorRuntime.h"
 #include <windows.h>
+#include <shellapi.h>
 #include <winhttp.h>
 #include <vector>
 #include <cstdio>
@@ -33,8 +34,34 @@ std::string getUpdaterRepoSlug() {
     return WM_OBF("1zyxu/winmirror");
 }
 
-bool openWinHttpGet(const std::wstring& host, INTERNET_PORT port, const std::wstring& path, bool https,
-                    HINTERNET& outSession, HINTERNET& outConnect, HINTERNET& outRequest, const std::wstring& extraHeaders) {
+void closeWinHttp(HINTERNET& hSession, HINTERNET& hConnect, HINTERNET& hRequest) {
+    if (hRequest) { WinHttpCloseHandle(hRequest); hRequest = nullptr; }
+    if (hConnect) { WinHttpCloseHandle(hConnect); hConnect = nullptr; }
+    if (hSession) { WinHttpCloseHandle(hSession); hSession = nullptr; }
+}
+
+bool moveReplaceWithRetry(const std::wstring& srcPath, const std::wstring& dstPath) {
+    // Strip Mark-of-the-Web and wait out Windows Defender's post-download scan lock
+    DeleteFileW((srcPath + L":Zone.Identifier").c_str());
+    for (int attempt = 0; attempt < 25; ++attempt) {
+        if (MoveFileExW(srcPath.c_str(), dstPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            DeleteFileW((dstPath + L":Zone.Identifier").c_str());
+            return true;
+        }
+        DWORD err = GetLastError();
+        if (err != ERROR_SHARING_VIOLATION && err != ERROR_ACCESS_DENIED && err != ERROR_LOCK_VIOLATION) {
+            break;
+        }
+        Sleep(120);
+    }
+    return false;
+}
+
+bool openWinHttpRequest(const std::wstring& host, INTERNET_PORT port, const std::wstring& path,
+                        const wchar_t* verb, bool https, bool allowRedirects,
+                        HINTERNET& outSession, HINTERNET& outConnect, HINTERNET& outRequest,
+                        const std::wstring& extraHeaders, DWORD& outStatusCode) {
+    outStatusCode = 0;
     std::wstring ua = WM_OBF_W(L"WM-Client/2.5");
     outSession = WinHttpOpen(ua.c_str(), WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                              WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
@@ -42,22 +69,21 @@ bool openWinHttpGet(const std::wstring& host, INTERNET_PORT port, const std::wst
     if (!outSession) return false;
 
     DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
-    WinHttpSetOption(outSession, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
-    WinHttpSetTimeouts(outSession, 1500, 2000, 2500, 10000);
+    if (!WinHttpSetOption(outSession, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols))) {
+        protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+        WinHttpSetOption(outSession, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
+    }
+    WinHttpSetTimeouts(outSession, 4000, 6000, 10000, 45000);
 
     outConnect = WinHttpConnect(outSession, host.c_str(), port, 0);
-    if (!outConnect) { WinHttpCloseHandle(outSession); outSession = nullptr; return false; }
+    if (!outConnect) { closeWinHttp(outSession, outConnect, outRequest); return false; }
 
     DWORD flags = https ? WINHTTP_FLAG_SECURE : 0;
-    outRequest = WinHttpOpenRequest(outConnect, L"GET", path.c_str(), nullptr,
+    outRequest = WinHttpOpenRequest(outConnect, verb ? verb : L"GET", path.c_str(), nullptr,
                                     WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-    if (!outRequest) {
-        WinHttpCloseHandle(outConnect); outConnect = nullptr;
-        WinHttpCloseHandle(outSession); outSession = nullptr;
-        return false;
-    }
+    if (!outRequest) { closeWinHttp(outSession, outConnect, outRequest); return false; }
 
-    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+    DWORD redirectPolicy = allowRedirects ? WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS : WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
     WinHttpSetOption(outRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
 
     std::wstring headers = !extraHeaders.empty() ? extraHeaders : WM_OBF_W(L"User-Agent: WM-Client\r\n");
@@ -65,23 +91,56 @@ bool openWinHttpGet(const std::wstring& host, INTERNET_PORT port, const std::wst
                                  WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
     if (ok) ok = WinHttpReceiveResponse(outRequest, nullptr);
 
-    DWORD statusCode = 0, statusSize = sizeof(statusCode);
+    DWORD statusSize = sizeof(outStatusCode);
     if (!ok ||
         !WinHttpQueryHeaders(outRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                             WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX) ||
-        statusCode != 200) {
-        WinHttpCloseHandle(outRequest); outRequest = nullptr;
-        WinHttpCloseHandle(outConnect); outConnect = nullptr;
-        WinHttpCloseHandle(outSession); outSession = nullptr;
+                             WINHTTP_HEADER_NAME_BY_INDEX, &outStatusCode, &statusSize, WINHTTP_NO_HEADER_INDEX)) {
+        closeWinHttp(outSession, outConnect, outRequest);
         return false;
     }
     return true;
 }
 
-void closeWinHttp(HINTERNET& hSession, HINTERNET& hConnect, HINTERNET& hRequest) {
-    if (hRequest) { WinHttpCloseHandle(hRequest); hRequest = nullptr; }
-    if (hConnect) { WinHttpCloseHandle(hConnect); hConnect = nullptr; }
-    if (hSession) { WinHttpCloseHandle(hSession); hSession = nullptr; }
+bool openWinHttpGet(const std::wstring& host, INTERNET_PORT port, const std::wstring& path, bool https,
+                    HINTERNET& outSession, HINTERNET& outConnect, HINTERNET& outRequest, const std::wstring& extraHeaders) {
+    DWORD status = 0;
+    if (!openWinHttpRequest(host, port, path, L"GET", https, true,
+                            outSession, outConnect, outRequest, extraHeaders, status) ||
+        status != 200) {
+        closeWinHttp(outSession, outConnect, outRequest);
+        return false;
+    }
+    return true;
+}
+
+// GitHub web /releases/latest 302 redirect never hits api.github.com's 60 req/hr unauthenticated rate limit
+bool resolveLatestTagViaRedirect(const std::string& repo, std::string& outTag) {
+    outTag.clear();
+    std::wstring ghHost = WM_OBF_W(L"github.com");
+    std::wstring relLatest = WM_OBF_W(L"/releases/latest");
+    std::wstring path = L"/" + toWide(repo) + relLatest;
+    wm_sec::wipeWString(relLatest);
+
+    HINTERNET s = nullptr, c = nullptr, r = nullptr;
+    DWORD status = 0;
+    bool ok = openWinHttpRequest(ghHost, INTERNET_DEFAULT_HTTPS_PORT, path, L"HEAD", true, false,
+                                 s, c, r, L"", status);
+    wm_sec::wipeWString(ghHost);
+    wm_sec::wipeWString(path);
+    if (!ok) return false;
+
+    if (status == 301 || status == 302 || status == 307 || status == 308) {
+        DWORD len = 0;
+        WinHttpQueryHeaders(r, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX, nullptr, &len, WINHTTP_NO_HEADER_INDEX);
+        if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && len > 0) {
+            std::wstring locW(len / sizeof(wchar_t) + 1, L'\0');
+            if (WinHttpQueryHeaders(r, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX, &locW[0], &len, WINHTTP_NO_HEADER_INDEX)) {
+                outTag = updater_logic::parseTagFromLocationUrl(toUtf8(locW.c_str()));
+            }
+        }
+    }
+    closeWinHttp(s, c, r);
+    return !outTag.empty();
 }
 
 } // namespace
@@ -229,31 +288,13 @@ bool Updater::ensureCompanionDll(const std::wstring& exeDir) {
 
     std::string repo = getUpdaterRepoSlug();
     std::string dllAsset = WM_OBF("winmirror_rt.dll");
-    std::string tagKey = WM_OBF("tag_name");
-    std::string latestKey = WM_OBF("latest");
     std::string exactTag = std::string("v") + WINMIRROR_VERSION;
-
-    std::string dllUrl;
-    std::string json;
-    if (fetchReleaseJson(repo, exactTag, json)) {
-        dllUrl = findAssetDownloadUrl(json, dllAsset);
-    }
-    if (dllUrl.empty() && fetchReleaseJson(repo, latestKey, json)) {
-        std::string latestTag = parseJsonStringField(json, tagKey);
-        if (trimVersion(latestTag) == WINMIRROR_VERSION) {
-            dllUrl = findAssetDownloadUrl(json, dllAsset);
-        }
-    }
-    if (dllUrl.empty()) {
-        std::string ghBase = WM_OBF("https://github.com/");
-        std::string dlPath = WM_OBF("/releases/download/");
-        dllUrl = ghBase + repo + dlPath + exactTag + "/" + dllAsset;
-        wm_sec::wipeString(ghBase);
-        wm_sec::wipeString(dlPath);
-    }
+    std::string ghBase = WM_OBF("https://github.com/");
+    std::string dlPath = WM_OBF("/releases/download/");
+    std::string dllUrl = ghBase + repo + dlPath + exactTag + "/" + dllAsset;
+    wm_sec::wipeString(ghBase);
+    wm_sec::wipeString(dlPath);
     wm_sec::wipeString(repo);
-    wm_sec::wipeString(tagKey);
-    wm_sec::wipeString(latestKey);
 
     std::wstring tmpSuffix = WM_OBF_W(L".tmp");
     std::wstring tmpDll = dllPath + tmpSuffix;
@@ -270,7 +311,7 @@ bool Updater::ensureCompanionDll(const std::wstring& exeDir) {
         return false;
     }
 
-    if (!MoveFileExW(tmpDll.c_str(), dllPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+    if (!moveReplaceWithRetry(tmpDll, dllPath)) {
         DeleteFileW(tmpDll.c_str());
         return false;
     }
@@ -306,23 +347,35 @@ void Updater::applyUpdateAndRestart(const std::string& newExePath) {
     std::wstring oldExe = std::wstring(currentExe) + oldSuf;
     wm_sec::wipeWString(oldSuf);
 
-    if (!MoveFileExW(currentExe, oldExe.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+    if (!moveReplaceWithRetry(currentExe, oldExe)) {
         DeleteFileW(newExeW.c_str());
         return;
     }
-    if (!MoveFileExW(newExeW.c_str(), currentExe, MOVEFILE_REPLACE_EXISTING)) {
-        MoveFileExW(oldExe.c_str(), currentExe, MOVEFILE_REPLACE_EXISTING);
+    if (!moveReplaceWithRetry(newExeW, currentExe)) {
+        moveReplaceWithRetry(oldExe, currentExe);
         DeleteFileW(newExeW.c_str());
         return;
     }
 
+    std::wstring exeDir = getExecutableDir();
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
     if (CreateProcessW(currentExe, nullptr, nullptr, nullptr, FALSE,
-                       DETACHED_PROCESS, nullptr, nullptr, &si, &pi)) {
+                       DETACHED_PROCESS, nullptr, exeDir.c_str(), &si, &pi)) {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
         ExitProcess(0);
+    }
+
+    if (GetLastError() == ERROR_ELEVATION_REQUIRED) {
+        SHELLEXECUTEINFOW sei = { sizeof(sei) };
+        sei.lpVerb = L"runas";
+        sei.lpFile = currentExe;
+        sei.lpDirectory = exeDir.c_str();
+        sei.nShow = SW_SHOWNORMAL;
+        if (ShellExecuteExW(&sei)) {
+            ExitProcess(0);
+        }
     }
 }
 
@@ -332,30 +385,43 @@ bool Updater::checkForUpdates(bool autoInstall, StatusCallback onStatus) {
     if (onStatus) onStatus("Checking for updates...");
 
     std::string repo = getUpdaterRepoSlug();
-    std::string latestKey = WM_OBF("latest");
-    std::string json;
-    bool fetched = fetchReleaseJson(repo, latestKey, json);
-    wm_sec::wipeString(latestKey);
-    if (!fetched) {
+    std::string exeAsset = WM_OBF("winmirror.exe");
+    std::string dllAsset = WM_OBF("winmirror_rt.dll");
+    std::string latestTag;
+    std::string exeUrl;
+    std::string dllUrl;
+
+    // 1. Zero-rate-limit HTTPS redirect check on github.com/.../releases/latest
+    resolveLatestTagViaRedirect(repo, latestTag);
+
+    // 2. Fallback to GitHub Releases API JSON if redirect didn't return tag
+    if (latestTag.empty()) {
+        std::string latestKey = WM_OBF("latest");
+        std::string json;
+        bool fetched = fetchReleaseJson(repo, latestKey, json);
+        wm_sec::wipeString(latestKey);
+        if (fetched) {
+            std::string tagKey = WM_OBF("tag_name");
+            latestTag = parseJsonStringField(json, tagKey);
+            exeUrl = findAssetDownloadUrl(json, exeAsset);
+            dllUrl = findAssetDownloadUrl(json, dllAsset);
+            wm_sec::wipeString(tagKey);
+        }
+    }
+
+    if (latestTag.empty()) {
         wm_sec::wipeString(repo);
+        wm_sec::wipeString(exeAsset);
+        wm_sec::wipeString(dllAsset);
         return false;
     }
 
-    std::string tagKey = WM_OBF("tag_name");
-    std::string exeAsset = WM_OBF("winmirror.exe");
-    std::string dllAsset = WM_OBF("winmirror_rt.dll");
-    std::string latestTag = parseJsonStringField(json, tagKey);
-    std::string exeUrl = findAssetDownloadUrl(json, exeAsset);
-    std::string dllUrl = findAssetDownloadUrl(json, dllAsset);
-    wm_sec::wipeString(tagKey);
-
-    if (exeUrl.empty() && !latestTag.empty()) {
-        std::string ghBase = WM_OBF("https://github.com/");
-        std::string dlPath = WM_OBF("/releases/download/");
-        exeUrl = ghBase + repo + dlPath + latestTag + "/" + exeAsset;
-        wm_sec::wipeString(ghBase);
-        wm_sec::wipeString(dlPath);
-    }
+    std::string ghBase = WM_OBF("https://github.com/");
+    std::string dlPath = WM_OBF("/releases/download/");
+    if (exeUrl.empty()) exeUrl = ghBase + repo + dlPath + latestTag + "/" + exeAsset;
+    if (dllUrl.empty()) dllUrl = ghBase + repo + dlPath + latestTag + "/" + dllAsset;
+    wm_sec::wipeString(ghBase);
+    wm_sec::wipeString(dlPath);
     wm_sec::wipeString(repo);
     wm_sec::wipeString(exeAsset);
 
@@ -378,7 +444,7 @@ bool Updater::checkForUpdates(bool autoInstall, StatusCallback onStatus) {
         wm_sec::wipeWString(updSuf);
         WinMirrorRuntimeApi::instance().unload();
         if (downloadFileW(dllUrl, dllTmp, true)) {
-            if (!MoveFileExW(dllTmp.c_str(), dllDest.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            if (!moveReplaceWithRetry(dllTmp, dllDest)) {
                 DeleteFileW(dllTmp.c_str());
             }
         }

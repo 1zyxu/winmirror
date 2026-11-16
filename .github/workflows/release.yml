@@ -43,6 +43,13 @@ jobs:
             ole32.lib oleaut32.lib gdi32.lib user32.lib shell32.lib advapi32.lib ws2_32.lib bthprops.lib winhttp.lib iphlpapi.lib winmm.lib `
             /OUT:winmirror.exe
           Compress-Archive -Path winmirror.exe, winmirror_rt.dll -DestinationPath winmirror-windows.zip -Force
+          $verLine = Select-String -Path src\Common.h -Pattern 'WINMIRROR_VERSION\s+"([^"]+)"'
+          $appVer = if ($verLine) { $verLine.Matches[0].Groups[1].Value } else { "2.5.3" }
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          & $iscc "/DAppVersion=$appVer" installer\winmirror.iss
 
       - name: Upload Windows Artifact
         uses: actions/upload-artifact@v4
@@ -52,6 +59,7 @@ jobs:
             winmirror.exe
             winmirror_rt.dll
             winmirror-windows.zip
+            WinMirror-Setup.exe
 
   build-macos:
     runs-on: macos-latest
@@ -93,6 +101,7 @@ jobs:
             winmirror.exe
             winmirror_rt.dll
             winmirror-windows.zip
+            WinMirror-Setup.exe
             winmirror_mac
             WinMirror.dmg
           draft: false
