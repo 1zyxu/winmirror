@@ -1,83 +1,98 @@
-# WinMirror
+<p align="center">
+  <img src="assets/app_icon.png" alt="WinMirror Logo" width="112" />
+</p>
 
-**Ultra-Low Latency C++ Screen Mirror (PC &rarr; Mac)**
+<h1 align="center">WinMirror AirPlay</h1>
 
-WinMirror captures your Windows PC display at 60+ FPS straight from GPU VRAM and streams it to your Mac over direct USB-C or local network with **deeply sub-millisecond to 5ms end-to-end latency** ("deeply no lag").
+<p align="center">
+  <strong>Ultra-Low-Latency GPU Screen, Cursor & Audio Mirroring (Windows &rarr; macOS)</strong><br />
+  <code>v2.5.4</code> &bull; by <strong>karnajitop</strong>
+</p>
 
----
-
-## ⚡ Why Zero Lag?
-
-1. **DXGI Desktop Duplication (DirectX 11)**:
-   Captures frames directly from GPU memory in `< 1ms` without CPU copies or GDI stalls. (Falls back to GDI if running headless/restricted).
-2. **Hardware/SIMD WIC Encoder**:
-   Uses Windows Imaging Component (WIC) to compress frames into lightweight intra-frame JPEG in `~2ms` (no GOP/B-frame buffer latency).
-3. **Queue-less Zero-Buffer Streaming**:
-   Sockets use `TCP_NODELAY = 1`. If a client socket is busy, stale frames are discarded immediately so you are always seeing real-time frames with zero drift.
-4. **Auto-Updater**:
-   Built-in GitHub release auto-updater via `winhttp.dll` (`1zyxu/winmirror`).
+<p align="center">
+  <a href="https://github.com/1zyxu/winmirror/releases/latest">Latest Release</a> &bull;
+  <a href="ARCHITECTURE.md">System Architecture</a> &bull;
+  <a href="https://github.com/1zyxu/winmirror/actions">CI Builds</a>
+</p>
 
 ---
 
-## 🚀 Quick Start
+## Overview
 
-### 1. On Windows PC:
-Run `winmirror.exe`:
+WinMirror streams your Windows desktop, hardware mouse cursor, and system/microphone audio to macOS over USB-C tethering, Wi-Fi/LAN, or Bluetooth discovery with sub-frame GPU capture (`DXGI` / `WGC`) and hardware `NVENC` / `Media Foundation` encoding (`HEVC` 10-bit HDR10 PQ & `H.264`).
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for sequence diagrams, packet wire format specifications (`WMIR`), and updater internals.
+
+```mermaid
+flowchart LR
+    pcCap["Windows Capture (DXGI / WGC + WASAPI + Cursor)"] --> pcEnc["Hardware Encode (NVENC HEVC HDR10 / H.264)"]
+    pcEnc -->|"WMIR Binary Stream (TCP 7001 / 7002)"| macDec["macOS Decode (VideoToolbox + AudioQueue)"]
+    pcDisc["Auto-Discovery (mDNS 5353 + UDP 8889 + RFCOMM)"] -.->|"Zero-Config Connect"| macDec
+    macDec --> macOut["AVSampleBufferDisplayLayer + Cursor Layer"]
+```
+
+---
+
+## Key Capabilities
+
+- **GPU-Native Capture & Encode:** Captures frames in GPU VRAM via DXGI Desktop Duplication / WGC and encodes directly through NVIDIA `NVENC` (including Optimus dual-GPU bridging) or Media Foundation `HEVC` (10-bit `P010` HDR10 PQ / 8-bit `NV12`) and `H.264`.
+- **Decoupled Cursor & Audio:** Streams hardware cursor position/hotspot/bitmaps alongside WASAPI audio frames with live audio source switching from the receiver.
+- **Queue-Less Real-Time Transport:** `TCP_NODELAY` sockets drop stale frames under congestion and issue `PACKET_TYPE_KEYFRAME_REQ` recovery to prevent latency buildup.
+- **Frameless Acrylic Windows UI:** Obsidian, crimson, and crisp white Direct2D/DirectWrite chrome (`WS_POPUP`) with receiver auto-discovery, name-only privacy badges (raw IPs hidden in the UI), system tray controls, and custom squircle branding.
+- **Hardened Pre-Launch Auto-Updater:** Zero-rate-limit GitHub `releases/latest` redirect check over TLS 1.2/1.3, MZ PE verification, Defender lock-retry file replacement, and runtime companion DLL recovery (`winmirror_rt.dll`).
+- **Multi-Transport Discovery:** Supports mDNS (`UDP 5353`), UDP Beacon (`UDP 8889`), direct OBS subnet probe (`TCP 7002`), and Bluetooth RFCOMM pairing (`{8F4A2C10-7B3E-4E91-9A02-574D49520001}`).
+
+---
+
+## Installation & Quick Start
+
+### Windows Sender (`winmirror.exe`)
+1. Download **`WinMirror-Setup.exe`** (recommended installer) or `winmirror-windows.zip` from the [Latest Release](https://github.com/1zyxu/winmirror/releases/latest).
+2. Run **`WinMirror AirPlay`**. On launch, the pre-launch splash checks GitHub Releases for updates before starting the main window.
+3. Click any discovered Mac/OBS receiver row to start mirroring video, cursor, and audio, or enter a host name in the manual input bar.
+
+#### Optional CLI Flags
 ```cmd
-winmirror.exe
+winmirror.exe --port 7001 --fps 60
 ```
-You can also customize options:
-```cmd
-winmirror.exe --port 8888 --fps 60 --quality 0.75
-```
-Options:
-- `--port <number>`: Streaming port (default: `8888`)
-- `--fps <30-120>`: Target FPS (default: `60`)
-- `--quality <0.1-1.0>`: Image quality (default: `0.75`)
-- `--no-update`: Skip checking GitHub releases on launch
-- `--update-only`: Check and apply updates then exit
+- `--port <number>`: TCP media server port (default `7001`).
+- `--fps <number|auto|unlimited>`: Override capture/encode frame rate (`auto` matches display refresh; `unlimited` / `max` / `uncapped` removes cap).
+- `--no-update`: Skip the pre-launch GitHub auto-update check.
+- `--update-only`: Apply updates if available and exit.
+- `--check`: Run `winmirror_rt.dll` preflight diagnostics cleanly in console.
+- `--install`: Configure firewall (`TCP 7001`, `UDP 8889`), MMCSS/GPU preferences, and runtime components (run automatically by `WinMirror-Setup.exe`).
+- `--install-vdd`: Install the 4K 120/240Hz HDR Virtual Display Driver package (requires Administrator).
 
-### 2. Connect via USB-C:
-- Connect your USB-C cable between PC and Mac.
-- On Windows, enable **USB Tethering / Internet Sharing** on the USB interface, OR both machines will communicate instantly over your shared local Wi-Fi / LAN router.
-- `winmirror.exe` automatically prints all active IP addresses in the console.
-
-### 3. View on Mac:
-
-#### Option A: Native High-Performance App (Recommended)
-Run the native Cocoa viewer in Terminal:
-```bash
-./winmirror_mac
-```
-*(Automatically auto-discovers PC via UDP beacon, or pass IP directly: `./winmirror_mac 192.168.0.x`)*
-- Press **F** to toggle Fullscreen.
-
-#### Option B: Zero-Install Browser View
-Open Safari or Google Chrome and navigate to:
-```
-http://<PC-IP>:8888
-```
-Includes an interactive, dark-mode canvas viewer with real-time FPS counter, fullscreen toggle (`F`), and scaling controls.
+### macOS Receiver (`WinMirror.app`)
+1. Open **`WinMirror.dmg`** from [Latest Release](https://github.com/1zyxu/winmirror/releases/latest) and drag `WinMirror.app` into `/Applications` (or run CLI `./winmirror_mac [host] [port]`).
+2. WinMirror automatically publishes Bonjour `_winmirror._tcp.`, listens for UDP `8889` beacons, and monitors Bluetooth RFCOMM so your Windows PC discovers your Mac without manual IP entry.
 
 ---
 
-## 🔄 Auto-Update via GitHub
+## Building from Source
 
-When a new release tag (e.g. `v1.0.1`) is published to GitHub (`1zyxu/winmirror`), `winmirror.exe`:
-1. Detects the new release automatically via the GitHub API.
-2. Downloads `winmirror_update.exe`.
-3. Seamlessly replaces itself and restarts with zero manual intervention.
+### On macOS (Cross-Compiles Windows + Native macOS)
+Requires `zig` (`0.14.1+`), Xcode Command Line Tools (`clang++`, `sips`, `iconutil`, `hdiutil`):
+```bash
+./build.sh all    # Builds winmirror.exe, winmirror_rt.dll, winmirror_mac, WinMirror.app, WinMirror.dmg
+./build.sh win    # Windows targets only
+./build.sh mac    # macOS app bundle + DMG only
+```
+
+### CI Release Builds
+Tagging `v*` triggers [.github/workflows/release.yml](.github/workflows/release.yml):
+- **`windows-latest`:** MSVC `cl.exe /O2 /GL` + `rc.exe` (`app_icon.ico` + manifest) + Inno Setup 6 `ISCC.exe` -> `winmirror.exe`, `winmirror_rt.dll`, `winmirror-windows.zip`, `WinMirror-Setup.exe`.
+- **`macos-latest`:** `./build.sh mac` -> `winmirror_mac`, `WinMirror.dmg`.
 
 ---
 
-## 🛠️ Building from Source
+## Repository Layout
 
-To build both `winmirror.exe` and `winmirror_mac` locally on macOS:
-```bash
-./build.sh all
-```
-Or build individually:
-```bash
-./build.sh win    # Builds winmirror.exe
-./build.sh mac    # Builds winmirror_mac
-```
+| Path | Purpose |
+|---|---|
+| `src/` | Windows sender, DXGI/WGC/GDI capture, NVENC/MFT encoder, WASAPI audio, acrylic UI, auto-updater, security obfuscation, `.ico`/pixel logo, `winmirror_rt.dll` |
+| `mac/` | Native Cocoa `VideoToolbox` HDR10/SDR decoder, `AVSampleBufferDisplayLayer`, `AudioQueue` playback, Bonjour + Bluetooth receiver |
+| `installer/` | Inno Setup 6 installer script (`winmirror.iss` &rarr; `WinMirror-Setup.exe`) |
+| `assets/` | `1024x1024` master squircle app icons (`app_icon.png`, `app_icon_mac.png`) |
+| `.github/workflows/` | Automated MSVC + Inno Setup + macOS universal release workflow |
+| `ARCHITECTURE.md` | Full Mermaid system topology, `WMIR` sequence diagram, and module deep dive |
