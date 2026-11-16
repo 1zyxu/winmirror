@@ -50,39 +50,14 @@ build_mac() {
     cp mac/Info.plist WinMirror.app/Contents/Info.plist
     chmod +x WinMirror.app/Contents/MacOS/winmirror_mac
 
-    python3 - <<'PYEOF'
-import struct, zlib
-W = H = 512
-rows = []
-for y in range(H):
-    row = bytearray([0])
-    for x in range(W):
-        dx = max(0, max(96 - x, x - 415))
-        dy = max(0, max(96 - y, y - 415))
-        if dx * dx + dy * dy > 96 * 96:
-            row.extend((0, 0, 0, 0))
-            continue
-        r, g, b = (30, 88, 224) if y < 256 else (20, 62, 184)
-        if 96 <= x <= 415 and 128 <= y <= 344 and (x < 114 or x > 397 or y < 146 or y > 326):
-            r, g, b = 248, 250, 252
-        elif 176 <= x <= 336 and 372 <= y <= 390:
-            r, g, b = 147, 197, 253
-        elif 216 <= x <= 316 and 186 <= y <= 286 and abs(y - 236) <= (316 - x) // 2:
-            r, g, b = 52, 211, 153
-        row.extend((r, g, b, 255))
-    rows.append(bytes(row))
-def chunk(tag, data):
-    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
-ihdr = struct.pack(">IIBBBBB", W, H, 8, 6, 0, 0, 0)
-idat = zlib.compress(b"".join(rows), 6)
-with open(".iconset_tmp/base.png", "wb") as f:
-    f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b""))
-PYEOF
-    sips -z 128 128 .iconset_tmp/base.png --out .iconset_tmp/AppIcon.iconset/icon_128x128.png >/dev/null
-    sips -z 256 256 .iconset_tmp/base.png --out .iconset_tmp/AppIcon.iconset/icon_128x128@2x.png >/dev/null
-    sips -z 256 256 .iconset_tmp/base.png --out .iconset_tmp/AppIcon.iconset/icon_256x256.png >/dev/null
-    cp .iconset_tmp/base.png .iconset_tmp/AppIcon.iconset/icon_256x256@2x.png
-    cp .iconset_tmp/base.png .iconset_tmp/AppIcon.iconset/icon_512x512.png
+    for s in 16 32 128 256 512; do
+        sips -z $s $s assets/app_icon_mac.png --out ".iconset_tmp/AppIcon.iconset/icon_${s}x${s}.png" >/dev/null
+    done
+    sips -z 32 32 assets/app_icon_mac.png --out .iconset_tmp/AppIcon.iconset/icon_16x16@2x.png >/dev/null
+    sips -z 64 64 assets/app_icon_mac.png --out .iconset_tmp/AppIcon.iconset/icon_32x32@2x.png >/dev/null
+    sips -z 256 256 assets/app_icon_mac.png --out .iconset_tmp/AppIcon.iconset/icon_128x128@2x.png >/dev/null
+    sips -z 512 512 assets/app_icon_mac.png --out .iconset_tmp/AppIcon.iconset/icon_256x256@2x.png >/dev/null
+    cp assets/app_icon_mac.png .iconset_tmp/AppIcon.iconset/icon_512x512@2x.png
     iconutil -c icns .iconset_tmp/AppIcon.iconset -o WinMirror.app/Contents/Resources/AppIcon.icns
     rm -rf .iconset_tmp
 

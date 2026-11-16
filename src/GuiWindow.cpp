@@ -1,5 +1,6 @@
 #include "GuiWindow.h"
 #include "GlassCanvas.h"
+#include "AppIconData.h"
 #include "SecProtect.h"
 #include <d2d1.h>
 #include <dwrite.h>
@@ -383,12 +384,6 @@ std::vector<HitRectItem> buildControlRects(UINT dpi) {
     };
 }
 
-void drawMirroringGlyph(uint32_t* px, int w, int h, float x, float y, UINT dpi) {
-    float s = scf(1.0f, dpi);
-    glass::strokeRoundRect(px, w, h, x, y, x + 15 * s, y + 10.5f * s, 2.5f * s, 1.7f * s, {239, 68, 68, 250});
-    glass::strokeRoundRect(px, w, h, x + 6 * s, y + 5 * s, x + 21 * s, y + 16 * s, 2.5f * s, 1.7f * s, {255, 255, 255, 248});
-}
-
 void drawLaptopGlyph(uint32_t* px, int w, int h, float x, float y, UINT dpi, GlassColor col) {
     float s = scf(1.0f, dpi);
     glass::strokeRoundRect(px, w, h, x + 3 * s, y + 1 * s, x + 21 * s, y + 13 * s, 2.2f * s, 1.6f * s, col);
@@ -444,7 +439,12 @@ void drawSpeakerGlyph(uint32_t* px, int w, int h, float x, float y, UINT dpi, Gl
 }
 
 HICON createAppBadgeIcon() {
-    const int sz = 32;
+    const int sz = std::max(32, GetSystemMetrics(SM_CXICON));
+    if (HICON resIcon = static_cast<HICON>(LoadImageW(
+            GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON, sz, sz, LR_DEFAULTCOLOR))) {
+        return resIcon;
+    }
+
     BITMAPINFO bi = {};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bi.bmiHeader.biWidth = sz;
@@ -453,10 +453,11 @@ HICON createAppBadgeIcon() {
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB;
 
+    std::vector<uint8_t> maskZeros(static_cast<size_t>((sz + 15) / 16) * 2 * sz, 0);
     void* bits = nullptr;
     HDC screenDc = GetDC(nullptr);
     HBITMAP colorBmp = CreateDIBSection(screenDc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    HBITMAP maskBmp = CreateBitmap(sz, sz, 1, 1, nullptr);
+    HBITMAP maskBmp = CreateBitmap(sz, sz, 1, 1, maskZeros.data());
     ReleaseDC(nullptr, screenDc);
     if (!colorBmp || !maskBmp || !bits) {
         if (colorBmp) DeleteObject(colorBmp);
@@ -465,22 +466,9 @@ HICON createAppBadgeIcon() {
     }
 
     uint32_t* px = static_cast<uint32_t*>(bits);
-    for (int y = 0; y < sz; ++y) {
-        for (int x = 0; x < sz; ++x) {
-            int dx = std::max(0, std::max(5 - x, x - 26));
-            int dy = std::max(0, std::max(5 - y, y - 26));
-            if (dx * dx + dy * dy > 25) {
-                px[y * sz + x] = 0x00000000;
-                continue;
-            }
-            uint32_t col = (y < 16) ? 0xFFDC2626u : 0xFF141418u;
-            if ((x >= 6 && x <= 19 && y >= 7 && y <= 17 && (x == 6 || x == 19 || y == 7 || y == 17)) ||
-                (x >= 12 && x <= 25 && y >= 13 && y <= 23 && (x == 12 || x == 25 || y == 13 || y == 23))) {
-                col = 0xFFFFFFFF;
-            }
-            px[y * sz + x] = col;
-        }
-    }
+    std::memset(px, 0, static_cast<size_t>(sz) * sz * sizeof(uint32_t));
+    glass::blitPremulArgbBilinear(px, sz, sz, kAppIcon48, kAppIconSize, kAppIconSize,
+                                  0.0f, 0.0f, static_cast<float>(sz));
 
     ICONINFO ii = {};
     ii.fIcon = TRUE;
@@ -676,7 +664,8 @@ LRESULT CALLBACK splashWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 
             glass::fillCanvasGlass(st->canvasPx, w, h, st->glass ? 232 : 255);
             glass::strokeRoundRect(st->canvasPx, w, h, 0.5f, 0.5f, w - 0.5f, h - 0.5f, scf(10, st->dpi), 1.0f, {255, 255, 255, 36});
-            drawMirroringGlyph(st->canvasPx, w, h, scf(16, st->dpi), scf(20, st->dpi), st->dpi);
+            glass::blitPremulArgbBilinear(st->canvasPx, w, h, kAppIcon48, kAppIconSize, kAppIconSize,
+                                          scf(13, st->dpi), scf(20, st->dpi), scf(28, st->dpi));
             drawTextToCanvas(st->canvasPx, w, h, st->scratchDc, st->scratchPx, st->sw, st->sh,
                              &st->dwText, 0,
                              { sc(46, st->dpi), sc(14, st->dpi), sc(170, st->dpi), sc(36, st->dpi) },
@@ -1194,8 +1183,9 @@ void WinMirrorGui::paintWindow(HWND hwnd) {
     const GlassColor cMuted = {161, 161, 170, 238};
     const GlassColor cRed   = {239, 68, 68, 255};
 
-    // Header: Red & White Mirroring Icon + Google-style Crisp Typography + Status Pill + Chrome
-    drawMirroringGlyph(m_canvasPx, cw, ch, scf(16, m_dpi), scf(19, m_dpi), m_dpi);
+    // Header: WinMirror App Logo Badge + Google-style Crisp Typography + Status Pill + Chrome
+    glass::blitPremulArgbBilinear(m_canvasPx, cw, ch, kAppIcon48, kAppIconSize, kAppIconSize,
+                                  scf(13, m_dpi), scf(16, m_dpi), scf(28, m_dpi));
     drawTextGlass({ sc(46, m_dpi), sc(12, m_dpi), sc(244, m_dpi), sc(33, m_dpi) },
                   m_fontTitle, cWhite, L"Screen Mirroring",
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);

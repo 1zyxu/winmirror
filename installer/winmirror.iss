@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "2.5.3"
+  #define AppVersion "2.5.4"
 #endif
 
 [Setup]
@@ -24,6 +24,7 @@ DisableProgramGroupPage=yes
 CloseApplications=yes
 CloseApplicationsFilter=winmirror.exe,winmirror_rt.dll
 RestartApplications=no
+SetupIconFile=..\src\app_icon.ico
 UninstallDisplayIcon={app}\winmirror.exe
 VersionInfoVersion={#AppVersion}.0
 VersionInfoCompany=karnajitop

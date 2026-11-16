@@ -667,7 +667,7 @@ static OSStatus OnCoreAudioRouteChanged(AudioObjectID, UInt32, const AudioObject
         };
 
         _lobbyTitle = [makeLabel(NSMakeRect(24, 174, 452, 26), 19.0, NSFontWeightSemibold,
-                                 [NSColor whiteColor], @"WinMirror AirPlay v2.5.3") retain];
+                                 [NSColor whiteColor], @"WinMirror AirPlay v2.5.4") retain];
         _lobbySub = [makeLabel(NSMakeRect(24, 150, 452, 18), 12.0, NSFontWeightRegular,
                                [NSColor colorWithCalibratedRed:0.55 green:0.60 blue:0.68 alpha:1.0],
                                @"Game Screen Low-Latency Receiver  |  Max 200 Mbps HEVC HDR10") retain];
@@ -1436,7 +1436,7 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
                                               styleMask:style
                                                 backing:NSBackingStoreBuffered
                                                   defer:NO];
-        [_window setTitle:@"WinMirror AirPlay v2.5.3 | by karnajitop"];
+        [_window setTitle:@"WinMirror AirPlay v2.5.4 | by karnajitop"];
         [_window setBackgroundColor:[NSColor colorWithCalibratedRed:0.051 green:0.067 blue:0.090 alpha:1.0]];
         [_window setMinSize:NSMakeSize(800, 450)];
         [_window setDelegate:self];
@@ -1784,7 +1784,7 @@ static double probeTcpCandidate(const std::string& ip, int port, int timeoutMs) 
     _statusItem = [[[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength] retain];
     if (_statusItem.button) {
         _statusItem.button.title = @"WM";
-        _statusItem.button.toolTip = @"WinMirror AirPlay v2.5.3 by karnajitop";
+        _statusItem.button.toolTip = @"WinMirror AirPlay v2.5.4 by karnajitop";
     }
     NSMenu *sbMenu = [[[NSMenu alloc] initWithTitle:@"WinMirror"] autorelease];
     NSMenuItem *sbShow = [[[NSMenuItem alloc] initWithTitle:@"Focus Receiver Window"

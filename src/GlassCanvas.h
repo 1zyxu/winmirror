@@ -227,4 +227,55 @@ inline void fillAaPlayTriangle(uint32_t* px, int w, int h, float cx, float cy, f
     }
 }
 
+inline void blitPremulArgbBilinear(uint32_t* dst, int dw, int dh,
+                                   const uint32_t* src, int sw, int sh,
+                                   float dstX, float dstY, float dstSize) {
+    if (!dst || !src || dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0 || dstSize <= 0.0f) return;
+    const int ix0 = std::max(0, static_cast<int>(std::floor(dstX)));
+    const int iy0 = std::max(0, static_cast<int>(std::floor(dstY)));
+    const int ix1 = std::min(dw, static_cast<int>(std::ceil(dstX + dstSize)));
+    const int iy1 = std::min(dh, static_cast<int>(std::ceil(dstY + dstSize)));
+    const float invSize = 1.0f / dstSize;
+
+    for (int y = iy0; y < iy1; ++y) {
+        float sy = ((y + 0.5f - dstY) * invSize) * sh - 0.5f;
+        sy = std::clamp(sy, 0.0f, static_cast<float>(sh - 1));
+        int y0 = static_cast<int>(std::floor(sy));
+        int y1 = std::min(sh - 1, y0 + 1);
+        float fy = sy - y0;
+        uint32_t* row = dst + static_cast<size_t>(y) * dw;
+
+        for (int x = ix0; x < ix1; ++x) {
+            float sx = ((x + 0.5f - dstX) * invSize) * sw - 0.5f;
+            sx = std::clamp(sx, 0.0f, static_cast<float>(sw - 1));
+            int x0 = static_cast<int>(std::floor(sx));
+            int x1 = std::min(sw - 1, x0 + 1);
+            float fx = sx - x0;
+
+            uint32_t p00 = src[static_cast<size_t>(y0) * sw + x0];
+            uint32_t p10 = src[static_cast<size_t>(y0) * sw + x1];
+            uint32_t p01 = src[static_cast<size_t>(y1) * sw + x0];
+            uint32_t p11 = src[static_cast<size_t>(y1) * sw + x1];
+
+            float w00 = (1.0f - fx) * (1.0f - fy);
+            float w10 = fx * (1.0f - fy);
+            float w01 = (1.0f - fx) * fy;
+            float w11 = fx * fy;
+
+            auto interp = [&](int shift) -> uint32_t {
+                float v = ((p00 >> shift) & 0xFF) * w00 + ((p10 >> shift) & 0xFF) * w10 +
+                          ((p01 >> shift) & 0xFF) * w01 + ((p11 >> shift) & 0xFF) * w11;
+                return static_cast<uint32_t>(std::clamp(static_cast<int>(std::lround(v)), 0, 255));
+            };
+
+            uint32_t sa = interp(24);
+            if (sa == 0) continue;
+            uint32_t sr = std::min(sa, interp(16));
+            uint32_t sg = std::min(sa, interp(8));
+            uint32_t sb = std::min(sa, interp(0));
+            blendPremul(row[x], sr, sg, sb, sa);
+        }
+    }
+}
+
 } // namespace glass
