@@ -1,7 +1,10 @@
 #include "GuiWindow.h"
 #include "GlassCanvas.h"
 #include "SecProtect.h"
+#include <d2d1.h>
+#include <dwrite.h>
 #include <shellapi.h>
+#include <wincodec.h>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -9,6 +12,219 @@
 #include <cstring>
 #include <cwchar>
 #include <thread>
+
+struct DWriteTextEngine {
+    static constexpr int kRoleCount = 5; // 0=Title, 1=Row, 2=Badge, 3=Body, 4=Small
+
+    HRESULT coHr = E_FAIL;
+    HMODULE hD2D = nullptr;
+    HMODULE hDW = nullptr;
+    ID2D1Factory* d2d = nullptr;
+    IDWriteFactory* dw = nullptr;
+    IWICImagingFactory* wic = nullptr;
+    IWICBitmap* wicBmp = nullptr;
+    ID2D1RenderTarget* rt = nullptr;
+    ID2D1SolidColorBrush* whiteBrush = nullptr;
+    IDWriteInlineObject* ellipsis = nullptr;
+    IDWriteTextFormat* formats[kRoleCount] = {};
+    int targetW = 0;
+    int targetH = 0;
+    bool ready = false;
+    std::wstring displayFamily = L"Segoe UI";
+    std::wstring bodyFamily = L"Segoe UI";
+
+    DWriteTextEngine() = default;
+    ~DWriteTextEngine() { cleanup(); }
+
+    void releaseFormats() {
+        for (int i = 0; i < kRoleCount; ++i) {
+            if (formats[i]) { formats[i]->Release(); formats[i] = nullptr; }
+        }
+        if (ellipsis) { ellipsis->Release(); ellipsis = nullptr; }
+    }
+
+    void dropRenderTarget() {
+        if (whiteBrush) { whiteBrush->Release(); whiteBrush = nullptr; }
+        if (rt) { rt->Release(); rt = nullptr; }
+        if (wicBmp) { wicBmp->Release(); wicBmp = nullptr; }
+        targetW = 0;
+        targetH = 0;
+    }
+
+    void cleanup() {
+        releaseFormats();
+        dropRenderTarget();
+        if (wic) { wic->Release(); wic = nullptr; }
+        if (dw) { dw->Release(); dw = nullptr; }
+        if (d2d) { d2d->Release(); d2d = nullptr; }
+        if (hDW) { FreeLibrary(hDW); hDW = nullptr; }
+        if (hD2D) { FreeLibrary(hD2D); hD2D = nullptr; }
+        if (SUCCEEDED(coHr)) { CoUninitialize(); coHr = E_FAIL; }
+        ready = false;
+    }
+
+    static std::wstring pickFontFamily(IDWriteFontCollection* coll, const wchar_t* const* candidates, size_t count) {
+        if (!coll) return L"Segoe UI";
+        for (size_t i = 0; i < count; ++i) {
+            UINT32 idx = 0;
+            BOOL exists = FALSE;
+            if (SUCCEEDED(coll->FindFamilyName(candidates[i], &idx, &exists)) && exists) {
+                return candidates[i];
+            }
+        }
+        return L"Segoe UI";
+    }
+
+    bool init() {
+        if (ready) return true;
+        if (FAILED(coHr)) {
+            coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        }
+
+        static constexpr GUID kClsidWicFactory = { 0xcacaf262, 0x9370, 0x4615, { 0xa1, 0x3b, 0x9f, 0x55, 0x39, 0xda, 0x4c, 0x0a } };
+        static constexpr GUID kIidWicFactory = { 0xec5ec8a9, 0xc395, 0x4314, { 0x9c, 0x77, 0x54, 0xd7, 0xa9, 0x35, 0xff, 0x70 } };
+        static constexpr GUID kIidD2D1Factory = { 0x06152247, 0x6f50, 0x465a, { 0x92, 0x45, 0x11, 0x8b, 0xfd, 0x3b, 0x60, 0x07 } };
+        static constexpr GUID kIidDWriteFactory = { 0xb859ee5a, 0xd838, 0x4b5b, { 0xa2, 0xe8, 0x1a, 0xdc, 0x7d, 0x93, 0xdb, 0x48 } };
+
+        if (!hD2D) {
+            std::wstring sD2d = WM_OBF_W(L"d2d1.dll");
+            hD2D = LoadLibraryW(sD2d.c_str());
+            wm_sec::wipeWString(sD2d);
+        }
+        if (!hDW) {
+            std::wstring sDw = WM_OBF_W(L"dwrite.dll");
+            hDW = LoadLibraryW(sDw.c_str());
+            wm_sec::wipeWString(sDw);
+        }
+        if (!hD2D || !hDW) return false;
+
+        if (!d2d) {
+            using PfnD2DCreate = HRESULT(WINAPI*)(D2D1_FACTORY_TYPE, REFIID, const D2D1_FACTORY_OPTIONS*, void**);
+            std::string fnName = WM_OBF("D2D1CreateFactory");
+            auto pD2D = reinterpret_cast<PfnD2DCreate>(GetProcAddress(hD2D, fnName.c_str()));
+            wm_sec::wipeString(fnName);
+            if (!pD2D || FAILED(pD2D(D2D1_FACTORY_TYPE_SINGLE_THREADED, kIidD2D1Factory, nullptr, reinterpret_cast<void**>(&d2d)))) {
+                return false;
+            }
+        }
+        if (!dw) {
+            using PfnDwCreate = HRESULT(WINAPI*)(DWRITE_FACTORY_TYPE, REFIID, IUnknown**);
+            std::string fnName = WM_OBF("DWriteCreateFactory");
+            auto pDW = reinterpret_cast<PfnDwCreate>(GetProcAddress(hDW, fnName.c_str()));
+            wm_sec::wipeString(fnName);
+            if (!pDW || FAILED(pDW(DWRITE_FACTORY_TYPE_SHARED, kIidDWriteFactory, reinterpret_cast<IUnknown**>(&dw)))) {
+                return false;
+            }
+        }
+        if (!wic) {
+            if (FAILED(CoCreateInstance(kClsidWicFactory, nullptr, CLSCTX_INPROC_SERVER, kIidWicFactory, reinterpret_cast<void**>(&wic))) || !wic) {
+                return false;
+            }
+        }
+
+        IDWriteFontCollection* coll = nullptr;
+        if (SUCCEEDED(dw->GetSystemFontCollection(&coll, FALSE)) && coll) {
+            const wchar_t* dispCands[] = { L"Google Sans", L"Inter", L"Segoe UI Variable Display", L"Segoe UI Variable Text", L"Roboto", L"Segoe UI" };
+            const wchar_t* bodyCands[] = { L"Google Sans", L"Inter", L"Segoe UI Variable Text", L"Roboto", L"Segoe UI" };
+            displayFamily = pickFontFamily(coll, dispCands, ARRAYSIZE(dispCands));
+            bodyFamily = pickFontFamily(coll, bodyCands, ARRAYSIZE(bodyCands));
+            coll->Release();
+        }
+        ready = true;
+        return true;
+    }
+
+    bool rebuildForDpi(UINT dpi) {
+        if (!init()) return false;
+        releaseFormats();
+        const float scale = static_cast<float>(dpi) / 96.0f;
+        struct Spec { const wchar_t* fam; DWRITE_FONT_WEIGHT wt; float px; };
+        const Spec specs[kRoleCount] = {
+            { displayFamily.c_str(), DWRITE_FONT_WEIGHT_SEMI_BOLD, 15.5f * scale }, // Title
+            { bodyFamily.c_str(),    DWRITE_FONT_WEIGHT_MEDIUM,    13.5f * scale }, // Row
+            { bodyFamily.c_str(),    DWRITE_FONT_WEIGHT_MEDIUM,    11.0f * scale }, // Badge
+            { bodyFamily.c_str(),    DWRITE_FONT_WEIGHT_MEDIUM,    12.5f * scale }, // Body
+            { bodyFamily.c_str(),    DWRITE_FONT_WEIGHT_NORMAL,    11.5f * scale }  // Small
+        };
+        for (int i = 0; i < kRoleCount; ++i) {
+            if (FAILED(dw->CreateTextFormat(specs[i].fam, nullptr, specs[i].wt,
+                                            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                                            specs[i].px, L"en-US", &formats[i]))) {
+                return false;
+            }
+            formats[i]->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        }
+        dw->CreateEllipsisTrimmingSign(formats[1], &ellipsis);
+        return true;
+    }
+
+    bool ensureTargetSize(int w, int h) {
+        if (rt && whiteBrush && wicBmp && w <= targetW && h <= targetH) return true;
+        dropRenderTarget();
+        int allocW = std::max(w, 512);
+        int allocH = std::max(h, 96);
+        static constexpr GUID kPixFmt32Pbgra = { 0x6fddc324, 0x4e03, 0x4bfe, { 0xb1, 0x85, 0x3d, 0x77, 0x76, 0x8d, 0xc9, 0x10 } };
+        if (FAILED(wic->CreateBitmap(static_cast<UINT>(allocW), static_cast<UINT>(allocH),
+                                     kPixFmt32Pbgra, WICBitmapCacheOnLoad, &wicBmp)) || !wicBmp) {
+            return false;
+        }
+        D2D1_RENDER_TARGET_PROPERTIES props = {};
+        props.type = D2D1_RENDER_TARGET_TYPE_SOFTWARE;
+        props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+        props.dpiX = 96.0f;
+        props.dpiY = 96.0f;
+        if (FAILED(d2d->CreateWicBitmapRenderTarget(wicBmp, &props, &rt)) || !rt) {
+            dropRenderTarget();
+            return false;
+        }
+        rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        D2D1_COLOR_F whiteCol = { 1.0f, 1.0f, 1.0f, 1.0f };
+        if (FAILED(rt->CreateSolidColorBrush(&whiteCol, nullptr, &whiteBrush)) || !whiteBrush) {
+            dropRenderTarget();
+            return false;
+        }
+        targetW = allocW;
+        targetH = allocH;
+        return true;
+    }
+
+    bool renderText(const std::wstring& txt, int roleIdx, UINT fmt, int boxW, int boxH,
+                    uint32_t* outPbgra, int outStridePixels) {
+        if (!ready || roleIdx < 0 || roleIdx >= kRoleCount || !formats[roleIdx] || !outPbgra) return false;
+        if (!ensureTargetSize(boxW, boxH)) return false;
+
+        IDWriteTextLayout* layout = nullptr;
+        if (FAILED(dw->CreateTextLayout(txt.c_str(), static_cast<UINT32>(txt.size()), formats[roleIdx],
+                                        static_cast<float>(boxW), static_cast<float>(boxH), &layout)) || !layout) {
+            return false;
+        }
+        layout->SetTextAlignment((fmt & DT_CENTER) ? DWRITE_TEXT_ALIGNMENT_CENTER
+                                                   : ((fmt & DT_RIGHT) ? DWRITE_TEXT_ALIGNMENT_TRAILING : DWRITE_TEXT_ALIGNMENT_LEADING));
+        layout->SetParagraphAlignment((fmt & DT_VCENTER) ? DWRITE_PARAGRAPH_ALIGNMENT_CENTER : DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        layout->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        if ((fmt & DT_END_ELLIPSIS) && ellipsis) {
+            DWRITE_TRIMMING trim = { DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
+            layout->SetTrimming(&trim, ellipsis);
+        }
+
+        rt->BeginDraw();
+        D2D1_COLOR_F zeroCol = { 0.0f, 0.0f, 0.0f, 0.0f };
+        rt->Clear(&zeroCol);
+        rt->DrawTextLayout(D2D1_POINT_2F{0.0f, 0.0f}, layout, whiteBrush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        HRESULT hrEnd = rt->EndDraw();
+        layout->Release();
+        if (FAILED(hrEnd)) {
+            dropRenderTarget();
+            return false;
+        }
+
+        WICRect wr = { 0, 0, boxW, boxH };
+        UINT strideBytes = static_cast<UINT>(outStridePixels * 4);
+        UINT bufBytes = static_cast<UINT>(boxH) * strideBytes;
+        return SUCCEEDED(wicBmp->CopyPixels(&wr, strideBytes, bufBytes, reinterpret_cast<BYTE*>(outPbgra)));
+    }
+};
 
 namespace {
 
@@ -30,10 +246,10 @@ constexpr int ID_TRAY_COPY_IP = 2002;
 constexpr int ID_TRAY_UPDATE  = 2003;
 constexpr int ID_TRAY_QUIT    = 2005;
 
-constexpr int BASE_W = 368;
-constexpr int BASE_H = 296;
-constexpr int SPLASH_W = 304;
-constexpr int SPLASH_H = 84;
+constexpr int BASE_W = 412;
+constexpr int BASE_H = 330;
+constexpr int SPLASH_W = 328;
+constexpr int SPLASH_H = 92;
 constexpr size_t MAX_VISIBLE_ROWS = 2;
 
 int sc(int px, UINT dpi) {
@@ -132,7 +348,7 @@ bool enableGlassBackdrop(HWND hwnd) {
         wm_sec::wipeWString(u32);
         wm_sec::wipeString(sCompAttr);
         if (pSetComp) {
-            AccentPolicy acc = { 4 /* ACCENT_ENABLE_ACRYLICBLURBEHIND */, 2, 0x55221614u, 0 };
+            AccentPolicy acc = { 4 /* ACCENT_ENABLE_ACRYLICBLURBEHIND */, 2, 0xDF0A0A0Du, 0 };
             WinCompAttr data = { 19 /* WCA_ACCENT_POLICY */, &acc, sizeof(acc) };
             if (!pSetComp(hwnd, &data)) {
                 acc.state = 3; // ACCENT_ENABLE_BLURBEHIND
@@ -151,27 +367,27 @@ struct HitRectItem {
 
 RECT receiverRowRect(int idx, UINT dpi) {
     return {
-        sc(22, dpi),
-        sc(63 + idx * 62, dpi),
-        sc(346, dpi),
-        sc(119 + idx * 62, dpi)
+        sc(24, dpi),
+        sc(69 + idx * 70, dpi),
+        sc(388, dpi),
+        sc(131 + idx * 70, dpi)
     };
 }
 
 std::vector<HitRectItem> buildControlRects(UINT dpi) {
     return {
-        { ID_BTN_MINIMIZE, { sc(302, dpi), sc(15,  dpi), sc(324, dpi), sc(37,  dpi) } },
-        { ID_BTN_CLOSE,    { sc(330, dpi), sc(15,  dpi), sc(352, dpi), sc(37,  dpi) } },
-        { ID_IP_BOX,       { sc(14,  dpi), sc(200, dpi), sc(206, dpi), sc(232, dpi) } },
-        { ID_BTN_CONNECT,  { sc(212, dpi), sc(200, dpi), sc(292, dpi), sc(232, dpi) } },
-        { ID_BTN_SCAN,     { sc(298, dpi), sc(200, dpi), sc(354, dpi), sc(232, dpi) } }
+        { ID_BTN_MINIMIZE, { sc(344, dpi), sc(16,  dpi), sc(368, dpi), sc(40,  dpi) } },
+        { ID_BTN_CLOSE,    { sc(374, dpi), sc(16,  dpi), sc(398, dpi), sc(40,  dpi) } },
+        { ID_IP_BOX,       { sc(16,  dpi), sc(222, dpi), sc(222, dpi), sc(258, dpi) } },
+        { ID_BTN_CONNECT,  { sc(230, dpi), sc(222, dpi), sc(320, dpi), sc(258, dpi) } },
+        { ID_BTN_SCAN,     { sc(328, dpi), sc(222, dpi), sc(396, dpi), sc(258, dpi) } }
     };
 }
 
 void drawMirroringGlyph(uint32_t* px, int w, int h, float x, float y, UINT dpi) {
     float s = scf(1.0f, dpi);
-    glass::strokeRoundRect(px, w, h, x, y, x + 15 * s, y + 10.5f * s, 2.5f * s, 1.7f * s, {78, 138, 255, 240});
-    glass::strokeRoundRect(px, w, h, x + 6 * s, y + 5 * s, x + 21 * s, y + 16 * s, 2.5f * s, 1.7f * s, {146, 114, 255, 245});
+    glass::strokeRoundRect(px, w, h, x, y, x + 15 * s, y + 10.5f * s, 2.5f * s, 1.7f * s, {239, 68, 68, 250});
+    glass::strokeRoundRect(px, w, h, x + 6 * s, y + 5 * s, x + 21 * s, y + 16 * s, 2.5f * s, 1.7f * s, {255, 255, 255, 248});
 }
 
 void drawLaptopGlyph(uint32_t* px, int w, int h, float x, float y, UINT dpi, GlassColor col) {
@@ -258,7 +474,7 @@ HICON createAppBadgeIcon() {
                 px[y * sz + x] = 0x00000000;
                 continue;
             }
-            uint32_t col = (y < 16) ? 0xFF3B82F6 : 0xFF7C3AED;
+            uint32_t col = (y < 16) ? 0xFFDC2626u : 0xFF141418u;
             if ((x >= 6 && x <= 19 && y >= 7 && y <= 17 && (x == 6 || x == 19 || y == 7 || y == 17)) ||
                 (x >= 12 && x <= 25 && y >= 13 && y <= 23 && (x == 12 || x == 25 || y == 13 || y == 23))) {
                 col = 0xFFFFFFFF;
@@ -285,6 +501,7 @@ HFONT makeUiFont(int pt, UINT dpi, int weight) {
 
 void drawTextToCanvas(uint32_t* canvasPx, int cw, int ch,
                       HDC scratchDc, uint32_t* scratchPx, int sw, int sh,
+                      DWriteTextEngine* dwEngine, int roleIdx,
                       const RECT& r, HFONT font, GlassColor col, const std::wstring& txt, UINT fmt) {
     if (!canvasPx || !scratchPx || txt.empty()) return;
     int bw = std::max(1, static_cast<int>(r.right - r.left));
@@ -292,16 +509,18 @@ void drawTextToCanvas(uint32_t* canvasPx, int cw, int ch,
     int boxW = std::min(bw, sw);
     int boxH = std::min(bh, sh);
 
-    for (int y = 0; y < boxH; ++y) {
-        std::memset(scratchPx + static_cast<size_t>(y) * sw, 0, static_cast<size_t>(boxW) * 4);
+    bool usedDWrite = (dwEngine && dwEngine->renderText(txt, roleIdx, fmt, boxW, boxH, scratchPx, sw));
+    if (!usedDWrite) {
+        for (int y = 0; y < boxH; ++y) {
+            std::memset(scratchPx + static_cast<size_t>(y) * sw, 0, static_cast<size_t>(boxW) * 4);
+        }
+        SetBkMode(scratchDc, TRANSPARENT);
+        SetTextColor(scratchDc, RGB(255, 255, 255));
+        HGDIOBJ oldF = SelectObject(scratchDc, font);
+        RECT localRc = { 0, 0, boxW, boxH };
+        DrawTextW(scratchDc, txt.c_str(), -1, &localRc, fmt);
+        SelectObject(scratchDc, oldF);
     }
-
-    SetBkMode(scratchDc, TRANSPARENT);
-    SetTextColor(scratchDc, RGB(255, 255, 255));
-    HGDIOBJ oldF = SelectObject(scratchDc, font);
-    RECT localRc = { 0, 0, boxW, boxH };
-    DrawTextW(scratchDc, txt.c_str(), -1, &localRc, fmt);
-    SelectObject(scratchDc, oldF);
 
     int dstX0 = std::max<int>(0, r.left);
     int dstY0 = std::max<int>(0, r.top);
@@ -313,11 +532,16 @@ void drawTextToCanvas(uint32_t* canvasPx, int cw, int ch,
         uint32_t* dRow = canvasPx + static_cast<size_t>(dy) * cw;
         for (int dx = dstX0; dx < dstX1; ++dx) {
             uint32_t sp = sRow[dx - r.left];
-            if ((sp & 0x00FFFFFFu) == 0) continue;
-            uint32_t sr = (sp >> 16) & 0xFF;
-            uint32_t sg = (sp >> 8) & 0xFF;
-            uint32_t sb = sp & 0xFF;
-            uint32_t cov = (sr + sg * 2 + sb) >> 2;
+            uint32_t cov = 0;
+            if (usedDWrite) {
+                cov = (sp >> 24) & 0xFF;
+            } else {
+                if ((sp & 0x00FFFFFFu) == 0) continue;
+                uint32_t sr = (sp >> 16) & 0xFF;
+                uint32_t sg = (sp >> 8) & 0xFF;
+                uint32_t sb = sp & 0xFF;
+                cov = (sr + sg * 2 + sb) >> 2;
+            }
             if (cov > 0) {
                 glass::blendStraight(dRow[dx], col, static_cast<float>(cov) / 255.0f);
             }
@@ -334,6 +558,7 @@ struct SplashState {
     HICON icon = nullptr;
     HFONT fTitle = nullptr;
     HFONT fSub = nullptr;
+    DWriteTextEngine dwText;
     HDC canvasDc = nullptr;
     HBITMAP canvasBmp = nullptr;
     HGDIOBJ canvasOld = nullptr;
@@ -446,31 +671,34 @@ LRESULT CALLBACK splashWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
                 statusCopy = st->statusText;
             }
 
-            glass::fillCanvasGlass(st->canvasPx, w, h, st->glass ? 106 : 255);
-            glass::strokeRoundRect(st->canvasPx, w, h, 0.5f, 0.5f, w - 0.5f, h - 0.5f, scf(8, st->dpi), 1.0f, {180, 198, 255, 52});
-            drawMirroringGlyph(st->canvasPx, w, h, scf(16, st->dpi), scf(18, st->dpi), st->dpi);
+            glass::fillCanvasGlass(st->canvasPx, w, h, st->glass ? 232 : 255);
+            glass::strokeRoundRect(st->canvasPx, w, h, 0.5f, 0.5f, w - 0.5f, h - 0.5f, scf(10, st->dpi), 1.0f, {255, 255, 255, 36});
+            drawMirroringGlyph(st->canvasPx, w, h, scf(16, st->dpi), scf(20, st->dpi), st->dpi);
             drawTextToCanvas(st->canvasPx, w, h, st->scratchDc, st->scratchPx, st->sw, st->sh,
-                             { sc(46, st->dpi), sc(14, st->dpi), sc(165, st->dpi), sc(34, st->dpi) },
-                             st->fTitle, {246, 248, 255, 255}, L"WinMirror",
+                             &st->dwText, 0,
+                             { sc(46, st->dpi), sc(14, st->dpi), sc(170, st->dpi), sc(36, st->dpi) },
+                             st->fTitle, {255, 255, 255, 255}, L"WinMirror",
                              DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             drawTextToCanvas(st->canvasPx, w, h, st->scratchDc, st->scratchPx, st->sw, st->sh,
-                             { sc(165, st->dpi), sc(14, st->dpi), sc(290, st->dpi), sc(34, st->dpi) },
-                             st->fSub, {158, 174, 212, 220}, L"karnajitop \u2022 v" L"" WINMIRROR_VERSION,
+                             &st->dwText, 4,
+                             { sc(170, st->dpi), sc(14, st->dpi), sc(312, st->dpi), sc(36, st->dpi) },
+                             st->fSub, {161, 161, 170, 240}, L"karnajitop  \u2022  v" L"" WINMIRROR_VERSION,
                              DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
             drawTextToCanvas(st->canvasPx, w, h, st->scratchDc, st->scratchPx, st->sw, st->sh,
-                             { sc(46, st->dpi), sc(35, st->dpi), sc(290, st->dpi), sc(54, st->dpi) },
-                             st->fSub, {178, 192, 226, 240}, utf8ToWide(statusCopy),
+                             &st->dwText, 4,
+                             { sc(46, st->dpi), sc(38, st->dpi), sc(312, st->dpi), sc(58, st->dpi) },
+                             st->fSub, {212, 212, 216, 245}, utf8ToWide(statusCopy),
                              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
             float tx0 = scf(16, st->dpi), tx1 = static_cast<float>(w) - scf(16, st->dpi);
-            float ty0 = scf(66, st->dpi), ty1 = scf(70, st->dpi);
+            float ty0 = scf(72, st->dpi), ty1 = scf(76, st->dpi);
             glass::fillRoundRectGrad(st->canvasPx, w, h, tx0, ty0, tx1, ty1, scf(2, st->dpi),
-                                     {50, 58, 86, 130}, {42, 50, 76, 130}, {0, 0, 0, 0}, 0.0f);
+                                     {36, 36, 44, 210}, {28, 28, 36, 210}, {0, 0, 0, 0}, 0.0f);
             float span = tx1 - tx0;
             float barW = span * 0.34f;
             float bx0 = tx0 + st->animPhase * (span - barW);
             glass::fillRoundRectGrad(st->canvasPx, w, h, bx0, ty0, bx0 + barW, ty1, scf(2, st->dpi),
-                                     {68, 146, 255, 245}, {146, 102, 255, 245}, {0, 0, 0, 0}, 0.0f);
+                                     {239, 68, 68, 255}, {255, 92, 92, 255}, {0, 0, 0, 0}, 0.0f);
 
             BitBlt(screenDc, 0, 0, w, h, st->canvasDc, 0, 0, SRCCOPY);
             EndPaint(hwnd, &ps);
@@ -527,8 +755,9 @@ void WinMirrorGui::runPreLaunchUpdater(std::function<void(std::function<void(con
     }
 
     st.dpi = queryWindowDpi(hSplash);
-    st.fTitle = makeUiFont(10, st.dpi, FW_SEMIBOLD);
-    st.fSub = makeUiFont(8, st.dpi, FW_NORMAL);
+    st.fTitle = makeUiFont(11, st.dpi, FW_SEMIBOLD);
+    st.fSub = makeUiFont(9, st.dpi, FW_NORMAL);
+    st.dwText.rebuildForDpi(st.dpi);
     st.glass = enableGlassBackdrop(hSplash);
 
     int w = sc(SPLASH_W, st.dpi);
@@ -588,6 +817,8 @@ WinMirrorGui::WinMirrorGui() = default;
 WinMirrorGui::~WinMirrorGui() {
     removeTrayIcon();
     releaseBitmaps();
+    delete m_dwText;
+    m_dwText = nullptr;
     if (m_appIcon) { DestroyIcon(m_appIcon); m_appIcon = nullptr; }
     if (m_fontTitle) { DeleteObject(m_fontTitle); m_fontTitle = nullptr; }
     if (m_fontRow) { DeleteObject(m_fontRow); m_fontRow = nullptr; }
@@ -675,9 +906,14 @@ void WinMirrorGui::ensureTextScratch(HDC refDc, int w, int h) {
 }
 
 void WinMirrorGui::drawTextGlass(const RECT& r, HFONT font, GlassColor col, const std::wstring& txt, UINT fmt) {
+    int roleIdx = 4; // Small
+    if (font == m_fontTitle) roleIdx = 0;
+    else if (font == m_fontRow) roleIdx = 1;
+    else if (font == m_fontLabel) roleIdx = 2;
+    else if (font == m_fontBody) roleIdx = 3;
     drawTextToCanvas(m_canvasPx, m_canvasW, m_canvasH,
                      m_scratchDc, m_scratchPx, m_scratchW, m_scratchH,
-                     r, font, col, txt, fmt);
+                     m_dwText, roleIdx, r, font, col, txt, fmt);
 }
 
 void WinMirrorGui::setActions(std::function<void()> onQuit,
@@ -701,9 +937,12 @@ void WinMirrorGui::rebuildFonts() {
 
     m_fontTitle = makeUiFont(11, m_dpi, FW_SEMIBOLD);
     m_fontRow   = makeUiFont(10, m_dpi, FW_SEMIBOLD);
-    m_fontLabel = makeUiFont(7,  m_dpi, FW_SEMIBOLD);
-    m_fontBody  = makeUiFont(8,  m_dpi, FW_NORMAL);
-    m_fontSmall = makeUiFont(8,  m_dpi, FW_NORMAL);
+    m_fontLabel = makeUiFont(8,  m_dpi, FW_SEMIBOLD);
+    m_fontBody  = makeUiFont(9,  m_dpi, FW_NORMAL);
+    m_fontSmall = makeUiFont(9,  m_dpi, FW_NORMAL);
+
+    if (!m_dwText) m_dwText = new DWriteTextEngine();
+    m_dwText->rebuildForDpi(m_dpi);
 }
 
 bool WinMirrorGui::createAndShow() {
@@ -967,38 +1206,38 @@ void WinMirrorGui::paintWindow(HWND hwnd) {
     size_t bgPixels = static_cast<size_t>(cw) * static_cast<size_t>(ch);
     if (m_baseBgW != cw || m_baseBgH != ch || m_baseBgGlass != m_glassBlurActive || m_baseBg.size() != bgPixels) {
         m_baseBg.resize(bgPixels);
-        glass::fillCanvasGlass(m_baseBg.data(), cw, ch, m_glassBlurActive ? 102 : 255);
+        // High-opacity pitch obsidian prevents underlying caption chrome from bleeding through
+        glass::fillCanvasGlass(m_baseBg.data(), cw, ch, m_glassBlurActive ? 232 : 255);
         glass::strokeRoundRect(m_baseBg.data(), cw, ch, 0.5f, 0.5f, cw - 0.5f, ch - 0.5f,
-                               scf(8, m_dpi), 1.0f, {178, 196, 255, 48});
+                               scf(10, m_dpi), 1.0f, {255, 255, 255, 34});
         m_baseBgW = cw;
         m_baseBgH = ch;
         m_baseBgGlass = m_glassBlurActive;
     }
     std::memcpy(m_canvasPx, m_baseBg.data(), bgPixels * sizeof(uint32_t));
 
-    const GlassColor cWhite = {246, 248, 255, 255};
-    const GlassColor cMuted = {166, 178, 208, 230};
-    const GlassColor cCyan  = {88, 212, 255, 255};
-    const GlassColor cGreen = {64, 224, 158, 255};
-    const GlassColor cAmber = {252, 200, 72, 255};
+    const GlassColor cWhite = {255, 255, 255, 255};
+    const GlassColor cSilver = {212, 212, 216, 250};
+    const GlassColor cMuted = {161, 161, 170, 238};
+    const GlassColor cRed   = {239, 68, 68, 255};
 
-    // Header: Glowing Mirroring Icon + Title + Compact Live Pill + Window Chrome
-    drawMirroringGlyph(m_canvasPx, cw, ch, scf(16, m_dpi), scf(17, m_dpi), m_dpi);
-    drawTextGlass({ sc(45, m_dpi), sc(11, m_dpi), sc(218, m_dpi), sc(31, m_dpi) },
+    // Header: Red & White Mirroring Icon + Google-style Crisp Typography + Status Pill + Chrome
+    drawMirroringGlyph(m_canvasPx, cw, ch, scf(16, m_dpi), scf(19, m_dpi), m_dpi);
+    drawTextGlass({ sc(46, m_dpi), sc(12, m_dpi), sc(244, m_dpi), sc(33, m_dpi) },
                   m_fontTitle, cWhite, L"Screen Mirroring",
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-    drawTextGlass({ sc(45, m_dpi), sc(29, m_dpi), sc(218, m_dpi), sc(44, m_dpi) },
-                  m_fontLabel, cMuted, L"AirPlay \u2022 by karnajitop",
+    drawTextGlass({ sc(46, m_dpi), sc(32, m_dpi), sc(244, m_dpi), sc(49, m_dpi) },
+                  m_fontSmall, cMuted, L"AirPlay  \u2022  by karnajitop",
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
     glass::fillRoundRectGrad(m_canvasPx, cw, ch,
-                             scf(222, m_dpi), scf(15, m_dpi), scf(295, m_dpi), scf(37, m_dpi),
-                             scf(11, m_dpi),
-                             snap.clients > 0 ? GlassColor{24, 68, 56, 170} : GlassColor{34, 40, 62, 150},
-                             snap.clients > 0 ? GlassColor{18, 52, 46, 170} : GlassColor{26, 32, 52, 150},
-                             snap.clients > 0 ? GlassColor{68, 210, 150, 190} : GlassColor{150, 168, 220, 95}, 1.0f);
-    glass::fillAaCircle(m_canvasPx, cw, ch, scf(233, m_dpi), scf(26, m_dpi), scf(3.3f, m_dpi),
-                        snap.clients > 0 ? cGreen : (snap.streamingReady ? cCyan : cAmber));
+                             scf(248, m_dpi), scf(16, m_dpi), scf(336, m_dpi), scf(40, m_dpi),
+                             scf(12, m_dpi),
+                             snap.clients > 0 ? GlassColor{58, 12, 18, 236} : GlassColor{24, 24, 30, 224},
+                             snap.clients > 0 ? GlassColor{38, 9, 14, 236} : GlassColor{18, 18, 24, 224},
+                             snap.clients > 0 ? GlassColor{239, 68, 68, 215} : GlassColor{255, 255, 255, 42}, 1.0f);
+    glass::fillAaCircle(m_canvasPx, cw, ch, scf(260, m_dpi), scf(28, m_dpi), scf(3.4f, m_dpi),
+                        snap.clients > 0 ? cRed : (snap.streamingReady ? cWhite : cMuted));
     wchar_t pillTxt[32] = {};
     if (snap.clients > 0) {
         std::swprintf(pillTxt, ARRAYSIZE(pillTxt), L"Live \u2022 %.0f", snap.actualFps);
@@ -1007,7 +1246,7 @@ void WinMirrorGui::paintWindow(HWND hwnd) {
     } else {
         std::swprintf(pillTxt, ARRAYSIZE(pillTxt), L"Init...");
     }
-    drawTextGlass({ sc(241, m_dpi), sc(15, m_dpi), sc(291, m_dpi), sc(37, m_dpi) },
+    drawTextGlass({ sc(269, m_dpi), sc(16, m_dpi), sc(332, m_dpi), sc(40, m_dpi) },
                   m_fontLabel, cWhite, pillTxt, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     const auto ctrls = buildControlRects(m_dpi);
@@ -1016,22 +1255,22 @@ void WinMirrorGui::paintWindow(HWND hwnd) {
         return {};
     };
 
-    // Custom Minimal Chrome Buttons (- and X)
+    // Custom Minimal Black/Red/White Chrome Buttons (- and X)
     RECT rcMin = rectOf(ID_BTN_MINIMIZE);
     bool minHv = (m_hoverBtnId == ID_BTN_MINIMIZE);
     glass::fillRoundRectGrad(m_canvasPx, cw, ch,
                              static_cast<float>(rcMin.left), static_cast<float>(rcMin.top),
                              static_cast<float>(rcMin.right), static_cast<float>(rcMin.bottom),
                              scf(7, m_dpi),
-                             minHv ? GlassColor{72, 80, 114, 175} : GlassColor{38, 44, 68, 120},
-                             minHv ? GlassColor{58, 66, 98, 175} : GlassColor{30, 36, 58, 120},
-                             {156, 174, 224, minHv ? uint8_t(150) : uint8_t(72)}, 1.0f);
+                             minHv ? GlassColor{42, 42, 50, 235} : GlassColor{24, 24, 30, 220},
+                             minHv ? GlassColor{34, 34, 42, 235} : GlassColor{18, 18, 24, 220},
+                             minHv ? GlassColor{255, 255, 255, 78} : GlassColor{255, 255, 255, 36}, 1.0f);
     glass::drawAaSegment(m_canvasPx, cw, ch,
                          static_cast<float>(rcMin.left + sc(7, m_dpi)),
                          static_cast<float>((rcMin.top + rcMin.bottom) / 2),
                          static_cast<float>(rcMin.right - sc(7, m_dpi)),
                          static_cast<float>((rcMin.top + rcMin.bottom) / 2),
-                         scf(1.4f, m_dpi), cWhite);
+                         scf(1.5f, m_dpi), cWhite);
 
     RECT rcClose = rectOf(ID_BTN_CLOSE);
     bool closeHv = (m_hoverBtnId == ID_BTN_CLOSE);
@@ -1039,35 +1278,35 @@ void WinMirrorGui::paintWindow(HWND hwnd) {
                              static_cast<float>(rcClose.left), static_cast<float>(rcClose.top),
                              static_cast<float>(rcClose.right), static_cast<float>(rcClose.bottom),
                              scf(7, m_dpi),
-                             closeHv ? GlassColor{216, 62, 74, 215} : GlassColor{38, 44, 68, 120},
-                             closeHv ? GlassColor{184, 48, 60, 215} : GlassColor{30, 36, 58, 120},
-                             closeHv ? GlassColor{255, 136, 146, 200} : GlassColor{156, 174, 224, 72}, 1.0f);
+                             closeHv ? GlassColor{220, 38, 38, 248} : GlassColor{24, 24, 30, 220},
+                             closeHv ? GlassColor{185, 28, 28, 248} : GlassColor{18, 18, 24, 220},
+                             closeHv ? GlassColor{252, 165, 165, 210} : GlassColor{255, 255, 255, 36}, 1.0f);
     glass::drawAaSegment(m_canvasPx, cw, ch,
-                         static_cast<float>(rcClose.left + sc(7, m_dpi)),
-                         static_cast<float>(rcClose.top + sc(7, m_dpi)),
-                         static_cast<float>(rcClose.right - sc(7, m_dpi)),
-                         static_cast<float>(rcClose.bottom - sc(7, m_dpi)),
-                         scf(1.4f, m_dpi), cWhite);
+                         static_cast<float>(rcClose.left + scf(7.5f, m_dpi)),
+                         static_cast<float>(rcClose.top + scf(7.5f, m_dpi)),
+                         static_cast<float>(rcClose.right - scf(7.5f, m_dpi)),
+                         static_cast<float>(rcClose.bottom - scf(7.5f, m_dpi)),
+                         scf(1.5f, m_dpi), cWhite);
     glass::drawAaSegment(m_canvasPx, cw, ch,
-                         static_cast<float>(rcClose.right - sc(7, m_dpi)),
-                         static_cast<float>(rcClose.top + sc(7, m_dpi)),
-                         static_cast<float>(rcClose.left + sc(7, m_dpi)),
-                         static_cast<float>(rcClose.bottom - sc(7, m_dpi)),
-                         scf(1.4f, m_dpi), cWhite);
+                         static_cast<float>(rcClose.right - scf(7.5f, m_dpi)),
+                         static_cast<float>(rcClose.top + scf(7.5f, m_dpi)),
+                         static_cast<float>(rcClose.left + scf(7.5f, m_dpi)),
+                         static_cast<float>(rcClose.bottom - scf(7.5f, m_dpi)),
+                         scf(1.5f, m_dpi), cWhite);
 
-    // Compact Frosted Receiver Card Container
+    // Compact Obsidian Receiver Card Container
     glass::fillRoundRectGrad(m_canvasPx, cw, ch,
-                             scf(14, m_dpi), scf(54, m_dpi), scf(354, m_dpi), scf(190, m_dpi),
+                             scf(16, m_dpi), scf(60, m_dpi), scf(396, m_dpi), scf(210, m_dpi),
                              scf(14, m_dpi),
-                             {34, 38, 60, 124}, {22, 26, 44, 136},
-                             {170, 188, 232, 92}, 1.0f);
+                             {15, 15, 19, 232}, {11, 11, 15, 232},
+                             {255, 255, 255, 32}, 1.0f);
 
     if (snap.receivers.empty()) {
-        drawLaptopGlyph(m_canvasPx, cw, ch, scf(172, m_dpi), scf(88, m_dpi), m_dpi, cMuted);
-        drawTextGlass({ sc(24, m_dpi), sc(112, m_dpi), sc(344, m_dpi), sc(134, m_dpi) },
+        drawLaptopGlyph(m_canvasPx, cw, ch, scf(194, m_dpi), scf(96, m_dpi), m_dpi, cSilver);
+        drawTextGlass({ sc(28, m_dpi), sc(122, m_dpi), sc(384, m_dpi), sc(146, m_dpi) },
                       m_fontRow, cWhite, L"Looking for AirPlay devices...",
                       DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        drawTextGlass({ sc(24, m_dpi), sc(134, m_dpi), sc(344, m_dpi), sc(154, m_dpi) },
+        drawTextGlass({ sc(28, m_dpi), sc(146, m_dpi), sc(384, m_dpi), sc(168, m_dpi) },
                       m_fontSmall, cMuted, L"Open OBS on Mac or enter IP below",
                       DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     } else {
@@ -1083,33 +1322,33 @@ void WinMirrorGui::paintWindow(HWND hwnd) {
                     static_cast<float>(row.left), static_cast<float>(row.top),
                     static_cast<float>(row.right), static_cast<float>(row.bottom),
                     scf(11, m_dpi),
-                    hovered ? GlassColor{96, 94, 212, 188} : GlassColor{84, 82, 196, 178},
-                    hovered ? GlassColor{62, 84, 176, 182} : GlassColor{52, 72, 152, 172},
-                    {136, 174, 255, 220}, 1.15f);
+                    hovered ? GlassColor{62, 14, 20, 245} : GlassColor{48, 11, 16, 242},
+                    hovered ? GlassColor{40, 10, 15, 245} : GlassColor{30, 8, 12, 242},
+                    {239, 68, 68, 225}, 1.25f);
             } else {
                 glass::fillRoundRectGrad(
                     m_canvasPx, cw, ch,
                     static_cast<float>(row.left), static_cast<float>(row.top),
                     static_cast<float>(row.right), static_cast<float>(row.bottom),
                     scf(11, m_dpi),
-                    hovered ? GlassColor{68, 76, 112, 160} : GlassColor{38, 44, 70, 98},
-                    hovered ? GlassColor{52, 60, 96, 160} : GlassColor{28, 34, 58, 98},
-                    hovered ? GlassColor{156, 176, 232, 160} : GlassColor{132, 148, 192, 64}, 1.0f);
+                    hovered ? GlassColor{34, 24, 28, 236} : GlassColor{22, 22, 28, 228},
+                    hovered ? GlassColor{26, 18, 22, 236} : GlassColor{18, 18, 24, 228},
+                    hovered ? GlassColor{239, 68, 68, 170} : GlassColor{255, 255, 255, 26}, 1.0f);
             }
 
-            GlassColor iconCol = dev.isConnected ? cCyan : (dev.isDirectObs ? cWhite : cMuted);
+            GlassColor iconCol = dev.isConnected ? cRed : (dev.isDirectObs ? cWhite : cSilver);
             if (dev.isLaptop) {
                 drawLaptopGlyph(m_canvasPx, cw, ch,
-                                static_cast<float>(row.left + sc(13, m_dpi)),
-                                static_cast<float>(row.top + sc(19, m_dpi)), m_dpi, iconCol);
+                                static_cast<float>(row.left + sc(14, m_dpi)),
+                                static_cast<float>(row.top + sc(22, m_dpi)), m_dpi, iconCol);
             } else {
                 drawTvGlyph(m_canvasPx, cw, ch,
-                            static_cast<float>(row.left + sc(13, m_dpi)),
-                            static_cast<float>(row.top + sc(19, m_dpi)), m_dpi, iconCol);
+                            static_cast<float>(row.left + sc(14, m_dpi)),
+                            static_cast<float>(row.top + sc(22, m_dpi)), m_dpi, iconCol);
             }
 
-            drawTextGlass({ row.left + sc(46, m_dpi), row.top + sc(7, m_dpi),
-                            row.right - sc(86, m_dpi), row.top + sc(28, m_dpi) },
+            drawTextGlass({ row.left + sc(50, m_dpi), row.top + sc(10, m_dpi),
+                            row.right - sc(90, m_dpi), row.top + sc(33, m_dpi) },
                           m_fontRow, cWhite, utf8ToWide(dev.name),
                           DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
@@ -1125,54 +1364,61 @@ void WinMirrorGui::paintWindow(HWND hwnd) {
             } else {
                 std::swprintf(subLine, ARRAYSIZE(subLine), L"AirPlay \u2022 %hs", dev.ip.c_str());
             }
-            drawTextGlass({ row.left + sc(46, m_dpi), row.top + sc(29, m_dpi),
-                            row.right - sc(86, m_dpi), row.top + sc(47, m_dpi) },
+            drawTextGlass({ row.left + sc(50, m_dpi), row.top + sc(33, m_dpi),
+                            row.right - sc(90, m_dpi), row.top + sc(53, m_dpi) },
                           m_fontSmall, cMuted, subLine,
                           DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
             if (dev.isConnected) {
-                float bx0 = static_cast<float>(row.right - sc(78, m_dpi));
-                float by0 = static_cast<float>(row.top + sc(15, m_dpi));
-                float bx1 = static_cast<float>(row.right - sc(10, m_dpi));
-                float by1 = static_cast<float>(row.bottom - sc(15, m_dpi));
+                float bx0 = static_cast<float>(row.right - sc(82, m_dpi));
+                float by0 = static_cast<float>(row.top + sc(18, m_dpi));
+                float bx1 = static_cast<float>(row.right - sc(12, m_dpi));
+                float by1 = static_cast<float>(row.bottom - sc(18, m_dpi));
                 glass::fillRoundRectGrad(m_canvasPx, cw, ch, bx0, by0, bx1, by1, scf(12, m_dpi),
-                                         {34, 128, 92, 228}, {24, 102, 74, 228}, {76, 222, 160, 215}, 1.0f);
+                                         {220, 38, 38, 245}, {185, 28, 28, 245}, {252, 165, 165, 190}, 1.0f);
                 drawCheckGlyph(m_canvasPx, cw, ch, bx0 + scf(9, m_dpi), by0 + scf(9, m_dpi), m_dpi, cWhite);
-                drawTextGlass({ static_cast<LONG>(bx0) + sc(21, m_dpi), static_cast<LONG>(by0),
+                drawTextGlass({ static_cast<LONG>(bx0) + sc(22, m_dpi), static_cast<LONG>(by0),
                                 static_cast<LONG>(bx1) - sc(6, m_dpi), static_cast<LONG>(by1) },
                               m_fontLabel, cWhite, L"Active", DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             } else if (dev.isDirectObs) {
-                float bx0 = static_cast<float>(row.right - sc(54, m_dpi));
-                float by0 = static_cast<float>(row.top + sc(17, m_dpi));
-                float bx1 = static_cast<float>(row.right - sc(10, m_dpi));
-                float by1 = static_cast<float>(row.bottom - sc(17, m_dpi));
+                float bx0 = static_cast<float>(row.right - sc(58, m_dpi));
+                float by0 = static_cast<float>(row.top + sc(19, m_dpi));
+                float bx1 = static_cast<float>(row.right - sc(12, m_dpi));
+                float by1 = static_cast<float>(row.bottom - sc(19, m_dpi));
                 glass::fillRoundRectGrad(m_canvasPx, cw, ch, bx0, by0, bx1, by1, scf(9, m_dpi),
-                                         {52, 82, 160, 175}, {44, 68, 138, 175}, {122, 162, 255, 165}, 1.0f);
+                                         {46, 14, 18, 228}, {34, 10, 14, 228}, {239, 68, 68, 175}, 1.0f);
                 drawTextGlass({ static_cast<LONG>(bx0), static_cast<LONG>(by0),
                                 static_cast<LONG>(bx1), static_cast<LONG>(by1) },
                               m_fontLabel, cWhite, L"OBS", DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             } else {
-                drawTextGlass({ row.right - sc(64, m_dpi), row.top, row.right - sc(10, m_dpi), row.bottom },
-                              m_fontLabel, cMuted, L"AirPlay", DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+                float bx0 = static_cast<float>(row.right - sc(72, m_dpi));
+                float by0 = static_cast<float>(row.top + sc(19, m_dpi));
+                float bx1 = static_cast<float>(row.right - sc(12, m_dpi));
+                float by1 = static_cast<float>(row.bottom - sc(19, m_dpi));
+                glass::fillRoundRectGrad(m_canvasPx, cw, ch, bx0, by0, bx1, by1, scf(9, m_dpi),
+                                         {30, 30, 38, 215}, {24, 24, 30, 215}, {255, 255, 255, 36}, 1.0f);
+                drawTextGlass({ static_cast<LONG>(bx0), static_cast<LONG>(by0),
+                                static_cast<LONG>(bx1), static_cast<LONG>(by1) },
+                              m_fontLabel, cSilver, L"AirPlay", DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             }
         }
     }
 
-    // 1) Compact IP Pill
+    // 1) Compact Obsidian IP Input Box
     RECT rcIp = rectOf(ID_IP_BOX);
     glass::fillRoundRectGrad(m_canvasPx, cw, ch,
                              static_cast<float>(rcIp.left), static_cast<float>(rcIp.top),
                              static_cast<float>(rcIp.right), static_cast<float>(rcIp.bottom),
                              scf(10, m_dpi),
-                             {30, 34, 54, 152}, {24, 28, 46, 152},
-                             m_ipFocused ? GlassColor{96, 182, 255, 225}
-                                         : (m_hoverBtnId == ID_IP_BOX ? GlassColor{156, 174, 226, 145}
-                                                                      : GlassColor{136, 152, 198, 85}),
+                             {16, 16, 21, 238}, {12, 12, 16, 238},
+                             m_ipFocused ? GlassColor{239, 68, 68, 225}
+                                         : (m_hoverBtnId == ID_IP_BOX ? GlassColor{255, 255, 255, 84}
+                                                                      : GlassColor{255, 255, 255, 36}),
                              m_ipFocused ? 1.3f : 1.0f);
     drawMonitorGlyph(m_canvasPx, cw, ch,
-                     static_cast<float>(rcIp.left + sc(10, m_dpi)),
-                     static_cast<float>(rcIp.top + sc(10, m_dpi)), m_dpi,
-                     m_ipFocused ? cCyan : cMuted);
+                     static_cast<float>(rcIp.left + sc(11, m_dpi)),
+                     static_cast<float>(rcIp.top + sc(12, m_dpi)), m_dpi,
+                     m_ipFocused ? cRed : cMuted);
 
     std::wstring ipLabel;
     GlassColor ipTextCol = cWhite;
@@ -1190,10 +1436,10 @@ void WinMirrorGui::paintWindow(HWND hwnd) {
         ipLabel = !autoIp.empty() ? (L"Mac: " + utf8ToWide(autoIp)) : L"Enter Mac IP...";
         ipTextCol = cMuted;
     }
-    drawTextGlass({ rcIp.left + sc(29, m_dpi), rcIp.top, rcIp.right - sc(8, m_dpi), rcIp.bottom },
+    drawTextGlass({ rcIp.left + sc(31, m_dpi), rcIp.top, rcIp.right - sc(10, m_dpi), rcIp.bottom },
                   m_fontBody, ipTextCol, ipLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-    // 2) Gradient Connect Pill
+    // 2) Signature Crimson Connect Pill (with fixed AA white Play triangle)
     RECT rcConn = rectOf(ID_BTN_CONNECT);
     bool connHv = (m_hoverBtnId == ID_BTN_CONNECT);
     bool connDn = (m_pressedBtnId == ID_BTN_CONNECT);
@@ -1201,67 +1447,67 @@ void WinMirrorGui::paintWindow(HWND hwnd) {
                              static_cast<float>(rcConn.left), static_cast<float>(rcConn.top),
                              static_cast<float>(rcConn.right), static_cast<float>(rcConn.bottom),
                              scf(10, m_dpi),
-                             connDn ? GlassColor{48, 96, 212, 245} : (connHv ? GlassColor{78, 146, 255, 250} : GlassColor{60, 128, 252, 245}),
-                             connDn ? GlassColor{104, 62, 198, 245} : (connHv ? GlassColor{154, 102, 255, 250} : GlassColor{134, 82, 244, 245}),
-                             {178, 198, 255, 190}, 1.0f);
+                             connDn ? GlassColor{175, 24, 28, 250} : (connHv ? GlassColor{244, 52, 58, 252} : GlassColor{225, 29, 40, 248}),
+                             connDn ? GlassColor{140, 18, 22, 250} : (connHv ? GlassColor{205, 32, 38, 252} : GlassColor{180, 22, 30, 248}),
+                             {254, 202, 202, 130}, 1.0f);
     glass::fillAaPlayTriangle(m_canvasPx, cw, ch,
-                              static_cast<float>(rcConn.left + sc(16, m_dpi)),
+                              static_cast<float>(rcConn.left + sc(20, m_dpi)),
                               static_cast<float>((rcConn.top + rcConn.bottom) / 2),
                               scf(8.5f, m_dpi), cWhite);
-    drawTextGlass({ rcConn.left + sc(25, m_dpi), rcConn.top, rcConn.right - sc(6, m_dpi), rcConn.bottom },
+    drawTextGlass({ rcConn.left + sc(31, m_dpi), rcConn.top, rcConn.right - sc(8, m_dpi), rcConn.bottom },
                   m_fontBody, cWhite, L"Connect", DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    // 3) Compact Scan Pill
+    // 3) Obsidian Scan Pill
     RECT rcScan = rectOf(ID_BTN_SCAN);
     bool scanHv = (m_hoverBtnId == ID_BTN_SCAN);
     glass::fillRoundRectGrad(m_canvasPx, cw, ch,
                              static_cast<float>(rcScan.left), static_cast<float>(rcScan.top),
                              static_cast<float>(rcScan.right), static_cast<float>(rcScan.bottom),
                              scf(10, m_dpi),
-                             scanHv ? GlassColor{58, 66, 98, 185} : GlassColor{38, 44, 68, 160},
-                             scanHv ? GlassColor{44, 52, 82, 185} : GlassColor{28, 34, 56, 160},
-                             {156, 174, 224, scanHv ? uint8_t(165) : uint8_t(95)}, 1.0f);
+                             scanHv ? GlassColor{42, 26, 30, 236} : GlassColor{24, 24, 30, 228},
+                             scanHv ? GlassColor{32, 20, 24, 236} : GlassColor{18, 18, 24, 228},
+                             scanHv ? GlassColor{239, 68, 68, 175} : GlassColor{255, 255, 255, 38}, 1.0f);
     drawRefreshGlyph(m_canvasPx, cw, ch,
-                     static_cast<float>(rcScan.left + sc(14, m_dpi)),
+                     static_cast<float>(rcScan.left + sc(16, m_dpi)),
                      static_cast<float>((rcScan.top + rcScan.bottom) / 2), m_dpi, cWhite);
-    drawTextGlass({ rcScan.left + sc(22, m_dpi), rcScan.top, rcScan.right - sc(4, m_dpi), rcScan.bottom },
+    drawTextGlass({ rcScan.left + sc(26, m_dpi), rcScan.top, rcScan.right - sc(6, m_dpi), rcScan.bottom },
                   m_fontBody, cWhite, L"Scan", DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     // Compact Telemetry Spec Strip
-    int specY0 = sc(241, m_dpi), specY1 = sc(260, m_dpi);
-    drawChipGlyph(m_canvasPx, cw, ch, scf(16, m_dpi), scf(245, m_dpi), m_dpi, cMuted);
-    drawTextGlass({ sc(31, m_dpi), specY0, sc(80, m_dpi), specY1 },
+    int specY0 = sc(269, m_dpi), specY1 = sc(291, m_dpi);
+    drawChipGlyph(m_canvasPx, cw, ch, scf(18, m_dpi), scf(275, m_dpi), m_dpi, cMuted);
+    drawTextGlass({ sc(34, m_dpi), specY0, sc(90, m_dpi), specY1 },
                   m_fontSmall, cWhite, snap.isHevc ? L"HEVC" : L"H.264", DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    glass::drawAaSegment(m_canvasPx, cw, ch, scf(85, m_dpi), scf(244, m_dpi), scf(85, m_dpi), scf(256, m_dpi), 1.0f, {150, 165, 210, 75});
-    drawGaugeGlyph(m_canvasPx, cw, ch, scf(98, m_dpi), scf(250, m_dpi), m_dpi, cMuted);
+    glass::drawAaSegment(m_canvasPx, cw, ch, scf(94, m_dpi), scf(273, m_dpi), scf(94, m_dpi), scf(287, m_dpi), 1.0f, {255, 255, 255, 32});
+    drawGaugeGlyph(m_canvasPx, cw, ch, scf(108, m_dpi), scf(280, m_dpi), m_dpi, cMuted);
     wchar_t fpsSpec[32] = {};
     std::swprintf(fpsSpec, ARRAYSIZE(fpsSpec), L"%.0f FPS", snap.clients > 0 ? snap.actualFps : static_cast<float>(snap.targetFps));
-    drawTextGlass({ sc(109, m_dpi), specY0, sc(162, m_dpi), specY1 },
+    drawTextGlass({ sc(120, m_dpi), specY0, sc(180, m_dpi), specY1 },
                   m_fontSmall, cWhite, fpsSpec, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    glass::drawAaSegment(m_canvasPx, cw, ch, scf(166, m_dpi), scf(244, m_dpi), scf(166, m_dpi), scf(256, m_dpi), 1.0f, {150, 165, 210, 75});
-    glass::fillAaCircle(m_canvasPx, cw, ch, scf(178, m_dpi), scf(250, m_dpi), scf(2.8f, m_dpi), snap.clients > 0 ? cCyan : cMuted);
+    glass::drawAaSegment(m_canvasPx, cw, ch, scf(184, m_dpi), scf(273, m_dpi), scf(184, m_dpi), scf(287, m_dpi), 1.0f, {255, 255, 255, 32});
+    glass::fillAaCircle(m_canvasPx, cw, ch, scf(198, m_dpi), scf(280, m_dpi), scf(3.0f, m_dpi), snap.clients > 0 ? cRed : cMuted);
     wchar_t mbpsSpec[40] = {};
     if (snap.clients > 0) {
         std::swprintf(mbpsSpec, ARRAYSIZE(mbpsSpec), L"%.1f Mbps", snap.actualMbps);
     } else {
         std::swprintf(mbpsSpec, ARRAYSIZE(mbpsSpec), L"%u Mbps", snap.targetMbps ? snap.targetMbps : 200);
     }
-    drawTextGlass({ sc(187, m_dpi), specY0, sc(262, m_dpi), specY1 },
+    drawTextGlass({ sc(208, m_dpi), specY0, sc(294, m_dpi), specY1 },
                   m_fontSmall, cWhite, mbpsSpec, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    glass::drawAaSegment(m_canvasPx, cw, ch, scf(267, m_dpi), scf(244, m_dpi), scf(267, m_dpi), scf(256, m_dpi), 1.0f, {150, 165, 210, 75});
-    drawSpeakerGlyph(m_canvasPx, cw, ch, scf(279, m_dpi), scf(245, m_dpi), m_dpi, snap.audioActive ? cWhite : cMuted);
-    drawTextGlass({ sc(294, m_dpi), specY0, sc(354, m_dpi), specY1 },
+    glass::drawAaSegment(m_canvasPx, cw, ch, scf(300, m_dpi), scf(273, m_dpi), scf(300, m_dpi), scf(287, m_dpi), 1.0f, {255, 255, 255, 32});
+    drawSpeakerGlyph(m_canvasPx, cw, ch, scf(314, m_dpi), scf(275, m_dpi), m_dpi, snap.audioActive ? cWhite : cMuted);
+    drawTextGlass({ sc(330, m_dpi), specY0, sc(396, m_dpi), specY1 },
                   m_fontSmall, snap.audioActive ? cWhite : cMuted,
                   snap.audioActive ? L"Audio" : L"Muted", DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    // Compact Live Status Line
-    glass::fillAaCircle(m_canvasPx, cw, ch, scf(20, m_dpi), scf(276, m_dpi), scf(3.6f, m_dpi),
-                        snap.clients > 0 ? cGreen : cCyan);
-    drawTextGlass({ sc(30, m_dpi), sc(266, m_dpi), sc(354, m_dpi), sc(286, m_dpi) },
-                  m_fontLabel, snap.clients > 0 ? cWhite : cMuted,
+    // Clean Crisp Footer Status Line
+    glass::fillAaCircle(m_canvasPx, cw, ch, scf(22, m_dpi), scf(309, m_dpi), scf(3.6f, m_dpi),
+                        snap.clients > 0 ? cRed : cWhite);
+    drawTextGlass({ sc(33, m_dpi), sc(297, m_dpi), sc(396, m_dpi), sc(321, m_dpi) },
+                  m_fontSmall, snap.clients > 0 ? cWhite : cSilver,
                   utf8ToWide(snap.statusBanner),
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
@@ -1292,7 +1538,7 @@ LRESULT WinMirrorGui::handleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             ScreenToClient(hwnd, &pt);
             int btn = hitTestButton(pt);
             if (btn == ID_BTN_MINIMIZE || btn == ID_BTN_CLOSE) return HTCLIENT;
-            if (pt.y >= 0 && pt.y < sc(50, m_dpi)) return HTCAPTION;
+            if (pt.y >= 0 && pt.y < sc(56, m_dpi)) return HTCAPTION;
             return HTCLIENT;
         }
         case WM_ERASEBKGND:

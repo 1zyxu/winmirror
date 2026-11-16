@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+struct DWriteTextEngine;
+
 struct WinMirrorStatus {
     bool streamingReady = false;
     bool isAdmin = false;
@@ -96,6 +98,7 @@ private:
     HFONT m_fontLabel = nullptr;
     HFONT m_fontBody = nullptr;
     HFONT m_fontSmall = nullptr;
+    DWriteTextEngine* m_dwText = nullptr;
 
     std::vector<uint32_t> m_baseBg;
     int m_baseBgW = 0;

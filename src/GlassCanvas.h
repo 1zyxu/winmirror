@@ -55,14 +55,21 @@ inline void fillCanvasGlass(uint32_t* px, int w, int h, uint8_t baseAlpha) {
     const float fh = static_cast<float>(std::max(1, h));
     for (int y = 0; y < h; ++y) {
         float ty = y / fh;
+        float dy = ty - 0.08f;
         for (int x = 0; x < w; ++x) {
             float tx = x / fw;
-            // Subtle cool slate-indigo tint over blurred desktop
-            int r = static_cast<int>(16 + 10 * tx);
-            int g = static_cast<int>(18 + 8 * ty);
-            int b = static_cast<int>(30 + 18 * (0.5f * tx + 0.5f * ty));
+            float dx = tx - 0.14f;
+            // Pitch-black obsidian base with a restrained top-left crimson studio ambient bloom
+            float d2 = dx * dx + dy * dy * 1.4f;
+            float glow = std::exp(-d2 * 4.8f);
+            int r = static_cast<int>(9 + 28 * glow + 3 * tx);
+            int g = static_cast<int>(9 + 3 * glow + 2 * ty);
+            int b = static_cast<int>(12 + 5 * glow + 4 * ty);
             px[static_cast<size_t>(y) * w + x] = packPremul(
-                static_cast<uint8_t>(r), static_cast<uint8_t>(g), static_cast<uint8_t>(b), baseAlpha);
+                static_cast<uint8_t>(std::min(255, r)),
+                static_cast<uint8_t>(std::min(255, g)),
+                static_cast<uint8_t>(std::min(255, b)),
+                baseAlpha);
         }
     }
 }
@@ -196,6 +203,12 @@ inline void fillAaPlayTriangle(uint32_t* px, int w, int h, float cx, float cy, f
     auto edge = [](float ax, float ay, float bx, float by, float pxf, float pyf) {
         return (pxf - ax) * (by - ay) - (pyf - ay) * (bx - ax);
     };
+    const float len0 = std::hypot(x1 - x0, y1 - y0);
+    const float len1 = std::hypot(x2 - x1, y2 - y1);
+    const float len2 = std::hypot(x0 - x2, y0 - y2);
+    // Flip sign so points inside all three half-spaces always produce negative SDF distance
+    const float sign = (edge(x0, y0, x1, y1, cx, cy) > 0.0f) ? -1.0f : 1.0f;
+
     const int ix0 = std::max(0, static_cast<int>(std::floor(x0 - 1.5f)));
     const int iy0 = std::max(0, static_cast<int>(std::floor(y0 - 1.5f)));
     const int ix1 = std::min(w, static_cast<int>(std::ceil(x1 + 1.5f)));
@@ -204,14 +217,10 @@ inline void fillAaPlayTriangle(uint32_t* px, int w, int h, float cx, float cy, f
         uint32_t* row = px + static_cast<size_t>(y) * w;
         for (int x = ix0; x < ix1; ++x) {
             float fx = x + 0.5f, fy = y + 0.5f;
-            float d0 = edge(x0, y0, x1, y1, fx, fy) / std::hypot(x1 - x0, y1 - y0);
-            float d1 = edge(x1, y1, x2, y2, fx, fy) / std::hypot(x2 - x1, y2 - y1);
-            float d2 = edge(x2, y2, x0, y0, fx, fy) / std::hypot(x0 - x2, y0 - y2);
-            float dist = std::max({-d0, -d1, -d2}); // negative inside CW screen triangle
-            // Flip sign cleanly regardless of winding by testing centroid
-            if (edge(x0, y0, x1, y1, cx, cy) > 0) {
-                dist = std::max({d0, d1, d2});
-            }
+            float d0 = edge(x0, y0, x1, y1, fx, fy) / len0;
+            float d1 = edge(x1, y1, x2, y2, fx, fy) / len1;
+            float d2 = edge(x2, y2, x0, y0, fx, fy) / len2;
+            float dist = std::max({d0 * sign, d1 * sign, d2 * sign});
             float cov = std::clamp(0.5f - dist, 0.0f, 1.0f);
             if (cov > 0.0f) blendStraight(row[x], col, cov);
         }
